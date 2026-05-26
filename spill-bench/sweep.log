@@ -1,0 +1,94 @@
+
+===== object size 65536 bytes =====
+2026-05-26 23:15:33,563	WARNING node.py:1875 -- The object spilling config is specified from an unstable API - system config or environment variable. This is subject to change in the future. You can use the stable API - --object-spilling-directory in ray start or object_spilling_directory in ray.init() to specify the object spilling directory instead. If you need more advanced settings, please open a github issue with the Ray team.
+2026-05-26 23:15:35,481	INFO worker.py:2044 -- Started a local Ray instance.
+obj_size=65536 store_mb=300 n_objects=19200
+put done in 4.2s, waiting for spill to drain
+restored 200 objects in 0.8s
+DONE
+size 65536 exit 0
+
+===== object size 131072 bytes =====
+2026-05-26 23:15:47,948	WARNING node.py:1875 -- The object spilling config is specified from an unstable API - system config or environment variable. This is subject to change in the future. You can use the stable API - --object-spilling-directory in ray start or object_spilling_directory in ray.init() to specify the object spilling directory instead. If you need more advanced settings, please open a github issue with the Ray team.
+2026-05-26 23:15:49,864	INFO worker.py:2044 -- Started a local Ray instance.
+obj_size=131072 store_mb=300 n_objects=9600
+put done in 2.7s, waiting for spill to drain
+restored 200 objects in 0.9s
+DONE
+size 131072 exit 0
+
+===== object size 262144 bytes =====
+2026-05-26 23:16:00,397	WARNING node.py:1875 -- The object spilling config is specified from an unstable API - system config or environment variable. This is subject to change in the future. You can use the stable API - --object-spilling-directory in ray start or object_spilling_directory in ray.init() to specify the object spilling directory instead. If you need more advanced settings, please open a github issue with the Ray team.
+2026-05-26 23:16:02,316	INFO worker.py:2044 -- Started a local Ray instance.
+obj_size=262144 store_mb=300 n_objects=4800
+put done in 1.9s, waiting for spill to drain
+restored 200 objects in 0.9s
+DONE
+size 262144 exit 0
+
+===== object size 524288 bytes =====
+2026-05-26 23:16:11,987	WARNING node.py:1875 -- The object spilling config is specified from an unstable API - system config or environment variable. This is subject to change in the future. You can use the stable API - --object-spilling-directory in ray start or object_spilling_directory in ray.init() to specify the object spilling directory instead. If you need more advanced settings, please open a github issue with the Ray team.
+2026-05-26 23:16:13,904	INFO worker.py:2044 -- Started a local Ray instance.
+obj_size=524288 store_mb=300 n_objects=2400
+put done in 1.3s, waiting for spill to drain
+restored 200 objects in 0.9s
+DONE
+size 524288 exit 0
+
+===== object size 1048576 bytes =====
+2026-05-26 23:16:22,963	WARNING node.py:1875 -- The object spilling config is specified from an unstable API - system config or environment variable. This is subject to change in the future. You can use the stable API - --object-spilling-directory in ray start or object_spilling_directory in ray.init() to specify the object spilling directory instead. If you need more advanced settings, please open a github issue with the Ray team.
+2026-05-26 23:16:24,880	INFO worker.py:2044 -- Started a local Ray instance.
+obj_size=1048576 store_mb=300 n_objects=1200
+put done in 1.0s, waiting for spill to drain
+restored 200 objects in 1.0s
+DONE
+size 1048576 exit 0
+
+===== object size 2097152 bytes =====
+2026-05-26 23:16:33,837	WARNING node.py:1875 -- The object spilling config is specified from an unstable API - system config or environment variable. This is subject to change in the future. You can use the stable API - --object-spilling-directory in ray start or object_spilling_directory in ray.init() to specify the object spilling directory instead. If you need more advanced settings, please open a github issue with the Ray team.
+2026-05-26 23:16:35,752	INFO worker.py:2044 -- Started a local Ray instance.
+obj_size=2097152 store_mb=300 n_objects=600
+put done in 0.8s, waiting for spill to drain
+restored 200 objects in 1.1s
+DONE
+size 2097152 exit 0
+
+===== object size 4194304 bytes =====
+2026-05-26 23:16:44,868	WARNING node.py:1875 -- The object spilling config is specified from an unstable API - system config or environment variable. This is subject to change in the future. You can use the stable API - --object-spilling-directory in ray start or object_spilling_directory in ray.init() to specify the object spilling directory instead. If you need more advanced settings, please open a github issue with the Ray team.
+2026-05-26 23:16:46,780	INFO worker.py:2044 -- Started a local Ray instance.
+obj_size=4194304 store_mb=300 n_objects=300
+put done in 0.7s, waiting for spill to drain
+restored 300 objects in 1.8s
+DONE
+size 4194304 exit 0
+
+===== object size 8388608 bytes =====
+2026-05-26 23:16:56,146	WARNING node.py:1875 -- The object spilling config is specified from an unstable API - system config or environment variable. This is subject to change in the future. You can use the stable API - --object-spilling-directory in ray start or object_spilling_directory in ray.init() to specify the object spilling directory instead. If you need more advanced settings, please open a github issue with the Ray team.
+2026-05-26 23:16:58,060	INFO worker.py:2044 -- Started a local Ray instance.
+obj_size=8388608 store_mb=300 n_objects=150
+put done in 0.7s, waiting for spill to drain
+restored 150 objects in 1.3s
+DONE
+size 8388608 exit 0
+
+===== object size 16777216 bytes =====
+2026-05-26 23:17:06,910	WARNING node.py:1875 -- The object spilling config is specified from an unstable API - system config or environment variable. This is subject to change in the future. You can use the stable API - --object-spilling-directory in ray start or object_spilling_directory in ray.init() to specify the object spilling directory instead. If you need more advanced settings, please open a github issue with the Ray team.
+2026-05-26 23:17:08,824	INFO worker.py:2044 -- Started a local Ray instance.
+obj_size=16777216 store_mb=300 n_objects=75
+put done in 0.8s, waiting for spill to drain
+restored 75 objects in 0.9s
+DONE
+size 16777216 exit 0
+
+===== object size 33554432 bytes =====
+2026-05-26 23:17:17,445	WARNING node.py:1875 -- The object spilling config is specified from an unstable API - system config or environment variable. This is subject to change in the future. You can use the stable API - --object-spilling-directory in ray start or object_spilling_directory in ray.init() to specify the object spilling directory instead. If you need more advanced settings, please open a github issue with the Ray team.
+2026-05-26 23:17:19,360	INFO worker.py:2044 -- Started a local Ray instance.
+obj_size=33554432 store_mb=300 n_objects=37
+put done in 1.2s, waiting for spill to drain
+restored 37 objects in 0.8s
+DONE
+size 33554432 exit 0
+
+SWEEP COMPLETE
+python csv: /tmp/spillbench/out/spill_py.csv
+cpp csv: /tmp/spillbench/out/spill_cpp.csv
