@@ -15,7 +15,11 @@
 #include "ray/raylet/local_object_manager.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <fstream>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -27,6 +31,22 @@
 namespace ray {
 
 namespace raylet {
+
+namespace {
+void RecordSpillCppTiming(const char *op, int num_objects, int64_t total_bytes,
+                          int64_t dur_ns) {
+  static const char *path = std::getenv("RAY_SPILL_TIMING_CPP");
+  if (path == nullptr) {
+    return;
+  }
+  static const char *tag = std::getenv("RAY_SPILL_TIMING_TAG");
+  static std::mutex mu;
+  std::lock_guard<std::mutex> lock(mu);
+  std::ofstream out(path, std::ios::app);
+  out << op << "," << (tag ? tag : "") << "," << num_objects << ","
+      << total_bytes << "," << dur_ns << "\n";
+}
+}  // namespace
 
 void LocalObjectManager::PinObjectsAndWaitForFree(
     const std::vector<ObjectID> &object_ids,
@@ -328,6 +348,7 @@ void LocalObjectManager::SpillObjectsInternal(
                                      std::shared_ptr<WorkerInterface> io_worker) mutable {
     rpc::SpillObjectsRequest request;
     std::vector<ObjectID> requested_objects_to_spill;
+    int64_t total_spill_bytes = 0;
     for (const auto &object_id : objects_to_spill) {
       auto it = objects_pending_spill_.find(object_id);
       RAY_CHECK(it != objects_pending_spill_.end());
@@ -342,6 +363,7 @@ void LocalObjectManager::SpillObjectsInternal(
         ref->mutable_owner_address()->CopyFrom(freed_it->second.owner_address_);
         RAY_LOG(DEBUG) << "Sending spill request for object " << object_id;
         requested_objects_to_spill.push_back(object_id);
+        total_spill_bytes += it->second->GetSize();
       }
     }
 
@@ -352,12 +374,22 @@ void LocalObjectManager::SpillObjectsInternal(
       return;
     }
 
+    auto spill_timing_t0 = std::chrono::steady_clock::now();
+    int spill_timing_num = request.object_refs_to_spill_size();
     io_worker->rpc_client()->SpillObjects(
         request,
         [this,
          requested_objects_to_spill = std::move(requested_objects_to_spill),
          callback = std::move(callback),
+         spill_timing_t0,
+         spill_timing_num,
+         total_spill_bytes,
          io_worker](const ray::Status &status, const rpc::SpillObjectsReply &r) {
+          RecordSpillCppTiming(
+              "spill", spill_timing_num, total_spill_bytes,
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - spill_timing_t0)
+                  .count());
           num_active_workers_ -= 1;
           io_worker_pool_.PushSpillWorker(io_worker);
           size_t num_objects_spilled = status.ok() ? r.spilled_objects_url_size() : 0;

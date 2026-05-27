@@ -49,6 +49,7 @@ def _spill_record(op, backend, num_objects, total_bytes, t_python_ns, t_io_ns):
             _fh.write(line)
 
 
+
 def create_url_with_offset(*, url: str, offset: int, size: int) -> str:
     """Methods to create a URL with offset.
 
@@ -191,28 +192,25 @@ class ExternalStorage(metaclass=abc.ABCMeta):
                 error = f"Object {ref.hex()} does not exist."
                 raise ValueError(error)
             buf_len = 0 if buf is None else len(buf)
-            # Write the small fixed header (lengths + owner address + metadata)
-            # and the object buffer as two separate writes. Concatenating them
-            # into one bytes object would memcpy the entire object payload.
-            header = (
+            payload = (
                 address_len.to_bytes(8, byteorder="little")
                 + metadata_len.to_bytes(8, byteorder="little")
                 + buf_len.to_bytes(8, byteorder="little")
                 + owner_address
                 + metadata
+                + (memoryview(buf) if buf_len else b"")
             )
             # 24 bytes to store owner address, metadata, and buffer lengths.
-            payload_len = self.HEADER_LENGTH + address_len + metadata_len + buf_len
+            payload_len = len(payload)
+            assert (
+                self.HEADER_LENGTH + address_len + metadata_len + buf_len == payload_len
+            )
             if _spill_timing_enabled():
                 _t0 = time.perf_counter_ns()
-                written_bytes = f.write(header)
-                if buf_len:
-                    written_bytes += f.write(memoryview(buf))
+                written_bytes = f.write(payload)
                 _spill_io_add(time.perf_counter_ns() - _t0, buf_len)
             else:
-                written_bytes = f.write(header)
-                if buf_len:
-                    written_bytes += f.write(memoryview(buf))
+                written_bytes = f.write(payload)
             assert written_bytes == payload_len
             url_with_offset = create_url_with_offset(
                 url=url, offset=offset, size=written_bytes
