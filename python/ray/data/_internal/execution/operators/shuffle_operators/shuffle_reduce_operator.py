@@ -160,7 +160,7 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
             "num_cpus": self._shuffle_reduce_task_num_cpus,
         }
         if estimated_bytes > 0:
-            reduce_resources["memory"] = int(estimated_bytes * 2)
+            reduce_resources["memory"] = int(estimated_bytes * 3.5)
         reduce_options = {
             **reduce_resources,
             "scheduling_strategy": "SPREAD",
@@ -349,7 +349,7 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
         sizes = [b for b in partition_bytes.values() if b > 0]
         if sizes:
             avg_bytes = sum(sizes) / len(sizes)
-            memory = int(avg_bytes * 2)
+            memory = int(avg_bytes * 3.5)
         return ExecutionResources(
             cpu=self._shuffle_reduce_task_num_cpus,
             memory=memory,
