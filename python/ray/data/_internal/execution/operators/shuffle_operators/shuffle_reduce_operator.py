@@ -1,5 +1,6 @@
 import functools
 import logging
+import time
 import typing
 from collections import deque
 from typing import Any, Dict, List, Optional
@@ -16,6 +17,7 @@ from ray.data._internal.execution.interfaces.physical_operator import (
     estimate_total_num_of_blocks,
 )
 from ray.data._internal.execution.operators.shuffle_operators._shuffle_tasks import (
+    _SHUFFLE_PROFILE_ENABLED,
     ReduceFn,
     _shuffle_reduce_task,
 )
@@ -25,7 +27,7 @@ from ray.data._internal.execution.operators.shuffle_operators.shuffle_map_operat
 )
 from ray.data._internal.execution.operators.sub_progress import SubProgressBarMixin
 from ray.data._internal.stats import OpRuntimeMetrics
-from ray.data.block import BlockStats, TaskExecWorkerStats, to_stats
+from ray.data.block import BlockExecStats, BlockStats, TaskExecWorkerStats, to_stats
 from ray.data.context import DataContext
 
 if typing.TYPE_CHECKING:
@@ -120,6 +122,10 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
         self._reduce_bar: Optional["BaseProgressBar"] = None
         self._reduce_metrics = OpRuntimeMetrics(self)
 
+        # -- Profile timestamps (RAY_DATA_SHUFFLE_PROFILE=1) -----------------
+        self._profile_first_reduce_dispatch_s: Optional[float] = None
+        self._profile_stats_emitted: bool = False
+
     # -----------------------------------------------------------------------
     # Input handling: one bundle → one reducer task
     # -----------------------------------------------------------------------
@@ -135,6 +141,10 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
         """
         assert input_index == 0
         self._reduce_metrics.on_input_received(input_bundle)
+
+        if _SHUFFLE_PROFILE_ENABLED and self._profile_first_reduce_dispatch_s is None:
+            self._profile_first_reduce_dispatch_s = time.perf_counter()
+            self._emit_profile_stats_entry()
 
         if not input_bundle.block_refs:
             # Defensive: ShuffleMapOp skips empty partitions, but a future
@@ -288,6 +298,27 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
             and not self._output_queue
             and super().has_completed()
         )
+
+    def _emit_profile_stats_entry(self) -> None:
+        """Append a synthetic BlockStats with the reducer's dispatch latency.
+
+        Measured as the gap between the upstream map op's barrier release
+        and this op's first reducer task submission.  Fired exactly once.
+        """
+        if self._profile_stats_emitted:
+            return
+        upstream = self.input_dependencies[0]
+        barrier_release_s = getattr(upstream, "profile_barrier_release_s", None)
+        if barrier_release_s is None:
+            return
+        gap = self._profile_first_reduce_dispatch_s - barrier_release_s
+        exec_stats = BlockExecStats(
+            shuffle_stage_timings_s={"driver.first_reduce_dispatch_s": gap},
+        )
+        self._output_blocks_stats.append(
+            BlockStats(num_rows=None, size_bytes=None, exec_stats=exec_stats)
+        )
+        self._profile_stats_emitted = True
 
     # -----------------------------------------------------------------------
     # Shutdown

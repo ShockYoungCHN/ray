@@ -1,6 +1,7 @@
 import dataclasses
 import functools
 import logging
+import time
 import typing
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
@@ -25,12 +26,13 @@ from ray.data._internal.execution.operators.base_physical_operator import (
     InternalQueueOperatorMixin,
 )
 from ray.data._internal.execution.operators.shuffle_operators._shuffle_tasks import (
+    _SHUFFLE_PROFILE_ENABLED,
     PartitionFn,
     _shuffle_map_task,
 )
 from ray.data._internal.execution.operators.sub_progress import SubProgressBarMixin
 from ray.data._internal.stats import OpRuntimeMetrics
-from ray.data.block import BlockMetadata, BlockStats
+from ray.data.block import BlockExecStats, BlockMetadata, BlockStats
 from ray.data.context import DataContext
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
@@ -188,6 +190,15 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
         self._map_bar: Optional["BaseProgressBar"] = None
         self._map_metrics = OpRuntimeMetrics(self)
 
+        # -- Profile timestamps (RAY_DATA_SHUFFLE_PROFILE=1) -----------------
+        # All in perf_counter() units.  None until the corresponding event
+        # fires; the barrier-release path collects them into a synthetic
+        # BlockStats entry so ds.stats() picks them up.  ShuffleReduceOp
+        # reads barrier_release_s to compute first_reduce_dispatch_s.
+        self._profile_first_map_dispatch_s: Optional[float] = None
+        self._profile_last_map_done_s: Optional[float] = None
+        self.profile_barrier_release_s: Optional[float] = None
+
     # -----------------------------------------------------------------------
     # InternalQueueOperatorMixin
     # -----------------------------------------------------------------------
@@ -283,6 +294,9 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
         estimated_bytes: int = 0,
         target_node_id: Optional[str] = None,
     ) -> None:
+        if _SHUFFLE_PROFILE_ENABLED and self._profile_first_map_dispatch_s is None:
+            self._profile_first_map_dispatch_s = time.perf_counter()
+
         cur_task_idx = self._next_shuffle_map_task_idx
         self._next_shuffle_map_task_idx += 1
 
@@ -395,6 +409,9 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
         if self._map_bar is not None:
             self._map_bar.update(increment=input_meta.num_rows or 0)
 
+        if _SHUFFLE_PROFILE_ENABLED:
+            self._profile_last_map_done_s = time.perf_counter()
+
         # Barrier: emit partition-bundles once all map tasks are done AND
         # upstream has signalled no more inputs are coming.
         self._maybe_emit_partition_bundles()
@@ -415,6 +432,10 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
             return
 
         self._partition_bundles_emitted = True
+
+        if _SHUFFLE_PROFILE_ENABLED:
+            self.profile_barrier_release_s = time.perf_counter()
+            self._emit_profile_stats_entry()
 
         for pid in range(self._num_partitions):
             staging = self._partition_staging[pid]
@@ -442,6 +463,42 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
             )
             self._output_queue.add(stamped)
             self._map_metrics.on_output_queued(stamped)
+
+    def _emit_profile_stats_entry(self) -> None:
+        """Append a synthetic BlockStats carrying driver-side shuffle timings.
+
+        Fired exactly once, at barrier release.  The values are presented as
+        durations (in seconds) relative to the natural epoch for each phase
+        so they aggregate sensibly through ``_StatsAccumulator``.
+        """
+        timings: Dict[str, float] = {}
+        if (
+            self._profile_first_map_dispatch_s is not None
+            and self._profile_last_map_done_s is not None
+        ):
+            timings["driver.map_phase_s"] = (
+                self._profile_last_map_done_s - self._profile_first_map_dispatch_s
+            )
+        if (
+            self.profile_barrier_release_s is not None
+            and self._profile_last_map_done_s is not None
+        ):
+            # Time between the last map finishing and the barrier actually
+            # firing.  Usually near-zero unless `_inputs_complete` lagged
+            # behind the last map completion.
+            timings["driver.barrier_wait_s"] = (
+                self.profile_barrier_release_s - self._profile_last_map_done_s
+            )
+        if not timings:
+            return
+        # Build a minimal BlockExecStats — only shuffle_stage_timings_s is
+        # set, everything else stays None so the stats summary skips this
+        # entry for the normal row/byte/task aggregations and only picks up
+        # the new shuffle-stage section.
+        exec_stats = BlockExecStats(shuffle_stage_timings_s=timings)
+        self._map_blocks_stats.append(
+            BlockStats(num_rows=None, size_bytes=None, exec_stats=exec_stats)
+        )
 
     # -----------------------------------------------------------------------
     # Output handling

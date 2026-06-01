@@ -1465,6 +1465,12 @@ class OperatorStatsSummary:
     node_count: Optional[StatsSummary] = None
     task_rows: Optional[StatsSummary] = None
     scheduling_overhead: Optional[List["BucketedSchedulingOverhead"]] = None
+    # Per-stage shuffle timings/counters, populated only when
+    # RAY_DATA_SHUFFLE_PROFILE=1 was set during execution.  Keyed by stage
+    # name (e.g. "map.combine_chunks_s", "reduce.ray_get_s",
+    # "driver.barrier_wait_s") → aggregated min/max/mean/sum.  None when
+    # profiling was off.
+    shuffle_stage_timings: Optional[Dict[str, StatsSummary]] = None
 
     @property
     def num_rows_per_s(self) -> float:
@@ -1511,16 +1517,34 @@ class OperatorStatsSummary:
         output_sizes_acc: _StatsAccumulator = _StatsAccumulator()
         rows_per_task: DefaultDict[int, int] = collections.defaultdict(int)
         tasks_per_node: DefaultDict[str, Set[int]] = collections.defaultdict(set)
+        shuffle_stage_accs: DefaultDict[str, _StatsAccumulator] = collections.defaultdict(
+            _StatsAccumulator
+        )
         num_exec = 0
         earliest_start_time, latest_end_time = float("inf"), float("-inf")
 
         for block_meta in block_stats:
+            es = block_meta.exec_stats
+            # Driver-side shuffle profile entries are synthetic: they carry
+            # only ``shuffle_stage_timings_s`` (no real block, no real task)
+            # and would otherwise pollute the row/byte/task accumulators
+            # with zeros.  Detect via num_rows is None and route directly.
+            is_driver_synthetic = (
+                es is not None
+                and es.shuffle_stage_timings_s is not None
+                and block_meta.num_rows is None
+                and block_meta.size_bytes is None
+            )
+            if is_driver_synthetic:
+                for key, value in es.shuffle_stage_timings_s.items():
+                    shuffle_stage_accs[key].add(value)
+                continue
+
             if block_meta.num_rows is not None:
                 output_rows_acc.add(block_meta.num_rows)
             if block_meta.size_bytes is not None:
                 output_sizes_acc.add(block_meta.size_bytes)
 
-            es = block_meta.exec_stats
             if es is not None:
                 num_exec += 1
                 if es.wall_time_s is not None:
@@ -1536,6 +1560,9 @@ class OperatorStatsSummary:
                     latest_end_time = max(latest_end_time, es.end_time_s)
                 if block_meta.num_rows is not None:
                     rows_per_task[es.task_idx] += block_meta.num_rows
+                if es.shuffle_stage_timings_s:
+                    for key, value in es.shuffle_stage_timings_s.items():
+                        shuffle_stage_accs[key].add(value)
 
         # Compute timing totals.
         if num_exec and earliest_start_time != float("inf"):
@@ -1588,6 +1615,13 @@ class OperatorStatsSummary:
         # Assign a value in to_summary and initialize it as None.
         total_input_num_rows = None
 
+        # Shuffle-stage timings: only populated when RAY_DATA_SHUFFLE_PROFILE=1.
+        shuffle_stage_summaries: Optional[Dict[str, StatsSummary]] = None
+        if shuffle_stage_accs:
+            shuffle_stage_summaries = {
+                key: acc.get() for key, acc in sorted(shuffle_stage_accs.items())
+            }
+
         return OperatorStatsSummary(
             operator_name=operator_name,
             is_sub_operator=is_sub_operator,
@@ -1603,6 +1637,7 @@ class OperatorStatsSummary:
             output_size_bytes=output_size_bytes_stats,
             node_count=node_counts_stats,
             task_rows=task_rows_stats,
+            shuffle_stage_timings=shuffle_stage_summaries,
         )
 
     def __str__(self) -> str:
@@ -1699,6 +1734,27 @@ class OperatorStatsSummary:
                 f" {self.num_rows_per_task_s} "
                 "rows/s\n"
             )
+
+        if self.shuffle_stage_timings:
+            out += indent + "* Shuffle stages (RAY_DATA_SHUFFLE_PROFILE=1):\n"
+            # `*_bytes_*` keys are raw counters, not seconds; format them
+            # in bytes so users can read map.zstd_bytes_in/out as KB/MB.
+            for key, summary in self.shuffle_stage_timings.items():
+                is_bytes = key.endswith("_bytes_in") or key.endswith("_bytes_out")
+                fmt_fn = (
+                    (lambda v: f"{int(v):,}") if is_bytes else (lambda v: fmt(v))
+                )
+                out += (
+                    indent
+                    + "\t* {}: {} min, {} max, {} mean, {} total ({} samples)\n"
+                ).format(
+                    key,
+                    fmt_fn(summary.min),
+                    fmt_fn(summary.max),
+                    fmt_fn(summary.mean),
+                    fmt_fn(summary.sum),
+                    summary.count,
+                )
         return out
 
     def __repr__(self, level=0) -> str:

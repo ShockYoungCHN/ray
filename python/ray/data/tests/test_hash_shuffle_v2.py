@@ -612,6 +612,159 @@ def test_e2e_repartition_with_sort_produces_sorted_partitions(
             assert ids == sorted(ids)
 
 
+# ===========================================================================
+# Shuffle profiling (RAY_DATA_SHUFFLE_PROFILE=1)
+# ===========================================================================
+
+
+def test_stage_timings_disabled_returns_none(monkeypatch):
+    """When profiling is off, _StageTimings.as_dict is None and record() is
+    a true no-op (no dict allocation, no time.perf_counter calls)."""
+    from ray.data._internal.execution.operators.shuffle_operators import (
+        _shuffle_tasks,
+    )
+
+    monkeypatch.setattr(_shuffle_tasks, "_SHUFFLE_PROFILE_ENABLED", False)
+    timings = _shuffle_tasks._StageTimings()
+    with timings.record("foo"):
+        pass
+    timings.add("bytes", 100.0)
+    assert timings.as_dict() is None
+
+
+def test_stage_timings_enabled_accumulates(monkeypatch):
+    from ray.data._internal.execution.operators.shuffle_operators import (
+        _shuffle_tasks,
+    )
+
+    monkeypatch.setattr(_shuffle_tasks, "_SHUFFLE_PROFILE_ENABLED", True)
+    timings = _shuffle_tasks._StageTimings()
+    with timings.record("foo"):
+        pass
+    with timings.record("foo"):
+        pass
+    timings.add("bar_bytes_in", 42.0)
+    timings.add("bar_bytes_in", 8.0)
+    out = timings.as_dict()
+    assert "foo" in out and out["foo"] >= 0
+    assert out["bar_bytes_in"] == 50.0
+
+
+def test_operator_stats_summary_aggregates_shuffle_stages():
+    """from_block_metadata should aggregate shuffle_stage_timings_s across
+    BlockStats and synthetic driver-only entries should not pollute the
+    row/byte/task accumulators."""
+    from ray.data._internal.stats import OperatorStatsSummary
+    from ray.data.block import BlockExecStats, BlockStats
+
+    blocks = [
+        BlockStats(
+            num_rows=100,
+            size_bytes=1000,
+            exec_stats=BlockExecStats(
+                start_time_s=0.0,
+                end_time_s=1.0,
+                wall_time_s=1.0,
+                cpu_time_s=0.5,
+                shuffle_stage_timings_s={"map.ipc_encode_s": 0.2},
+            ),
+        ),
+        BlockStats(
+            num_rows=200,
+            size_bytes=2000,
+            exec_stats=BlockExecStats(
+                start_time_s=0.5,
+                end_time_s=1.5,
+                wall_time_s=1.0,
+                cpu_time_s=0.6,
+                shuffle_stage_timings_s={"map.ipc_encode_s": 0.4},
+            ),
+        ),
+        # Synthetic driver-only entry: must not bump num_exec, output_num_rows,
+        # output_size_bytes, etc.
+        BlockStats(
+            num_rows=None,
+            size_bytes=None,
+            exec_stats=BlockExecStats(
+                shuffle_stage_timings_s={"driver.barrier_wait_s": 0.05},
+            ),
+        ),
+    ]
+    summary = OperatorStatsSummary.from_block_metadata(
+        "TestOp", blocks, is_sub_operator=False
+    )
+    assert summary.shuffle_stage_timings is not None
+    assert "map.ipc_encode_s" in summary.shuffle_stage_timings
+    assert summary.shuffle_stage_timings["map.ipc_encode_s"].count == 2
+    assert summary.shuffle_stage_timings["map.ipc_encode_s"].sum == pytest.approx(0.6)
+    assert "driver.barrier_wait_s" in summary.shuffle_stage_timings
+    # Synthetic entry must not contribute to row/byte aggregations.
+    assert summary.output_num_rows.sum == 300
+    assert summary.output_size_bytes.sum == 3000
+
+    rendered = str(summary)
+    assert "Shuffle stages (RAY_DATA_SHUFFLE_PROFILE=1)" in rendered
+    assert "map.ipc_encode_s" in rendered
+    assert "driver.barrier_wait_s" in rendered
+
+
+def test_operator_stats_summary_omits_section_when_off():
+    """No shuffle_stage_timings_s on any block → no section in rendered output."""
+    from ray.data._internal.stats import OperatorStatsSummary
+    from ray.data.block import BlockExecStats, BlockStats
+
+    blocks = [
+        BlockStats(
+            num_rows=10,
+            size_bytes=100,
+            exec_stats=BlockExecStats(
+                start_time_s=0.0,
+                end_time_s=1.0,
+                wall_time_s=1.0,
+                cpu_time_s=0.5,
+            ),
+        ),
+    ]
+    summary = OperatorStatsSummary.from_block_metadata(
+        "TestOp", blocks, is_sub_operator=False
+    )
+    assert summary.shuffle_stage_timings is None
+    assert "Shuffle stages" not in str(summary)
+
+
+def test_e2e_shuffle_profile_emits_driver_timings(
+    ray_start_regular_shared_2_cpus,
+    restore_data_context,
+    disable_fallback_to_object_extension,
+    monkeypatch,
+):
+    """E2E: with driver-side profile flag flipped on, ds.stats() must
+    contain the Shuffle stages section with the driver-side keys.
+
+    Worker-side keys (map.*, reduce.*) require the env var to be present
+    in the worker process at import time, which is fixture-dependent and
+    out of scope for this smoke test."""
+    from ray.data._internal.execution.operators.shuffle_operators import (
+        _shuffle_tasks,
+        shuffle_map_operator,
+        shuffle_reduce_operator,
+    )
+
+    monkeypatch.setattr(_shuffle_tasks, "_SHUFFLE_PROFILE_ENABLED", True)
+    monkeypatch.setattr(shuffle_map_operator, "_SHUFFLE_PROFILE_ENABLED", True)
+    monkeypatch.setattr(shuffle_reduce_operator, "_SHUFFLE_PROFILE_ENABLED", True)
+
+    ctx = DataContext.get_current()
+    ctx.shuffle_strategy = ShuffleStrategy.HASH_SHUFFLE
+
+    ds = ray.data.range(200, override_num_blocks=4).repartition(4, keys=["id"])
+    assert ds.count() == 200
+    stats_str = ds.stats()
+    assert "Shuffle stages (RAY_DATA_SHUFFLE_PROFILE=1)" in stats_str
+    assert "driver.map_phase_s" in stats_str
+    assert "driver.first_reduce_dispatch_s" in stats_str
+
+
 if __name__ == "__main__":
     import sys
 
