@@ -199,7 +199,11 @@ def hash_partition(
     # The ``np.split`` call avoids a Python-level list comprehension over
     # ``num_partitions``, which becomes noticeable at very large P.
     sorted_row_indices = pc.sort_indices(pa.array(row_to_partition)).to_numpy()
-    counts = np.bincount(row_to_partition, minlength=num_partitions)
+    # np.bincount rejects uint64 under the 'safe' cast rule even though
+    # partition IDs are bounded by num_partitions; cast to int64 explicitly.
+    counts = np.bincount(
+        row_to_partition.astype(np.int64, copy=False), minlength=num_partitions
+    )
     # ``np.split`` takes interior boundaries: cumulative sums of all but the
     # last group (the final group runs to the end of the array).
     split_points = np.cumsum(counts[:-1])
