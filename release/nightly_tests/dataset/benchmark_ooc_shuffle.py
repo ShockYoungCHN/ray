@@ -12,12 +12,23 @@ Usage:
 import argparse
 import gc
 import json
+import os
 import shutil
 import time
 from datetime import datetime
 
 import ray
 from ray.data.context import ShuffleStrategy
+
+# Env vars that must be visible inside Ray worker processes (driver-side
+# `os.environ` does NOT propagate to workers on an Anyscale workspace,
+# because `ray.init()` attaches to a cluster that is already running).
+# Anything read at module-import time on a worker — e.g. the shuffle-
+# profile flag in `_shuffle_tasks.py` — must be forwarded via
+# `runtime_env={"env_vars": ...}`.
+_WORKER_ENV_VARS_TO_FORWARD = (
+    "RAY_DATA_SHUFFLE_PROFILE",
+)
 
 STRATEGY_MAP = {
     "actorless": ShuffleStrategy.HASH_SHUFFLE,
@@ -109,7 +120,13 @@ def main():
     )
     args = parser.parse_args()
 
-    ray.init()
+    forwarded_env_vars = {
+        k: os.environ[k] for k in _WORKER_ENV_VARS_TO_FORWARD if k in os.environ
+    }
+    runtime_env = {"env_vars": forwarded_env_vars} if forwarded_env_vars else None
+    if forwarded_env_vars:
+        print(f"Forwarding env vars to workers: {forwarded_env_vars}")
+    ray.init(runtime_env=runtime_env)
 
     cluster = ray.cluster_resources()
     total_cpu = cluster.get("CPU", 0)
