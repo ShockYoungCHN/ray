@@ -2429,6 +2429,7 @@ void NodeManager::ConvertWorkerToActor(const std::shared_ptr<WorkerInterface> &w
   }
 }
 
+  // run periodically, or when a new obj is added to local (ray put, or copied over)
 void NodeManager::SpillIfOverPrimaryObjectsThreshold() {
   if (RayConfig::instance().object_spilling_config().empty()) {
     RAY_LOG(INFO) << "Object spilling is disabled because spilling config is unspecified";
@@ -2442,7 +2443,8 @@ void NodeManager::SpillIfOverPrimaryObjectsThreshold() {
     RAY_LOG(INFO) << "Triggering object spilling because current usage "
                   << allocated_percentage * 100 << "% is above threshold "
                   << RayConfig::instance().object_spilling_threshold() * 100 << "%.";
-    local_object_manager_.SpillObjectUptoMaxThroughput();
+    local_object_manager_.SpillObjectUptoMaxThroughput(
+        SpillTrigger::kThresholdMonitor);
   }
 }
 

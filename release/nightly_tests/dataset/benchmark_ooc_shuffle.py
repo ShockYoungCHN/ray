@@ -20,6 +20,12 @@ from datetime import datetime
 import ray
 from ray.data.context import ShuffleStrategy
 
+from spill_metrics_dump import (
+    collect_spill_metrics,
+    default_output_dir,
+    summarize,
+)
+
 # Env vars that must be visible inside Ray worker processes (driver-side
 # `os.environ` does NOT propagate to workers on an Anyscale workspace,
 # because `ray.init()` attaches to a cluster that is already running).
@@ -92,6 +98,11 @@ def run_one(data_size_gb, num_partitions, strategy_name="actorless", uncap_reduc
     elapsed = time.perf_counter() - start
     print(f"{elapsed:.1f}s ({target_rows:,} rows, {data_size_gb:.1f} GB)")
 
+    if os.environ.get("RAY_DATA_SHUFFLE_PROFILE") == "1":
+        print("\n========== ds.stats() ==========")
+        print(repartitioned.stats())
+        print("================================\n")
+
     del repartitioned, ds
     gc.collect()
     shutil.rmtree(output_path, ignore_errors=True)
@@ -107,7 +118,9 @@ def run_one(data_size_gb, num_partitions, strategy_name="actorless", uncap_reduc
 
 def main():
     parser = argparse.ArgumentParser(description="Out-of-core shuffle benchmark")
-    parser.add_argument("--output", type=str, default="benchmark_ooc_shuffle_results.json")
+    parser.add_argument("--output", type=str, default=None,
+        help="Output JSON path. Defaults to "
+             "<persistent_log_dir>/<ts>/benchmark_ooc_shuffle.json.")
     parser.add_argument("--data-size-gb", type=int, required=True)
     parser.add_argument("--num-partitions", type=int, required=True)
     parser.add_argument(
@@ -120,13 +133,26 @@ def main():
     )
     args = parser.parse_args()
 
+    # Define unique experiment output directory
+    ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    experiment_dir = os.path.join(default_output_dir(), ts_str)
+    os.makedirs(experiment_dir, exist_ok=True)
+
+    # Fixed log path for all nodes (mandatory for C++)
+    # Two options usually:
+    # 1. /home/ray/default/raylet_spill_events.out
+    # 2. /tmp/raylet_spill_events.out
+    spill_log_path = "/tmp/raylet_spill_events.out"
+
     forwarded_env_vars = {
         k: os.environ[k] for k in _WORKER_ENV_VARS_TO_FORWARD if k in os.environ
     }
-    runtime_env = {"env_vars": forwarded_env_vars} if forwarded_env_vars else None
-    if forwarded_env_vars:
-        print(f"Forwarding env vars to workers: {forwarded_env_vars}")
-    ray.init(runtime_env=runtime_env)
+    # Mandate the spill log path for all workers and nodes
+    forwarded_env_vars["RAY_SPILL_EVENTS_LOG_PATH"] = spill_log_path
+    
+    runtime_env = {"env_vars": forwarded_env_vars}
+    print(f"Forwarding env vars to workers: {forwarded_env_vars}")
+    ray.init(address="auto", runtime_env=runtime_env)
 
     cluster = ray.cluster_resources()
     total_cpu = cluster.get("CPU", 0)
@@ -153,7 +179,11 @@ def main():
         f"({ratio:.1f}x of in-core limit, {zone}) ---"
     )
 
+    benchmark_start_ts = time.time()
     info = run_one(data_size_gb, num_partitions, strategy_name=strategy_name, uncap_reduce=args.uncap_reduce)
+
+    # Collect metrics and pull raw log files from all nodes into experiment_dir
+    spill_metrics = collect_spill_metrics(start_ts=benchmark_start_ts, output_dir=experiment_dir)
 
     result = {
         "timestamp": datetime.now().isoformat(),
@@ -170,11 +200,19 @@ def main():
             "ratio_to_in_core_limit": round(ratio, 2),
         },
         **info,
+        "spill_metrics": spill_metrics,
     }
-    with open(args.output, "w") as f:
+
+    output_path = args.output
+    if output_path is None:
+        output_path = os.path.join(experiment_dir, "benchmark_ooc_shuffle.json")
+
+    with open(output_path, "w") as f:
         json.dump(result, f, indent=2)
 
-    print(f"\nResults written to {args.output}")
+    print()
+    print(summarize(spill_metrics))
+    print(f"\nResults and raw logs written to {experiment_dir}")
     t = info["elapsed_s"]
     tp = f"{info['actual_gb'] / t:.1f} GB/s" if t and t > 0 else "N/A"
     print(f"  {data_size_gb} GB, {num_partitions} partitions: {t:.1f}s, {tp}")

@@ -72,7 +72,7 @@ class FakeLocalObjectManager : public LocalObjectManagerInterface {
   }
 
   // NOOP
-  void SpillObjectUptoMaxThroughput() override {}
+  void SpillObjectUptoMaxThroughput(SpillTrigger /*trigger*/) override {}
 
   void SpillObjects(const std::vector<ObjectID> &objects_ids,
                     std::function<void(const ray::Status &)> callback) override {}

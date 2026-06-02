@@ -41,6 +41,20 @@ namespace raylet {
 /// The default number of retries when spilled object deletion failed.
 inline constexpr int64_t kDefaultSpilledObjectDeleteRetries = 3;
 
+/// Initialize a dedicated spdlog sink for spill telemetry. Writes one event
+/// per line to `<dir>/raylet_spill_events.out`.
+///
+/// Directory resolution (first match wins):
+///   1. $RAY_SPILL_EVENTS_DIR if set,
+///   2. /home/ray/default/raylet_spill_events if that dir exists (Anyscale
+///      workspaces — persistent, survives session restart),
+///   3. `fallback_log_dir` (typically the raylet's session log dir under /tmp).
+///
+/// Safe to call at most once per process; subsequent calls are no-ops. If
+/// never called (e.g. in unit tests), emission is dropped silently — see
+/// `EmitSpillEvent` in the .cc.
+void InitSpillEventLogger(const std::string &fallback_log_dir);
+
 /// This class implements memory management for primary objects, objects that
 /// have been freed, and objects that have been spilled.
 class LocalObjectManager : public LocalObjectManagerInterface {
@@ -131,8 +145,11 @@ class LocalObjectManager : public LocalObjectManagerInterface {
 
   /// Spill objects as much as possible as fast as possible up to the max throughput.
   ///
+  /// \param trigger Identifies which production trigger path initiated this
+  /// spill. Recorded as a Prometheus label on per-object spill metrics so the
+  /// three trigger paths can be told apart in monitoring/post-mortems.
   /// \return True if spilling is in progress.
-  void SpillObjectUptoMaxThroughput() override;
+  void SpillObjectUptoMaxThroughput(SpillTrigger trigger) override;
 
   /// TODO(dayshah): This function is only used for testing, we should remove and just
   /// keep SpillObjectsInternal.
@@ -214,15 +231,30 @@ class LocalObjectManager : public LocalObjectManagerInterface {
   struct LocalObjectInfo {
     LocalObjectInfo(const rpc::Address &owner_address,
                     const ObjectID &generator_id,
-                    size_t object_size)
+                    size_t object_size,
+                    ObjectCreatorType creator_type = ObjectCreatorType::kUnknown)
         : owner_address_(owner_address),
           generator_id_(generator_id.IsNil() ? std::nullopt
                                              : std::optional<ObjectID>(generator_id)),
-          object_size_(object_size) {}
+          object_size_(object_size),
+          creator_type_(creator_type) {}
     rpc::Address owner_address_;
     bool is_freed_ = false;
     std::optional<ObjectID> generator_id_;
     size_t object_size_;
+    /// What kind of caller created this object (e.g. ray.put vs. task return).
+    /// Phase 1: always kUnknown; reserved for CoreWorker to populate later so
+    /// the spill metrics get real attribution without further raylet changes.
+    ObjectCreatorType creator_type_ = ObjectCreatorType::kUnknown;
+    /// Nanosecond timestamp at which spill completed for this object. Zero
+    /// until OnObjectSpilled fires. Used to emit the spill→delete duration
+    /// histogram when the object eventually exits via
+    /// ProcessSpilledObjectsDeleteQueue.
+    int64_t spill_completion_ns_ = 0;
+    /// Trigger path that produced the in-flight or completed spill. Captured
+    /// at SpillObjectsInternal entry and read by OnObjectSpilled and
+    /// ProcessSpilledObjectsDeleteQueue when emitting spill metrics.
+    SpillTrigger last_spill_trigger_ = SpillTrigger::kExplicitApi;
   };
 
   FRIEND_TEST(LocalObjectManagerTest, TestTryToSpillObjectsZero);
@@ -239,12 +271,15 @@ class LocalObjectManager : public LocalObjectManagerInterface {
   /// currently spilling objects time to finish.
   /// NOTE(sang): If 0 is given, this method spills a single object.
   ///
+  /// \param trigger Trigger path forwarded by SpillObjectUptoMaxThroughput so
+  /// per-object spill metrics can record the correct source label.
   /// \return True if it decides to spill more objects. False otherwise.
-  bool TryToSpillObjects();
+  bool TryToSpillObjects(SpillTrigger trigger);
 
   /// Internal helper method for spilling objects.
   void SpillObjectsInternal(const std::vector<ObjectID> &objects_ids,
-                            std::function<void(const ray::Status &)> callback);
+                            std::function<void(const ray::Status &)> callback,
+                            SpillTrigger trigger);
 
   /// Release an object that has been freed by its owner.
   void ReleaseFreedObject(const ObjectID &object_id);
@@ -255,7 +290,8 @@ class LocalObjectManager : public LocalObjectManagerInterface {
   /// 3. Update the spilled URL to the local directory if it doesn't
   ///    use the external storages like S3.
   void OnObjectSpilled(const std::vector<ObjectID> &object_ids,
-                       const rpc::SpillObjectsReply &worker_reply);
+                       const rpc::SpillObjectsReply &worker_reply,
+                       SpillTrigger trigger);
 
   /// Delete spilled objects stored in given urls.
   ///

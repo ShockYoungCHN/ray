@@ -47,6 +47,12 @@ from datetime import date, datetime
 from typing import Callable, Dict, List, Optional, Tuple
 
 import ray
+
+from spill_metrics_dump import (
+    collect_spill_metrics,
+    default_output_dir,
+    summarize,
+)
 from ray.data.aggregate import Count, Mean, Sum
 from ray.data.context import ShuffleStrategy
 from ray.data.expressions import col, lit
@@ -403,7 +409,9 @@ def run_one(name: str, sf: int, num_partitions: int) -> Dict:
 def main():
     parser = argparse.ArgumentParser(description="TPC-H query benchmark")
     parser.add_argument(
-        "--output", type=str, default="benchmark_tpch_results.json",
+        "--output", type=str, default=None,
+        help="Output JSON path. Defaults to "
+             "<persistent_log_dir>/benchmark_tpch_sf{N}_<ts>.json.",
     )
     parser.add_argument(
         "--scale-factor", type=int, required=True,
@@ -466,6 +474,8 @@ def main():
         results.append(info)
         print()
 
+    spill_metrics = collect_spill_metrics()
+
     out = {
         "timestamp": datetime.now().isoformat(),
         "cluster": {
@@ -479,11 +489,23 @@ def main():
             "queries": selected,
         },
         "results": results,
+        "spill_metrics": spill_metrics,
     }
-    with open(args.output, "w") as f:
+
+    output_path = args.output
+    if output_path is None:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = os.path.join(
+            default_output_dir(),
+            f"benchmark_tpch_sf{args.scale_factor}_{args.num_partitions}p_{ts}.json",
+        )
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    with open(output_path, "w") as f:
         json.dump(out, f, indent=2)
 
-    print(f"Results written to {args.output}")
+    print()
+    print(summarize(spill_metrics))
+    print(f"\nResults written to {output_path}")
     print()
     print("Summary:")
     for r in results:
