@@ -680,7 +680,7 @@ TEST_F(LocalObjectManagerTest, TestTryToSpillObjectsZero) {
   manager.PinObjectsAndWaitForFree(object_ids, std::move(objects), owner_address);
   // Make sure providing 0 bytes as min_spilling_size_ will spill one object.
   manager.min_spilling_size_ = 0;
-  ASSERT_TRUE(manager.TryToSpillObjects());
+  ASSERT_TRUE(manager.TryToSpillObjects(SpillTrigger::kThresholdMonitor));
   ASSERT_TRUE(worker_pool.FlushPopSpillWorkerCallbacks());
   EXPECT_CALL(worker_pool, PushSpillWorker(_));
   const std::string url = BuildURL("url" + std::to_string(object_ids.size()));
@@ -715,7 +715,7 @@ TEST_F(LocalObjectManagerTest, TestSpillUptoMaxFuseCount) {
   }
   manager.PinObjectsAndWaitForFree(object_ids, std::move(objects), owner_address);
   manager.min_spilling_size_ = total_size;
-  ASSERT_TRUE(manager.TryToSpillObjects());
+  ASSERT_TRUE(manager.TryToSpillObjects(SpillTrigger::kThresholdMonitor));
   ASSERT_TRUE(worker_pool.FlushPopSpillWorkerCallbacks());
   for (const auto &id : object_ids) {
     ASSERT_EQ((*unpins)[id], 0);
@@ -761,14 +761,14 @@ TEST_F(LocalObjectManagerTest, TestSpillObjectNotEvictable) {
 
   manager.PinObjectsAndWaitForFree(object_ids, std::move(objects), owner_address);
   manager.min_spilling_size_ = 1000;
-  ASSERT_FALSE(manager.TryToSpillObjects());
+  ASSERT_FALSE(manager.TryToSpillObjects(SpillTrigger::kThresholdMonitor));
   for (const auto &id : object_ids) {
     ASSERT_EQ((*unpins)[id], 0);
   }
 
   // Now object is evictable. Spill should succeed.
   unevictable_objects_.erase(object_id);
-  ASSERT_TRUE(manager.TryToSpillObjects());
+  ASSERT_TRUE(manager.TryToSpillObjects(SpillTrigger::kThresholdMonitor));
 
   AssertIOWorkersDoSpill(/*num_objects*/ 1, /*num_batches*/ 1);
   ASSERT_EQ(GetCurrentSpilledCount(), 1);
@@ -796,11 +796,11 @@ TEST_F(LocalObjectManagerTest, TestSpillUptoMaxThroughput) {
   manager.PinObjectsAndWaitForFree(object_ids, std::move(objects), owner_address);
 
   // This will spill until 2 workers are occupied.
-  manager.SpillObjectUptoMaxThroughput();
+  manager.SpillObjectUptoMaxThroughput(SpillTrigger::kThresholdMonitor);
   ASSERT_TRUE(worker_pool.FlushPopSpillWorkerCallbacks());
   ASSERT_TRUE(manager.IsSpillingInProgress());
   // Spilling is still going on, meaning we can make the pace. So it should return true.
-  manager.SpillObjectUptoMaxThroughput();
+  manager.SpillObjectUptoMaxThroughput(SpillTrigger::kThresholdMonitor);
   ASSERT_TRUE(worker_pool.FlushPopSpillWorkerCallbacks());
   ASSERT_TRUE(manager.IsSpillingInProgress());
   // No object ids are spilled yet.
@@ -826,10 +826,10 @@ TEST_F(LocalObjectManagerTest, TestSpillUptoMaxThroughput) {
   // Now, there's only one object that is current spilling.
   // SpillObjectUptoMaxThroughput will spill one more object (since one worker is
   // available).
-  manager.SpillObjectUptoMaxThroughput();
+  manager.SpillObjectUptoMaxThroughput(SpillTrigger::kThresholdMonitor);
   ASSERT_TRUE(worker_pool.FlushPopSpillWorkerCallbacks());
   ASSERT_TRUE(manager.IsSpillingInProgress());
-  manager.SpillObjectUptoMaxThroughput();
+  manager.SpillObjectUptoMaxThroughput(SpillTrigger::kThresholdMonitor);
   ASSERT_TRUE(manager.IsSpillingInProgress());
   ASSERT_FALSE(worker_pool.FlushPopSpillWorkerCallbacks());
 
@@ -852,7 +852,7 @@ TEST_F(LocalObjectManagerTest, TestSpillUptoMaxThroughput) {
   }
 
   // We cannot spill anymore as there is no more pinned object.
-  manager.SpillObjectUptoMaxThroughput();
+  manager.SpillObjectUptoMaxThroughput(SpillTrigger::kThresholdMonitor);
   ASSERT_FALSE(worker_pool.FlushPopSpillWorkerCallbacks());
   ASSERT_FALSE(manager.IsSpillingInProgress());
 }
@@ -1491,14 +1491,14 @@ TEST_F(LocalObjectManagerFusedTest, TestMinSpillingSize) {
     objects.push_back(std::move(object));
   }
   manager.PinObjectsAndWaitForFree(object_ids, std::move(objects), owner_address);
-  manager.SpillObjectUptoMaxThroughput();
+  manager.SpillObjectUptoMaxThroughput(SpillTrigger::kThresholdMonitor);
   // Only 2 of the objects should be spilled.
   ASSERT_TRUE(worker_pool.FlushPopSpillWorkerCallbacks());
   ASSERT_FALSE(worker_pool.FlushPopSpillWorkerCallbacks());
   for (const auto &id : object_ids) {
     ASSERT_EQ((*unpins)[id], 0);
   }
-  manager.SpillObjectUptoMaxThroughput();
+  manager.SpillObjectUptoMaxThroughput(SpillTrigger::kThresholdMonitor);
   ASSERT_FALSE(worker_pool.FlushPopSpillWorkerCallbacks());
 
   // Check that half the objects get spilled and the URLs get added to the
@@ -1529,7 +1529,7 @@ TEST_F(LocalObjectManagerFusedTest, TestMinSpillingSize) {
 
   // We will spill the last object, even though we're under the min spilling
   // size, because they are the only spillable objects.
-  manager.SpillObjectUptoMaxThroughput();
+  manager.SpillObjectUptoMaxThroughput(SpillTrigger::kThresholdMonitor);
   ASSERT_TRUE(worker_pool.FlushPopSpillWorkerCallbacks());
   ASSERT_FALSE(worker_pool.FlushPopSpillWorkerCallbacks());
 }
@@ -1553,7 +1553,7 @@ TEST_F(LocalObjectManagerFusedTest, TestMinSpillingSizeMaxFusionCount) {
     objects.push_back(std::move(object));
   }
   manager.PinObjectsAndWaitForFree(object_ids, std::move(objects), owner_address);
-  manager.SpillObjectUptoMaxThroughput();
+  manager.SpillObjectUptoMaxThroughput(SpillTrigger::kThresholdMonitor);
   // First two spill batches succeed because they have at least 15 objects.
   ASSERT_TRUE(worker_pool.FlushPopSpillWorkerCallbacks());
   ASSERT_TRUE(worker_pool.FlushPopSpillWorkerCallbacks());
@@ -1577,7 +1577,7 @@ TEST_F(LocalObjectManagerFusedTest, TestMinSpillingSizeMaxFusionCount) {
 
   // We will spill the last objects even though we're under the min spilling
   // size because they are the only spillable objects.
-  manager.SpillObjectUptoMaxThroughput();
+  manager.SpillObjectUptoMaxThroughput(SpillTrigger::kThresholdMonitor);
   ASSERT_TRUE(worker_pool.FlushPopSpillWorkerCallbacks());
   ASSERT_FALSE(worker_pool.FlushPopSpillWorkerCallbacks());
 
@@ -1622,7 +1622,7 @@ TEST_F(LocalObjectManagerMaxFileSizeFusedTest, TestMaxSpillingFileSizeMaxFusionC
   // batches are spilled.
   size_t batch_idx = 0;
   while (batch_idx < expected_batches.size()) {
-    manager.SpillObjectUptoMaxThroughput();
+    manager.SpillObjectUptoMaxThroughput(SpillTrigger::kThresholdMonitor);
 
     // This round may enqueue 0/1/2 pop callbacks (depending on max_io_workers=2).
     while (worker_pool.FlushPopSpillWorkerCallbacks()) {
@@ -1679,7 +1679,7 @@ TEST_F(LocalObjectManagerMaxFileSizeFusedTest,
 
   manager.PinObjectsAndWaitForFree(object_ids, std::move(objects), owner_address);
 
-  manager.SpillObjectUptoMaxThroughput();
+  manager.SpillObjectUptoMaxThroughput(SpillTrigger::kThresholdMonitor);
   ASSERT_TRUE(worker_pool.FlushPopSpillWorkerCallbacks());
 
   ASSERT_EQ(worker_pool.io_worker_client->spill_request_object_counts.size(), 1);
