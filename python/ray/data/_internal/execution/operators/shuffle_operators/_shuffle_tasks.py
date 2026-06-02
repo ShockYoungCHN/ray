@@ -31,6 +31,12 @@ PartitionFn = Callable[[pa.Table], Dict[int, pa.Table]]
 # See ShuffleReduceOp for streaming vs. blocking call semantics.
 ReduceFn = Callable[[int, List[pa.Table]], Iterable[Block]]
 
+# Optional per-block transform applied inside the map task before partitioning
+# (e.g. partial pre-aggregation, projection pushdown).  Must preserve the
+# semantics expected by the paired reduce_fn — typically reducing the block's
+# byte footprint without changing the row set in ways the reducer can't merge.
+MapBlockTransformer = Callable[[Block], Block]
+
 
 # Number of ObjectRefs fetched per ray.get() call in reducers.
 _REDUCE_BATCH_SIZE = 16
@@ -88,6 +94,7 @@ def _partition_blocks_to_shards(
     blocks: Tuple[Block, ...],
     partition_fn: PartitionFn,
     timings: Optional["_StageTimings"] = None,
+    input_block_transformer: Optional["MapBlockTransformer"] = None,
 ) -> Dict[int, List[pa.Table]]:
     """Run partition_fn on each block; collect non-empty shards by pid.
 
@@ -97,6 +104,10 @@ def _partition_blocks_to_shards(
     performance constraint, not optional: hash_partition's per-column take
     is sensitive to chunk count, and leaving chunked input alone halves map
     throughput.
+
+    If ``input_block_transformer`` is provided, it runs on each input block
+    before chunk defragmentation and partitioning — used by hash-aggregate
+    for partial pre-aggregation that shrinks the shuffle payload.
     """
     if timings is None:
         timings = _StageTimings()
@@ -107,6 +118,14 @@ def _partition_blocks_to_shards(
         )
         if block.num_rows == 0:
             continue
+        if input_block_transformer is not None:
+            with timings.record("map.input_transform_s"):
+                block = input_block_transformer(block)
+                block = TableBlockAccessor.try_convert_block_type(
+                    block, block_type=BlockType.ARROW
+                )
+            if block.num_rows == 0:
+                continue
         assert isinstance(block, pa.Table), f"Expected pa.Table, got {type(block)}"
         if any(col.num_chunks > 1 for col in block.columns):
             with timings.record("map.combine_chunks_s"):
@@ -150,6 +169,7 @@ def _shuffle_map_task(
     *blocks: Block,
     partition_fn: PartitionFn,
     num_partitions: int,
+    input_block_transformer: Optional["MapBlockTransformer"] = None,
 ):
     """Map stage: partition input blocks and return one shard per partition.
 
@@ -206,7 +226,10 @@ def _shuffle_map_task(
 
     # Step 1: partition each input block into (pid -> [shard_table, ...]).
     partition_accumulators = _partition_blocks_to_shards(
-        blocks, partition_fn, timings=timings
+        blocks,
+        partition_fn,
+        timings=timings,
+        input_block_transformer=input_block_transformer,
     )
 
     # Step 2: merge per-pid shards and ZSTD-encode each partition.

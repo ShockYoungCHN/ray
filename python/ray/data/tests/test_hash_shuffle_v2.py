@@ -451,12 +451,12 @@ def test_reduce_op_submits_one_task_per_partition_bundle(monkeypatch):
     assert sorted(submitted) == [0, 1, 2, 3]
     assert op._num_reduce_tasks_submitted == 4
     # Each bundle is 3 shards × 100 bytes = 300 bytes;
-    # memory ask = 2 × 300 = 600 bytes (per-task peak USS headroom;
+    # memory ask = 3.5 × 300 = 1050 bytes (per-task peak USS headroom;
     # relies on @ray.remote(max_calls=1) keeping the worker heap clean
     # between tasks); CPUs = 1.0.
     for opt in submitted_options:
         assert opt["num_cpus"] == 1.0
-        assert opt["memory"] == 600
+        assert opt["memory"] == 1050
         assert opt["scheduling_strategy"] == "SPREAD"
 
 
@@ -485,7 +485,7 @@ def test_reduce_op_short_circuits_empty_input_bundle(monkeypatch):
 
 def test_reduce_op_declares_per_task_memory_from_upstream(monkeypatch):
     """Once upstream's per-partition byte snapshot is populated,
-    `incremental_resource_usage` declares `memory = 2 × avg` — the
+    `incremental_resource_usage` declares `memory = 3.5 × avg` — the
     decompressed accumulator plus a margin for plasma + per-node
     baseline.  Relies on @ray.remote(max_calls=1) on
     _shuffle_reduce_task to keep the worker heap baseline clean."""
@@ -497,7 +497,7 @@ def test_reduce_op_declares_per_task_memory_from_upstream(monkeypatch):
     )
     inc = op.incremental_resource_usage()
     assert inc.cpu == 1.0
-    assert inc.memory == 2 * 1024**3
+    assert inc.memory == int(3.5 * 1024**3)
 
 
 def test_reduce_op_inc_resources_empty_until_upstream_reports(monkeypatch):
@@ -610,6 +610,115 @@ def test_e2e_repartition_with_sort_produces_sorted_partitions(
             block = ray.get(block_ref)
             ids = block["id"].to_pylist()
             assert ids == sorted(ids)
+
+
+# ===========================================================================
+# End-to-end: groupby().aggregate() via V2 dispatch
+# ===========================================================================
+
+
+def test_e2e_aggregate_single_key_sum(
+    ray_start_regular_shared_2_cpus,
+    restore_data_context,
+    disable_fallback_to_object_extension,
+):
+    """groupby + sum on a single key dispatches through V2 ShuffleMapOp /
+    ShuffleReduceOp and produces correct per-group totals."""
+    ctx = DataContext.get_current()
+    ctx.shuffle_strategy = ShuffleStrategy.HASH_SHUFFLE
+
+    ds = ray.data.range(1000, override_num_blocks=10).map(
+        lambda row: {"k": row["id"] % 5, "v": row["id"]}
+    )
+    out = ds.groupby("k").sum("v").take_all()
+
+    expected = {k: sum(i for i in range(1000) if i % 5 == k) for k in range(5)}
+    actual = {row["k"]: row["sum(v)"] for row in out}
+    assert actual == expected
+
+
+def test_e2e_aggregate_multi_agg(
+    ray_start_regular_shared_2_cpus,
+    restore_data_context,
+    disable_fallback_to_object_extension,
+):
+    """Combined Sum + Mean + Count over a single key flows through V2 without
+    losing any aggregate."""
+    from ray.data.aggregate import Count, Mean, Sum
+
+    ctx = DataContext.get_current()
+    ctx.shuffle_strategy = ShuffleStrategy.HASH_SHUFFLE
+
+    ds = ray.data.range(600, override_num_blocks=6).map(
+        lambda row: {"k": row["id"] % 3, "v": row["id"]}
+    )
+    out = ds.groupby("k").aggregate(Sum("v"), Mean("v"), Count()).take_all()
+    rows = {row["k"]: row for row in out}
+
+    for k in range(3):
+        vs = [i for i in range(600) if i % 3 == k]
+        assert rows[k]["sum(v)"] == sum(vs)
+        assert rows[k]["mean(v)"] == pytest.approx(sum(vs) / len(vs))
+        assert rows[k]["count()"] == len(vs)
+
+
+def test_e2e_aggregate_global(
+    ray_start_regular_shared_2_cpus,
+    restore_data_context,
+    disable_fallback_to_object_extension,
+):
+    """Global aggregation (no key columns) collapses to a single row via the
+    num_partitions=1 override in `_plan_hash_shuffle_aggregate_v2`."""
+    from ray.data.aggregate import Sum
+
+    ctx = DataContext.get_current()
+    ctx.shuffle_strategy = ShuffleStrategy.HASH_SHUFFLE
+
+    ds = ray.data.range(500, override_num_blocks=5)
+    out = ds.aggregate(Sum("id"))
+    assert out == {"sum(id)": sum(range(500))}
+
+
+def test_e2e_aggregate_empty_input(
+    ray_start_regular_shared_2_cpus,
+    restore_data_context,
+    disable_fallback_to_object_extension,
+):
+    """Aggregating an empty dataset yields no group rows; the V2 reducer
+    short-circuits partitions that received no shards."""
+    ctx = DataContext.get_current()
+    ctx.shuffle_strategy = ShuffleStrategy.HASH_SHUFFLE
+
+    ds = ray.data.range(0, override_num_blocks=4).map(
+        lambda row: {"k": row["id"] % 3, "v": row["id"]}
+    )
+    out = ds.groupby("k").sum("v").take_all()
+    assert out == []
+
+
+def test_e2e_aggregate_skewed_keys(
+    ray_start_regular_shared_2_cpus,
+    restore_data_context,
+    disable_fallback_to_object_extension,
+):
+    """Heavy key skew (one dominant key) must not corrupt per-group totals."""
+    ctx = DataContext.get_current()
+    ctx.shuffle_strategy = ShuffleStrategy.HASH_SHUFFLE
+
+    def _key(row):
+        # 95% of rows go to key 0; the rest spread over keys 1..4.
+        return {"k": 0 if row["id"] % 20 != 0 else (row["id"] // 20) % 4 + 1,
+                "v": row["id"]}
+
+    ds = ray.data.range(2000, override_num_blocks=8).map(_key)
+    out = ds.groupby("k").sum("v").take_all()
+
+    expected: dict = {}
+    for i in range(2000):
+        k = 0 if i % 20 != 0 else (i // 20) % 4 + 1
+        expected[k] = expected.get(k, 0) + i
+    actual = {row["k"]: row["sum(v)"] for row in out}
+    assert actual == expected
 
 
 # ===========================================================================
@@ -758,7 +867,10 @@ def test_e2e_shuffle_profile_emits_driver_timings(
     ctx.shuffle_strategy = ShuffleStrategy.HASH_SHUFFLE
 
     ds = ray.data.range(200, override_num_blocks=4).repartition(4, keys=["id"])
-    assert ds.count() == 200
+    # `.count()` on a key-preserving op resolves from metadata without
+    # running the shuffle, so it would leave stats() empty.  Materialize
+    # via take_all to force the map+reduce tasks to execute.
+    assert len(ds.take_all()) == 200
     stats_str = ds.stats()
     assert "Shuffle stages (RAY_DATA_SHUFFLE_PROFILE=1)" in stats_str
     assert "driver.map_phase_s" in stats_str
