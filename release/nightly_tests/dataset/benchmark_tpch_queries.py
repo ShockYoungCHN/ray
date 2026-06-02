@@ -411,7 +411,7 @@ def main():
     parser.add_argument(
         "--output", type=str, default=None,
         help="Output JSON path. Defaults to "
-             "<persistent_log_dir>/benchmark_tpch_sf{N}_<ts>.json.",
+             "<persistent_log_dir>/<ts>/benchmark_tpch_queries.json.",
     )
     parser.add_argument(
         "--scale-factor", type=int, required=True,
@@ -434,14 +434,24 @@ def main():
             f"Unknown queries: {unknown}. Available: {sorted(QUERIES)}"
         )
 
+    # Define unique experiment output directory
+    ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    experiment_dir = os.path.join(default_output_dir(), ts_str)
+    os.makedirs(experiment_dir, exist_ok=True)
+
+    # Fixed log path for all nodes (mandatory for C++)
+    spill_log_path = "/tmp/raylet_spill_events.out"
+
     forwarded = {
         k: os.environ[k] for k in _WORKER_ENV_VARS_TO_FORWARD
         if k in os.environ
     }
-    runtime_env = {"env_vars": forwarded} if forwarded else None
-    if forwarded:
-        print(f"Forwarding env vars to workers: {forwarded}")
-    ray.init(runtime_env=runtime_env)
+    # Mandate the spill log path for all workers and nodes
+    forwarded["RAY_SPILL_EVENTS_LOG_PATH"] = spill_log_path
+    
+    runtime_env = {"env_vars": forwarded}
+    print(f"Forwarding env vars to workers: {forwarded}")
+    ray.init(address="auto", runtime_env=runtime_env)
 
     cluster = ray.cluster_resources()
     total_cpu = cluster.get("CPU", 0)
@@ -459,6 +469,7 @@ def main():
     print()
 
     results: List[Dict] = []
+    benchmark_start_ts = time.time()
     for name in selected:
         print(f"--- {name} (sf{args.scale_factor}) ---")
         try:
@@ -474,7 +485,8 @@ def main():
         results.append(info)
         print()
 
-    spill_metrics = collect_spill_metrics()
+    # Collect metrics and pull raw log files from all nodes into experiment_dir
+    spill_metrics = collect_spill_metrics(start_ts=benchmark_start_ts, output_dir=experiment_dir)
 
     out = {
         "timestamp": datetime.now().isoformat(),
@@ -494,18 +506,14 @@ def main():
 
     output_path = args.output
     if output_path is None:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = os.path.join(
-            default_output_dir(),
-            f"benchmark_tpch_sf{args.scale_factor}_{args.num_partitions}p_{ts}.json",
-        )
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        output_path = os.path.join(experiment_dir, "benchmark_tpch_queries.json")
+    
     with open(output_path, "w") as f:
         json.dump(out, f, indent=2)
 
     print()
     print(summarize(spill_metrics))
-    print(f"\nResults written to {output_path}")
+    print(f"\nResults and raw logs written to {experiment_dir}")
     print()
     print("Summary:")
     for r in results:
