@@ -360,13 +360,17 @@ class Planner:
 
         # Traverse up the DAG, and set the mapping from physical to logical operators.
         # At this point, all physical operators without logical operators set
-        # must have been created by the current logical operator.
+        # must have been created by the current logical operator.  Walk every
+        # unset node — `continue` (not `break`) is required so that a multi-
+        # branch v2 sub-graph (e.g. join's left+right ShuffleMapOps) gets
+        # every branch registered, not just the first one DFS visits.
         queue = [physical_op]
         while queue:
             curr_physical_op = queue.pop()
-            # Once we find an operator with a logical operator set, we can stop.
+            # Skip nodes already attached to an upstream logical op — those
+            # were handled in an earlier _plan_recursively frame.
             if curr_physical_op._logical_operators:
-                break
+                continue
 
             curr_physical_op.set_logical_operators(logical_op)
             # Add this operator to the op_map so optimizer can find it
