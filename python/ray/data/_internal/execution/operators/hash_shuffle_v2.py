@@ -1,15 +1,18 @@
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import pyarrow as pa
 
 from ray.data._internal.arrow_ops.transform_pyarrow import hash_partition
 from ray.data._internal.execution.operators.shuffle_operators._shuffle_tasks import (
     MapBlockTransformer,
+    MultiSeqReduceFn,
     PartitionFn,
     ReduceFn,
 )
+from ray.data._internal.logical.operators import JoinType
 from ray.data.aggregate import AggregateFn
 from ray.data.block import Block
+from ray.data.context import DataContext
 
 # Isolate shuffle map workers into a dedicated worker pool so that
 # ReadParquet/Project tasks don't run on the same workers.  Without this,
@@ -51,6 +54,72 @@ def _sort_reduce(key_columns: List[str]) -> ReduceFn:
             return
         combined = pa.concat_tables(tables) if len(tables) > 1 else tables[0]
         yield combined.sort_by([(k, "ascending") for k in key_columns])
+
+    return _reduce
+
+
+def _make_join_partition_fn(
+    key_columns: List[str], num_partitions: int
+) -> PartitionFn:
+    """Return a partition function that hash-partitions by ``key_columns``.
+
+    Identical to :func:`_make_hash_partition_fn` but kept as a separate
+    factory so the join wiring can reference it by intent; both sides of
+    the join use this with their own key list, but must share the same
+    ``num_partitions`` and the same hash algorithm in :func:`hash_partition`
+    so equal join keys always land in the same partition_id on both
+    sides.
+    """
+
+    def _partition(block: pa.Table) -> Dict[int, pa.Table]:
+        return hash_partition(
+            block, hash_cols=key_columns, num_partitions=num_partitions
+        )
+
+    return _partition
+
+
+def _make_join_reduce_fn(
+    *,
+    join_type: JoinType,
+    left_key_columns: Tuple[str, ...],
+    right_key_columns: Tuple[str, ...],
+    left_columns_suffix: Optional[str],
+    right_columns_suffix: Optional[str],
+    data_context: DataContext,
+) -> MultiSeqReduceFn:
+    """Build a multi-seq reduce_fn that performs an in-memory hash join.
+
+    Wraps the existing :class:`JoiningAggregation` so v2 reuses the v1
+    join algorithm (PyArrow native ``Table.join`` + unsupported-column
+    preprocess/postprocess) — only the execution model (stateless tasks
+    instead of stateful aggregator actors) changes.
+
+    The reduce_fn receives ``{0: left_tables, 1: right_tables}`` where
+    each entry is the full list of decoded shards for this partition on
+    that side.  ``JoiningAggregation.finalize`` is invoked exactly once.
+    """
+    from ray.data._internal.execution.operators.join import JoiningAggregation
+
+    def _reduce(
+        partition_id: int, tables_by_seq: Dict[int, List[pa.Table]]
+    ) -> Iterable[Block]:
+        # ``JoiningAggregation`` expects ``Dict[seq, List[Block]]`` keyed
+        # 0=left, 1=right.  Empty lists are valid (outer joins) — the
+        # aggregation handles the null-padding internally via PyArrow.
+        partition_shards_map = {
+            0: tables_by_seq.get(0, []),
+            1: tables_by_seq.get(1, []),
+        }
+        aggregation = JoiningAggregation(
+            join_type=join_type,
+            left_key_col_names=left_key_columns,
+            right_key_col_names=right_key_columns,
+            left_columns_suffix=left_columns_suffix,
+            right_columns_suffix=right_columns_suffix,
+            data_context=data_context,
+        )
+        yield from aggregation.finalize(partition_shards_map)
 
     return _reduce
 

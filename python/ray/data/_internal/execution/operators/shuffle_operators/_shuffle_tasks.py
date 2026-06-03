@@ -31,6 +31,11 @@ PartitionFn = Callable[[pa.Table], Dict[int, pa.Table]]
 # See ShuffleReduceOp for streaming vs. blocking call semantics.
 ReduceFn = Callable[[int, List[pa.Table]], Iterable[Block]]
 
+# Multi-input variant for joins / N-way combiners.  Receives a dict mapping
+# input_seq_index -> list of decoded shard tables.  Always blocking: the
+# reducer task collects every shard from every side before invoking the fn.
+MultiSeqReduceFn = Callable[[int, Dict[int, List[pa.Table]]], Iterable[Block]]
+
 # Optional per-block transform applied inside the map task before partitioning
 # (e.g. partial pre-aggregation, projection pushdown).  Must preserve the
 # semantics expected by the paired reduce_fn — typically reducing the block's
@@ -416,3 +421,88 @@ def _shuffle_reduce_task(
                 ready.append(output_buffer.next())
         for out_block in ready:
             yield from _yield_with_stats(out_block)
+
+
+@ray.remote(max_calls=1)
+def _shuffle_multi_seq_reduce_task(
+    shard_refs_by_seq: Dict[int, List[ObjectRef]],
+    partition_id: int,
+    reduce_fn: "MultiSeqReduceFn",
+    target_max_block_size: Optional[int],
+) -> Generator[Union[Block, bytes], None, None]:
+    """Multi-input (e.g. join) reduce stage.
+
+    Decodes every input sequence's shards for this partition, then invokes
+    ``reduce_fn(partition_id, {seq -> [tables]})`` exactly once.  Multi-input
+    combiners (joins, set ops) need the full partition on every side before
+    they can produce a correct output, so streaming flush is not supported
+    here.
+
+    Empty sides (a partition where one side produced no rows) are passed as
+    empty lists so the reduce_fn can still emit outer-join null-padded rows.
+
+    Output blocks are pushed through a BlockOutputBuffer so they respect
+    ``target_max_block_size`` — same contract as the single-input task.
+    """
+    start_time_s = time.perf_counter()
+    timings = _StageTimings()
+
+    decoded_by_seq: Dict[int, List[pa.Table]] = {}
+    for seq_idx, refs in shard_refs_by_seq.items():
+        tables: List[pa.Table] = []
+        for batch_start in range(0, len(refs), _REDUCE_BATCH_SIZE):
+            batch = refs[batch_start : batch_start + _REDUCE_BATCH_SIZE]
+            with timings.record("reduce.ray_get_s"):
+                fetched = ray.get(batch)
+            for buf in fetched:
+                if buf is None:
+                    continue
+                with timings.record("reduce.ipc_decode_s"):
+                    table = _read_partition_ipc(buf)
+                if table is not None:
+                    tables.append(table)
+        decoded_by_seq[seq_idx] = tables
+
+    output_buffer = BlockOutputBuffer(
+        OutputBlockSizeOption.of(
+            target_max_block_size=target_max_block_size,
+        )
+    )
+
+    with timings.record("reduce.reduce_fn_s"):
+        produced_blocks = list(reduce_fn(partition_id, decoded_by_seq))
+
+    def _yield_with_stats(block: Block):
+        exec_stats_builder = BlockExecStats.builder()
+        exec_stats_builder.finish()
+        gen_stats: StreamingGeneratorStats = yield block
+        exec_stats = exec_stats_builder.build(
+            block_ser_time_s=(gen_stats.object_creation_dur_s if gen_stats else None),
+            shuffle_stage_timings_s=timings.as_dict(),
+        )
+        yield pickle.dumps(
+            BlockMetadataWithSchema.from_block(
+                block,
+                block_exec_stats=exec_stats,
+                task_exec_stats=TaskExecWorkerStats(
+                    task_wall_time_s=time.perf_counter() - start_time_s,
+                ),
+            )
+        )
+
+    for block in produced_blocks:
+        with timings.record("reduce.output_buffer_s"):
+            output_buffer.add_block(block)
+            ready = []
+            while output_buffer.has_next():
+                ready.append(output_buffer.next())
+        for out_block in ready:
+            yield from _yield_with_stats(out_block)
+
+    with timings.record("reduce.finalize_s"):
+        output_buffer.finalize()
+        ready = []
+        while output_buffer.has_next():
+            ready.append(output_buffer.next())
+    for out_block in ready:
+        yield from _yield_with_stats(out_block)

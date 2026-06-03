@@ -134,6 +134,10 @@ def plan_join_op(
     data_context: DataContext,
 ) -> PhysicalOperator:
     assert len(physical_children) == 2
+    if getattr(data_context, "enable_v2_join", False):
+        return _plan_hash_shuffle_join_v2(
+            data_context, logical_op, physical_children[0], physical_children[1]
+        )
     return JoinOperator(
         data_context=data_context,
         left_input_op=physical_children[0],
@@ -147,6 +151,80 @@ def plan_join_op(
         partition_size_hint=logical_op.partition_size_hint,
         aggregator_ray_remote_args_override=logical_op.aggregator_ray_remote_args,
     )
+
+
+def _plan_hash_shuffle_join_v2(
+    data_context: DataContext,
+    logical_op: Join,
+    left_physical_op: PhysicalOperator,
+    right_physical_op: PhysicalOperator,
+) -> PhysicalOperator:
+    """V2 hash-join physical plan: two ShuffleMapOps feed one multi-input
+    ShuffleReduceOp whose reduce_fn wraps JoiningAggregation."""
+    from ray.data._internal.execution.operators.hash_shuffle_v2 import (
+        _SHUFFLE_MAP_RUNTIME_ENV,
+        _make_join_partition_fn,
+        _make_join_reduce_fn,
+    )
+    from ray.data._internal.execution.operators.shuffle_operators.shuffle_map_operator import (  # noqa: E501
+        ShuffleMapOp,
+    )
+    from ray.data._internal.execution.operators.shuffle_operators.shuffle_reduce_operator import (  # noqa: E501
+        ShuffleReduceOp,
+    )
+
+    left_keys = tuple(logical_op.left_key_columns)
+    right_keys = tuple(logical_op.right_key_columns)
+    target_num_partitions = (
+        logical_op.num_outputs or data_context.default_hash_shuffle_parallelism
+    )
+
+    left_map = ShuffleMapOp(
+        left_physical_op,
+        data_context,
+        num_partitions=target_num_partitions,
+        partition_fn=_make_join_partition_fn(list(left_keys), target_num_partitions),
+        map_runtime_env=_SHUFFLE_MAP_RUNTIME_ENV,
+        input_seq_index=0,
+        name=(
+            f"JoinShuffleMapLeft(keys={left_keys}, "
+            f"partitions={target_num_partitions})"
+        ),
+    )
+    right_map = ShuffleMapOp(
+        right_physical_op,
+        data_context,
+        num_partitions=target_num_partitions,
+        partition_fn=_make_join_partition_fn(list(right_keys), target_num_partitions),
+        map_runtime_env=_SHUFFLE_MAP_RUNTIME_ENV,
+        input_seq_index=1,
+        name=(
+            f"JoinShuffleMapRight(keys={right_keys}, "
+            f"partitions={target_num_partitions})"
+        ),
+    )
+    reduce_op = ShuffleReduceOp(
+        [left_map, right_map],
+        data_context,
+        num_partitions=target_num_partitions,
+        reduce_fn=_make_join_reduce_fn(
+            join_type=logical_op.join_type,
+            left_key_columns=left_keys,
+            right_key_columns=right_keys,
+            left_columns_suffix=logical_op.left_columns_suffix,
+            right_columns_suffix=logical_op.right_columns_suffix,
+            data_context=data_context,
+        ),
+        # Joins need both sides materialized before any output row is
+        # correct → blocking mode + one block out per partition.
+        streaming_reduce=False,
+        disallow_block_splitting=True,
+        name=(
+            f"JoinShuffleReduce({logical_op.join_type.name}, "
+            f"partitions={target_num_partitions})"
+        ),
+    )
+    return reduce_op
 
 
 def plan_streaming_split_op(

@@ -694,6 +694,13 @@ class DataContext:
     # provided explicitly)
     default_hash_shuffle_parallelism: int = DEFAULT_MIN_PARALLELISM
 
+    # When True, ``plan_join_op`` routes joins through the v2 shuffle path
+    # built on ShuffleMapOp + ShuffleReduceOp (stateless tasks, no
+    # HashShuffleAggregator actors).  Default False keeps the v1 actor-pool
+    # join active to avoid regressing existing pipelines until v2 join is
+    # battle-tested.
+    enable_v2_join: bool = False
+
     # Max number of aggregators (actors) that could be provisioned
     # to perform aggregations on partitions produced during hash-shuffling
     #

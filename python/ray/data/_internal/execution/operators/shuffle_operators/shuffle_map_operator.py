@@ -3,7 +3,7 @@ import functools
 import logging
 import typing
 from collections import defaultdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import ray
 from ray import ObjectRef
@@ -39,34 +39,53 @@ if typing.TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# Sentinel prefix used to carry partition_id on a block's
-# BlockMetadata.input_files.  The downstream ShuffleReduceOp parses this
-# out of each input bundle to recover which partition it represents.
+# Sentinels carried on a block's BlockMetadata.input_files so the downstream
+# ShuffleReduceOp can recover (a) which partition this bundle represents and
+# (b) for joins / multi-input reduces, which upstream input sequence produced
+# it.  Both share a single list entry: "__partition__<pid>__seq__<seq>".
 _PARTITION_ID_SENTINEL = "__partition__"
+_INPUT_SEQ_SENTINEL = "__seq__"
 
 
-def make_partition_sentinel(partition_id: int) -> List[str]:
-    """Build the `BlockMetadata.input_files` list used to mark a block
-    with its partition_id.  Kept as a module-level helper so the reduce op
-    can use the same encoding without depending on map-op internals."""
-    return [f"{_PARTITION_ID_SENTINEL}{partition_id}"]
+def make_partition_sentinel(partition_id: int, input_seq_index: int = 0) -> List[str]:
+    """Build the `BlockMetadata.input_files` list used to mark a block with
+    its (partition_id, input_seq_index).
+
+    For single-input shuffles (e.g. HashAggregate), input_seq_index is 0 and
+    the sentinel is backward-compatible with the previous one-field form
+    because parsing only inspects the prefix-anchored substrings."""
+    return [f"{_PARTITION_ID_SENTINEL}{partition_id}{_INPUT_SEQ_SENTINEL}{input_seq_index}"]
 
 
-def extract_partition_id(bundle: RefBundle) -> int:
-    """Recover the partition_id stamped onto an upstream bundle by
-    `make_partition_sentinel`.  Raises if no sentinel is found."""
+def extract_partition_and_seq(bundle: RefBundle) -> Tuple[int, int]:
+    """Recover (partition_id, input_seq_index) stamped onto an upstream bundle.
+
+    Falls back to input_seq_index=0 when the sentinel lacks the `__seq__`
+    suffix (older single-input encoding) so the multi-input path stays
+    backward-compatible during rollout."""
     for _, meta in bundle.blocks:
         files = meta.input_files
         if not files:
             continue
         for f in files:
-            if f.startswith(_PARTITION_ID_SENTINEL):
-                return int(f[len(_PARTITION_ID_SENTINEL) :])
+            if not f.startswith(_PARTITION_ID_SENTINEL):
+                continue
+            rest = f[len(_PARTITION_ID_SENTINEL) :]
+            if _INPUT_SEQ_SENTINEL in rest:
+                pid_str, seq_str = rest.split(_INPUT_SEQ_SENTINEL, 1)
+                return int(pid_str), int(seq_str)
+            return int(rest), 0
     raise ValueError(
         "ShuffleMapOp bundle is missing a partition_id sentinel in "
         "BlockMetadata.input_files; this should never happen in the planner-"
         "wired ShuffleMapOp → ShuffleReduceOp pipeline."
     )
+
+
+def extract_partition_id(bundle: RefBundle) -> int:
+    """Recover only the partition_id (compat shim for single-input reducers)."""
+    pid, _ = extract_partition_and_seq(bundle)
+    return pid
 
 
 class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarMixin):
@@ -130,6 +149,7 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
         pre_map_merge_threshold: int = _DEFAULT_PRE_MAP_MERGE_THRESHOLD,
         map_runtime_env: Optional[Dict[str, Any]] = None,
         map_cpus: float = _DEFAULT_SHUFFLE_MAP_TASK_NUM_CPUS,
+        input_seq_index: int = 0,
         name: str = "ShuffleMap",
     ):
         super().__init__(
@@ -140,6 +160,10 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
 
         self._num_partitions: int = num_partitions
         self._partition_fn: PartitionFn = partition_fn
+        # Marks which upstream sequence this mapper represents in a multi-input
+        # reduce (e.g. join left=0, right=1).  Stamped onto every output bundle
+        # so a multi-input ShuffleReduceOp can route shards by side.
+        self._input_seq_index: int = input_seq_index
 
         # -- Map task config -------------------------------------------------
         self._shuffle_map_task_num_cpus: float = map_cpus
@@ -429,7 +453,10 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
             for i, (ref, meta) in enumerate(merged.blocks):
                 if i == 0:
                     meta = dataclasses.replace(
-                        meta, input_files=make_partition_sentinel(pid)
+                        meta,
+                        input_files=make_partition_sentinel(
+                            pid, self._input_seq_index
+                        ),
                     )
                 stamped_blocks.append((ref, meta))
             stamped = RefBundle(
