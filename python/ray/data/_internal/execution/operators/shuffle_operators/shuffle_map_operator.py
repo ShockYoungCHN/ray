@@ -1,7 +1,6 @@
 import dataclasses
 import functools
 import logging
-import time
 import typing
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
@@ -26,14 +25,11 @@ from ray.data._internal.execution.operators.base_physical_operator import (
     InternalQueueOperatorMixin,
 )
 from ray.data._internal.execution.operators.shuffle_operators._shuffle_tasks import (
-    _SHUFFLE_PROFILE_ENABLED,
-    MapBlockTransformer,
     PartitionFn,
     _shuffle_map_task,
 )
 from ray.data._internal.execution.operators.sub_progress import SubProgressBarMixin
-from ray.data._internal.stats import OpRuntimeMetrics
-from ray.data.block import BlockExecStats, BlockMetadata, BlockStats
+from ray.data.block import BlockMetadata, BlockStats
 from ray.data.context import DataContext
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
@@ -134,7 +130,6 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
         pre_map_merge_threshold: int = _DEFAULT_PRE_MAP_MERGE_THRESHOLD,
         map_runtime_env: Optional[Dict[str, Any]] = None,
         map_cpus: float = _DEFAULT_SHUFFLE_MAP_TASK_NUM_CPUS,
-        input_block_transformer: Optional[MapBlockTransformer] = None,
         name: str = "ShuffleMap",
     ):
         super().__init__(
@@ -145,9 +140,6 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
 
         self._num_partitions: int = num_partitions
         self._partition_fn: PartitionFn = partition_fn
-        self._input_block_transformer: Optional[MapBlockTransformer] = (
-            input_block_transformer
-        )
 
         # -- Map task config -------------------------------------------------
         self._shuffle_map_task_num_cpus: float = map_cpus
@@ -193,16 +185,6 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
 
         # -- Sub-progress bars -----------------------------------------------
         self._map_bar: Optional["BaseProgressBar"] = None
-        self._map_metrics = OpRuntimeMetrics(self)
-
-        # -- Profile timestamps (RAY_DATA_SHUFFLE_PROFILE=1) -----------------
-        # All in perf_counter() units.  None until the corresponding event
-        # fires; the barrier-release path collects them into a synthetic
-        # BlockStats entry so ds.stats() picks them up.  ShuffleReduceOp
-        # reads barrier_release_s to compute first_reduce_dispatch_s.
-        self._profile_first_map_dispatch_s: Optional[float] = None
-        self._profile_last_map_done_s: Optional[float] = None
-        self.profile_barrier_release_s: Optional[float] = None
 
     # -----------------------------------------------------------------------
     # InternalQueueOperatorMixin
@@ -233,7 +215,6 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
 
     def _add_input_inner(self, input_bundle: RefBundle, input_index: int) -> None:
         assert input_index == 0
-        self._map_metrics.on_input_received(input_bundle)
 
         if not input_bundle.block_refs:
             input_bundle.destroy_if_owned()
@@ -299,9 +280,6 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
         estimated_bytes: int = 0,
         target_node_id: Optional[str] = None,
     ) -> None:
-        if _SHUFFLE_PROFILE_ENABLED and self._profile_first_map_dispatch_s is None:
-            self._profile_first_map_dispatch_s = time.perf_counter()
-
         cur_task_idx = self._next_shuffle_map_task_idx
         self._next_shuffle_map_task_idx += 1
 
@@ -324,7 +302,6 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
             *block_refs,
             partition_fn=self._partition_fn,
             num_partitions=self._num_partitions,
-            input_block_transformer=self._input_block_transformer,
         )
         metadata_ref = map_refs[0]
         partition_refs = list(map_refs[1:])
@@ -351,7 +328,7 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
             for bundle in input_bundles
             for ref, meta in zip(bundle.block_refs, bundle.metadata)
         ]
-        self._map_metrics.on_task_submitted(
+        self._metrics.on_task_submitted(
             cur_task_idx,
             RefBundle(all_blocks_meta, schema=None, owns_blocks=False),
             task_id=task.get_task_id(),
@@ -361,7 +338,7 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
             _, _, num_rows = estimate_total_num_of_blocks(
                 cur_task_idx + 1,
                 self.upstream_op_num_outputs(),
-                self._map_metrics,
+                self._metrics,
                 total_num_tasks=None,
             )
             self._map_bar.update(total=num_rows)
@@ -405,7 +382,7 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
         self._total_input_bytes += input_meta.size_bytes or 0
         self._map_blocks_stats.append(input_meta.to_stats())
 
-        self._map_metrics.on_task_finished(
+        self._metrics.on_task_finished(
             task_idx,
             None,
             task_exec_stats=None,
@@ -414,9 +391,6 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
 
         if self._map_bar is not None:
             self._map_bar.update(increment=input_meta.num_rows or 0)
-
-        if _SHUFFLE_PROFILE_ENABLED:
-            self._profile_last_map_done_s = time.perf_counter()
 
         # Barrier: emit partition-bundles once all map tasks are done AND
         # upstream has signalled no more inputs are coming.
@@ -438,10 +412,6 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
             return
 
         self._partition_bundles_emitted = True
-
-        if _SHUFFLE_PROFILE_ENABLED:
-            self.profile_barrier_release_s = time.perf_counter()
-            self._emit_profile_stats_entry()
 
         for pid in range(self._num_partitions):
             staging = self._partition_staging[pid]
@@ -468,43 +438,7 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
                 owns_blocks=merged.owns_blocks,
             )
             self._output_queue.add(stamped)
-            self._map_metrics.on_output_queued(stamped)
-
-    def _emit_profile_stats_entry(self) -> None:
-        """Append a synthetic BlockStats carrying driver-side shuffle timings.
-
-        Fired exactly once, at barrier release.  The values are presented as
-        durations (in seconds) relative to the natural epoch for each phase
-        so they aggregate sensibly through ``_StatsAccumulator``.
-        """
-        timings: Dict[str, float] = {}
-        if (
-            self._profile_first_map_dispatch_s is not None
-            and self._profile_last_map_done_s is not None
-        ):
-            timings["driver.map_phase_s"] = (
-                self._profile_last_map_done_s - self._profile_first_map_dispatch_s
-            )
-        if (
-            self.profile_barrier_release_s is not None
-            and self._profile_last_map_done_s is not None
-        ):
-            # Time between the last map finishing and the barrier actually
-            # firing.  Usually near-zero unless `_inputs_complete` lagged
-            # behind the last map completion.
-            timings["driver.barrier_wait_s"] = (
-                self.profile_barrier_release_s - self._profile_last_map_done_s
-            )
-        if not timings:
-            return
-        # Build a minimal BlockExecStats — only shuffle_stage_timings_s is
-        # set, everything else stays None so the stats summary skips this
-        # entry for the normal row/byte/task aggregations and only picks up
-        # the new shuffle-stage section.
-        exec_stats = BlockExecStats(shuffle_stage_timings_s=timings)
-        self._map_blocks_stats.append(
-            BlockStats(num_rows=None, size_bytes=None, exec_stats=exec_stats)
-        )
+            self._metrics.on_output_queued(stamped)
 
     # -----------------------------------------------------------------------
     # Output handling
@@ -515,8 +449,7 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
 
     def _get_next_inner(self) -> RefBundle:
         bundle: RefBundle = self._output_queue.get_next()
-        self._map_metrics.on_output_dequeued(bundle)
-        self._map_metrics.on_output_taken(bundle)
+        self._metrics.on_output_dequeued(bundle)
         return bundle
 
     # -----------------------------------------------------------------------
@@ -575,9 +508,6 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
     def get_stats(self) -> Dict[str, List[BlockStats]]:
         return {self._name: self._map_blocks_stats}
 
-    def _extra_metrics(self) -> Dict[str, Any]:
-        return {self._name: self._map_metrics.as_dict()}
-
     # -----------------------------------------------------------------------
     # Resource accounting
     # -----------------------------------------------------------------------
@@ -599,7 +529,7 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
         # to Ray Core (`estimated_bytes * 2`).  We don't know the next
         # input's size up front, so use the running average across
         # already-submitted tasks; 0 until the first task is submitted.
-        avg_input = self._map_metrics.average_bytes_inputs_per_task
+        avg_input = self._metrics.average_bytes_inputs_per_task
         memory = int(avg_input * 2) if avg_input else 0
         return ExecutionResources(
             cpu=self._shuffle_map_task_num_cpus,

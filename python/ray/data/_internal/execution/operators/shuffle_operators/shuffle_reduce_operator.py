@@ -1,6 +1,5 @@
 import functools
 import logging
-import time
 import typing
 from collections import deque
 from typing import Any, Dict, List, Optional
@@ -17,7 +16,6 @@ from ray.data._internal.execution.interfaces.physical_operator import (
     estimate_total_num_of_blocks,
 )
 from ray.data._internal.execution.operators.shuffle_operators._shuffle_tasks import (
-    _SHUFFLE_PROFILE_ENABLED,
     ReduceFn,
     _shuffle_reduce_task,
 )
@@ -26,8 +24,7 @@ from ray.data._internal.execution.operators.shuffle_operators.shuffle_map_operat
     extract_partition_id,
 )
 from ray.data._internal.execution.operators.sub_progress import SubProgressBarMixin
-from ray.data._internal.stats import OpRuntimeMetrics
-from ray.data.block import BlockExecStats, BlockStats, TaskExecWorkerStats, to_stats
+from ray.data.block import BlockStats, TaskExecWorkerStats, to_stats
 from ray.data.context import DataContext
 
 if typing.TYPE_CHECKING:
@@ -120,11 +117,6 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
 
         # -- Sub-progress bars -----------------------------------------------
         self._reduce_bar: Optional["BaseProgressBar"] = None
-        self._reduce_metrics = OpRuntimeMetrics(self)
-
-        # -- Profile timestamps (RAY_DATA_SHUFFLE_PROFILE=1) -----------------
-        self._profile_first_reduce_dispatch_s: Optional[float] = None
-        self._profile_stats_emitted: bool = False
 
     # -----------------------------------------------------------------------
     # Input handling: one bundle → one reducer task
@@ -140,11 +132,6 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
         say the op can accept another input.
         """
         assert input_index == 0
-        self._reduce_metrics.on_input_received(input_bundle)
-
-        if _SHUFFLE_PROFILE_ENABLED and self._profile_first_reduce_dispatch_s is None:
-            self._profile_first_reduce_dispatch_s = time.perf_counter()
-            self._emit_profile_stats_entry()
 
         if not input_bundle.block_refs:
             # Defensive: ShuffleMapOp skips empty partitions, but a future
@@ -170,7 +157,7 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
             "num_cpus": self._shuffle_reduce_task_num_cpus,
         }
         if estimated_bytes > 0:
-            reduce_resources["memory"] = int(estimated_bytes * 3.5)
+            reduce_resources["memory"] = int(estimated_bytes * 2)
         reduce_options = {
             **reduce_resources,
             "scheduling_strategy": "SPREAD",
@@ -210,7 +197,7 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
         )
         self._shuffle_reduce_tasks[partition_id] = data_task
         self._num_reduce_tasks_submitted += 1
-        self._reduce_metrics.on_task_submitted(
+        self._metrics.on_task_submitted(
             partition_id, input_bundle, task_id=data_task.get_task_id()
         )
 
@@ -223,8 +210,7 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
 
     def _get_next_inner(self) -> RefBundle:
         bundle: RefBundle = self._output_queue.popleft()
-        self._reduce_metrics.on_output_dequeued(bundle)
-        self._reduce_metrics.on_output_taken(bundle)
+        self._metrics.on_output_dequeued(bundle)
         self._output_blocks_stats.extend(to_stats(bundle.metadata))
         return bundle
 
@@ -241,14 +227,12 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
 
     def _handle_reduce_output_ready(self, partition_id: int, bundle: RefBundle) -> None:
         self._output_queue.append(bundle)
-        self._reduce_metrics.on_output_queued(bundle)
-        self._reduce_metrics.on_task_output_generated(
-            task_index=partition_id, output=bundle
-        )
+        self._metrics.on_output_queued(bundle)
+        self._metrics.on_task_output_generated(task_index=partition_id, output=bundle)
         _, num_outputs, num_rows = estimate_total_num_of_blocks(
             self._num_reduce_tasks_submitted,
             self.upstream_op_num_outputs(),
-            self._reduce_metrics,
+            self._metrics,
             total_num_tasks=self._num_partitions,
         )
         self._estimated_num_output_bundles = num_outputs
@@ -272,7 +256,7 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
         if partition_id not in self._shuffle_reduce_tasks:
             return
         self._shuffle_reduce_tasks.pop(partition_id)
-        self._reduce_metrics.on_task_finished(
+        self._metrics.on_task_finished(
             task_index=partition_id,
             exception=exc,
             task_exec_stats=task_exec_stats,
@@ -299,27 +283,6 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
             and super().has_completed()
         )
 
-    def _emit_profile_stats_entry(self) -> None:
-        """Append a synthetic BlockStats with the reducer's dispatch latency.
-
-        Measured as the gap between the upstream map op's barrier release
-        and this op's first reducer task submission.  Fired exactly once.
-        """
-        if self._profile_stats_emitted:
-            return
-        upstream = self.input_dependencies[0]
-        barrier_release_s = getattr(upstream, "profile_barrier_release_s", None)
-        if barrier_release_s is None:
-            return
-        gap = self._profile_first_reduce_dispatch_s - barrier_release_s
-        exec_stats = BlockExecStats(
-            shuffle_stage_timings_s={"driver.first_reduce_dispatch_s": gap},
-        )
-        self._output_blocks_stats.append(
-            BlockStats(num_rows=None, size_bytes=None, exec_stats=exec_stats)
-        )
-        self._profile_stats_emitted = True
-
     # -----------------------------------------------------------------------
     # Shutdown
     # -----------------------------------------------------------------------
@@ -335,9 +298,6 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
 
     def get_stats(self) -> Dict[str, List[BlockStats]]:
         return {self._name: self._output_blocks_stats}
-
-    def _extra_metrics(self) -> Dict[str, Any]:
-        return {self._name: self._reduce_metrics.as_dict()}
 
     # -----------------------------------------------------------------------
     # Resource accounting
@@ -380,7 +340,7 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
         sizes = [b for b in partition_bytes.values() if b > 0]
         if sizes:
             avg_bytes = sum(sizes) / len(sizes)
-            memory = int(avg_bytes * 3.5)
+            memory = int(avg_bytes * 2)
         return ExecutionResources(
             cpu=self._shuffle_reduce_task_num_cpus,
             memory=memory,
