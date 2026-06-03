@@ -225,10 +225,14 @@ def q3(sf: int, num_partitions: int):
 def q5(sf: int, num_partitions: int):
     """Q5: Local Supplier Volume.
 
-    region ⋈ nation ⋈ supplier ⋈ customer ⋈ orders ⋈ lineitem.
-    The heaviest shuffle workload in this subset; small result
-    (5 rows in the reference answer) but every join shuffles a
-    large fact table.
+    customer ⋈ orders ⋈ lineitem ⋈ supplier ⋈ nation ⋈ region.
+
+    Critical join-order detail: the supplier join uses the **composite key**
+    ``(l_suppkey, c_nationkey) = (s_suppkey, s_nationkey)``.  Joining
+    supplier on nation_key alone (then post-filtering on suppkey) blows
+    up the intermediate to |supplier_in_nation| × |customer_in_nation|
+    rows per nation — billions of rows for sf>=10.  Composite key keeps
+    every fact row matched to at most one supplier.
     """
     region = load_table("region", sf, columns=["r_regionkey", "r_name"])
     region = region.filter(expr=col("r_name") == lit("ASIA"))
@@ -254,34 +258,37 @@ def q5(sf: int, num_partitions: int):
         lambda df: df["l_extendedprice"] * (1 - df["l_discount"]),
     )
 
-    # Build dim chain first so the big fact joins see smaller right sides.
-    rn = region.join(
-        nation, join_type="inner", num_partitions=num_partitions,
-        on=("r_regionkey",), right_on=("n_regionkey",),
-    )
-    rns = rn.join(
-        supplier, join_type="inner", num_partitions=num_partitions,
-        on=("n_nationkey",), right_on=("s_nationkey",),
-    )
-    rnsc = rns.join(
-        customer, join_type="inner", num_partitions=num_partitions,
-        on=("n_nationkey",), right_on=("c_nationkey",),
-    )
-    rnsco = rnsc.join(
+    # Fact chain: customer → orders → lineitem.  Each step matches on the
+    # natural PK/FK, so cardinality grows monotonically with lineitem
+    # (~6M·sf rows total for sf>=1).
+    co = customer.join(
         orders, join_type="inner", num_partitions=num_partitions,
         on=("c_custkey",), right_on=("o_custkey",),
     )
-    rnscol = rnsco.join(
+    col_ = co.join(
         lineitem, join_type="inner", num_partitions=num_partitions,
         on=("o_orderkey",), right_on=("l_orderkey",),
     )
-    # TPC-H Q5 also requires l_suppkey = s_suppkey (customer and supplier
-    # share a nation AND the specific lineitem was supplied by that
-    # supplier).  The shuffle chain above only enforces the nation match,
-    # so apply the suppkey predicate as a streaming filter post-join.
-    rnscol = rnscol.filter(expr=col("l_suppkey") == col("s_suppkey"))
+    # Composite-key supplier join: a lineitem-customer pair must share
+    # a supplier whose suppkey matches lineitem.l_suppkey AND whose
+    # nationkey matches customer.c_nationkey.  Supplier rows are unique
+    # on s_suppkey so each fact row matches at most once.
+    cols_ = col_.join(
+        supplier, join_type="inner", num_partitions=num_partitions,
+        on=("l_suppkey", "c_nationkey"),
+        right_on=("s_suppkey", "s_nationkey"),
+    )
+    # Small dimension tail joins (nation: 25 rows, region: 5 rows).
+    colsn = cols_.join(
+        nation, join_type="inner", num_partitions=num_partitions,
+        on=("c_nationkey",), right_on=("n_nationkey",),
+    )
+    colsnr = colsn.join(
+        region, join_type="inner", num_partitions=num_partitions,
+        on=("n_regionkey",), right_on=("r_regionkey",),
+    )
     return (
-        rnscol.groupby(["n_name"], num_partitions=num_partitions)
+        colsnr.groupby(["n_name"], num_partitions=num_partitions)
         .aggregate(Sum("revenue"))
     )
 
