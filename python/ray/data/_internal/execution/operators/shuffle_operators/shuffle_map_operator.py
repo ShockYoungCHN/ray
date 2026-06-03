@@ -202,6 +202,14 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
         self._output_queue: FIFOBundleQueue = FIFOBundleQueue()
         self._partition_bundles_emitted: bool = False
 
+        # -- Cached input schema --------------------------------------------
+        # Captured from the first non-None upstream RefBundle.schema we see
+        # in _add_input_inner.  Stamped onto every emitted partition bundle
+        # so a downstream multi-input ShuffleReduceOp can recover the
+        # schema for sides that produced zero rows for a given partition
+        # (necessary for joins where a partition may be empty on one side).
+        self._input_schema = None
+
         # -- Stats -----------------------------------------------------------
         self._total_input_rows: int = 0
         self._total_input_bytes: int = 0
@@ -239,6 +247,9 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
 
     def _add_input_inner(self, input_bundle: RefBundle, input_index: int) -> None:
         assert input_index == 0
+
+        if self._input_schema is None and input_bundle.schema is not None:
+            self._input_schema = input_bundle.schema
 
         if not input_bundle.block_refs:
             input_bundle.destroy_if_owned()
@@ -395,7 +406,9 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
                 exec_stats=None,
                 input_files=None,
             )
-            shard_bundle = RefBundle([(ref, shard_meta)], schema=None, owns_blocks=True)
+            shard_bundle = RefBundle(
+                [(ref, shard_meta)], schema=self._input_schema, owns_blocks=True
+            )
             self._partition_staging[pid].add(shard_bundle)
             self._partition_bytes[pid] += nbytes
 

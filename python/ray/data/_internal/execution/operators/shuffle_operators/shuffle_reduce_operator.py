@@ -158,6 +158,13 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
         self._inputs_done_per_seq: Dict[int, bool] = {
             i: False for i in range(self._num_input_seqs)
         }
+        # Per-seq cached schema, captured from the first input bundle that
+        # carried one.  Needed so the multi-seq reduce task can reconstruct
+        # an empty-but-typed Table when a partition produced zero rows on
+        # one side (e.g. inner join with very small right side).  Without
+        # this, PyArrow's Table.join fails with "No match for key field
+        # reference" because an empty Block has no columns.
+        self._schemas_by_seq: Dict[int, Any] = {}
 
         # -- Output queue ----------------------------------------------------
         self._output_queue: deque = deque()
@@ -201,6 +208,8 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
         # has also reported (or we know they're done with this partition
         # empty), fire the reduce task.
         partition_id, seq_idx = extract_partition_and_seq(input_bundle)
+        if seq_idx not in self._schemas_by_seq and input_bundle.schema is not None:
+            self._schemas_by_seq[seq_idx] = input_bundle.schema
         assert input_index == seq_idx, (
             f"input bundle's seq sentinel ({seq_idx}) disagrees with the "
             f"framework's input_index ({input_index}) — the upstream "
@@ -291,6 +300,7 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
             shard_refs_by_seq,
             partition_id=partition_id,
             reduce_fn=self._reduce_fn,
+            schemas_by_seq=dict(self._schemas_by_seq),
             target_max_block_size=(
                 None
                 if self._disallow_block_splitting

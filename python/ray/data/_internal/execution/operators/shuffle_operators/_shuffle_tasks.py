@@ -272,6 +272,24 @@ def _shuffle_map_task(
 # ---------------------------------------------------------------------------
 
 
+def _maybe_empty_table_for_schema(schema) -> Optional[pa.Table]:
+    """Build a zero-row pa.Table that has the given ``schema``.
+
+    Returns ``None`` for non-pyarrow schemas (e.g. PandasBlockSchema) so
+    callers can fall back to the original empty-list semantics.
+
+    Used by multi-input reduce tasks to substitute for sides that
+    produced no rows for a given partition.  Carrying the typed empty
+    table forward lets reduce_fn (e.g. JoiningAggregation.finalize)
+    resolve column references against the empty side instead of
+    failing with "no match for field reference" on a schemaless block.
+    """
+    if not isinstance(schema, pa.Schema):
+        return None
+    arrays = [pa.array([], type=field.type) for field in schema]
+    return pa.Table.from_arrays(arrays, schema=schema)
+
+
 def _read_partition_ipc(buf: pa.Buffer) -> Optional[pa.Table]:
     """Decompress one partition shard.  Returns None for empty buffers."""
     if len(buf) == 0:
@@ -429,6 +447,7 @@ def _shuffle_multi_seq_reduce_task(
     partition_id: int,
     reduce_fn: "MultiSeqReduceFn",
     target_max_block_size: Optional[int],
+    schemas_by_seq: Optional[Dict[int, "pa.Schema"]] = None,
 ) -> Generator[Union[Block, bytes], None, None]:
     """Multi-input (e.g. join) reduce stage.
 
@@ -438,14 +457,20 @@ def _shuffle_multi_seq_reduce_task(
     they can produce a correct output, so streaming flush is not supported
     here.
 
-    Empty sides (a partition where one side produced no rows) are passed as
-    empty lists so the reduce_fn can still emit outer-join null-padded rows.
+    Empty sides (a partition where one side produced no rows) are replaced
+    with a single schema-aware empty Table when ``schemas_by_seq`` carries
+    that seq's schema, so reduce_fn always sees a Table that knows its
+    columns even when the side contributed zero rows.  Without this,
+    PyArrow operations (e.g. Table.join) cannot resolve key column
+    references against the empty side.
 
     Output blocks are pushed through a BlockOutputBuffer so they respect
     ``target_max_block_size`` — same contract as the single-input task.
     """
     start_time_s = time.perf_counter()
     timings = _StageTimings()
+    if schemas_by_seq is None:
+        schemas_by_seq = {}
 
     decoded_by_seq: Dict[int, List[pa.Table]] = {}
     for seq_idx, refs in shard_refs_by_seq.items():
@@ -461,6 +486,12 @@ def _shuffle_multi_seq_reduce_task(
                     table = _read_partition_ipc(buf)
                 if table is not None:
                     tables.append(table)
+        if not tables and seq_idx in schemas_by_seq:
+            empty = _maybe_empty_table_for_schema(schemas_by_seq[seq_idx])
+            if empty is not None:
+                # Materialize a typed empty Table so PyArrow ops downstream
+                # can resolve column references against this side.
+                tables = [empty]
         decoded_by_seq[seq_idx] = tables
 
     output_buffer = BlockOutputBuffer(
