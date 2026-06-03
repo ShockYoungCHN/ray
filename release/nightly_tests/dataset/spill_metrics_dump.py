@@ -187,12 +187,23 @@ def _aggregate(per_node: Dict[str, Any]) -> Dict[str, Any]:
     return {n: {k: dict(v) for k, v in by_label.items()} for n, by_label in agg.items()}
 
 
-def collect_spill_metrics(start_ts: float = 0.0, output_dir: str = ".") -> Dict[str, Any]:
-    """Scrape metrics and collect raw spill logs from all nodes."""
+def snapshot_spill_metrics() -> Dict[str, Any]:
+    """Take a snapshot of every alive node's spill Prometheus gauges.
+
+    Returned shape: ``{endpoint -> {"samples": [{name, labels, value}, ...]}}``
+    matching the ``per_node`` payload of :func:`collect_spill_metrics`.
+
+    Use this at benchmark start and end to compute deltas — Prometheus
+    spill gauges (``throughput_mb``, ``request_total``, ``objects_bytes
+    [Spilled]``) are **cluster-lifetime cumulative**, so any single
+    scrape reflects everything the cluster has ever spilled, not the
+    current workload.  Delta = after - before recovers per-benchmark
+    activity.  Pinned/PendingSpill/PendingRestore object counts are
+    instantaneous gauges and have no meaningful "delta"; they're
+    carried through as the after-value.
+    """
     per_node: Dict[str, Any] = {}
     nodes = [n for n in ray.nodes() if n.get("Alive")]
-    
-    # 1. Collect Prometheus metrics
     for node in nodes:
         ip = node.get("NodeManagerAddress")
         port = node.get("MetricsExportPort")
@@ -204,7 +215,6 @@ def collect_spill_metrics(start_ts: float = 0.0, output_dir: str = ".") -> Dict[
         except Exception as e:
             per_node[endpoint] = {"error": f"{type(e).__name__}: {e}"}
             continue
-
         samples = []
         for line in text.splitlines():
             if not any(line.startswith(p) for p in SPILL_METRIC_PREFIXES):
@@ -215,6 +225,196 @@ def collect_spill_metrics(start_ts: float = 0.0, output_dir: str = ".") -> Dict[
             name, labels, value = parsed
             samples.append({"name": name, "labels": labels, "value": value})
         per_node[endpoint] = {"samples": samples}
+    return per_node
+
+
+# Names whose value at any instant is meaningful as a snapshot (i.e. not
+# cumulative).  Everything else is treated as monotonically increasing
+# from cluster start, and reported as a delta (after - before).
+_INSTANTANEOUS_METRIC_NAMES = {
+    "ray_spill_manager_objects",
+    "ray_spill_manager_objects_bytes",
+}
+
+
+def _sample_key(sample: Dict[str, Any]) -> tuple:
+    """Stable key (name, sorted labels) used to align samples across snapshots."""
+    return (sample["name"], tuple(sorted(sample["labels"].items())))
+
+
+def compute_metrics_delta(
+    before: Dict[str, Any], after: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Return per-node delta payload: cumulative metrics become
+    ``after - before``; instantaneous gauges (objects[State]) pass
+    through the after-value unchanged.
+
+    Output shape matches the ``per_node`` field of
+    :func:`collect_spill_metrics` so the same ``_aggregate`` reducer
+    can consume it.
+    """
+    delta: Dict[str, Any] = {}
+    for endpoint, after_data in after.items():
+        if "samples" not in after_data:
+            delta[endpoint] = after_data
+            continue
+        before_samples_by_key: Dict[tuple, float] = {}
+        before_data = before.get(endpoint, {})
+        for s in before_data.get("samples", []):
+            before_samples_by_key[_sample_key(s)] = s["value"]
+        delta_samples: List[Dict[str, Any]] = []
+        for s in after_data["samples"]:
+            if s["name"] in _INSTANTANEOUS_METRIC_NAMES:
+                delta_value = s["value"]
+            else:
+                delta_value = s["value"] - before_samples_by_key.get(
+                    _sample_key(s), 0.0
+                )
+            delta_samples.append(
+                {"name": s["name"], "labels": s["labels"], "value": delta_value}
+            )
+        delta[endpoint] = {"samples": delta_samples}
+    return delta
+
+
+@ray.remote(num_cpus=0)
+def _append_finalize_line(line: str) -> Dict[str, Any]:
+    """Append one finalize line to this node's spill events log.
+
+    Path resolution mirrors the C++ side (see local_object_manager.cc
+    ``InitSpillEventLogger``): env var first, then the persistent
+    ``/home/ray/default/raylet_spill_events/`` directory, fallback to
+    ``/tmp/raylet_spill_events.out``.
+    """
+    candidates: List[str] = []
+    env_path = os.environ.get("RAY_SPILL_EVENTS_LOG_PATH")
+    if env_path:
+        candidates.append(env_path)
+    candidates.append("/home/ray/default/raylet_spill_events/raylet_spill_events.out")
+    candidates.append("/tmp/raylet_spill_events.out")
+    chosen: Optional[str] = None
+    for path in candidates:
+        parent = os.path.dirname(path) or "."
+        try:
+            os.makedirs(parent, exist_ok=True)
+            chosen = path
+            break
+        except Exception:
+            continue
+    if chosen is None:
+        return {"ok": False, "error": "no writable spill log path"}
+    try:
+        with open(chosen, "a") as f:
+            f.write(line)
+            if not line.endswith("\n"):
+                f.write("\n")
+    except Exception as e:
+        return {"ok": False, "path": chosen, "error": str(e)}
+    return {"ok": True, "path": chosen}
+
+
+def _samples_to_flat_kvs(samples: List[Dict[str, Any]], prefix: str) -> List[str]:
+    """Project a list of {name,labels,value} samples to flat ``k=v`` tokens.
+
+    The token name is ``<prefix>.<metric_name_short>.<label_value>`` where:
+    - ``metric_name_short`` strips the ``ray_spill_manager_`` prefix
+    - ``label_value`` is the dominant label (State for objects, Type for
+      throughput/request) or ``all`` when unlabeled
+
+    This produces a compact line whose contents survive ``KV_RE`` parsing
+    in ``aggregate_observ_spill.py`` and stay grep-friendly in raw logs.
+    """
+    out: List[str] = []
+    for s in samples:
+        name = s["name"]
+        if name.startswith("ray_spill_manager_"):
+            short = name[len("ray_spill_manager_") :]
+        else:
+            short = name
+        label = (
+            s["labels"].get("State")
+            or s["labels"].get("Type")
+            or "all"
+        )
+        out.append(f"{prefix}.{short}.{label}={s['value']:.3f}")
+    return out
+
+
+def write_benchmark_summary_to_raylet_logs(
+    *,
+    benchmark_tag: str,
+    snapshot_before: Dict[str, Any],
+    snapshot_after: Dict[str, Any],
+    delta_per_node: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Fan out one finalize-line write to every alive node.
+
+    Each node appends one newline-terminated line of the form::
+
+        <epoch_ts> phase=benchmark_finalize tag=<tag> endpoint=<ip:port>
+            delta.throughput_mb.Spilled=<float>
+            after.throughput_mb.Spilled=<float>
+            delta.objects_bytes.Spilled=<float>
+            after.objects_bytes.Pinned=<float>
+            ...
+
+    Using flat ``k=v`` tokens means ``aggregate_observ_spill.py``'s
+    existing ``KV_RE`` parser absorbs the line cleanly; we add
+    ``phase=benchmark_finalize`` so the summary loop in that aggregator
+    can skip these synthetic entries when bucketing per-spill events.
+
+    Returns a list of per-node write results.
+    """
+    nodes = [n for n in ray.nodes() if n.get("Alive")]
+    futures = []
+    timestamp = datetime.now().timestamp()
+    for node in nodes:
+        ip = node.get("NodeManagerAddress")
+        port = node.get("MetricsExportPort")
+        node_id = node["NodeID"]
+        if not ip or not port:
+            continue
+        endpoint = f"{ip}:{port}"
+        after_samples = snapshot_after.get(endpoint, {}).get("samples", [])
+        delta_samples = delta_per_node.get(endpoint, {}).get("samples", [])
+        tokens = [
+            f"{timestamp:.3f}",
+            "phase=benchmark_finalize",
+            f"tag={benchmark_tag}",
+            f"endpoint={endpoint}",
+        ]
+        tokens.extend(_samples_to_flat_kvs(delta_samples, "delta"))
+        tokens.extend(_samples_to_flat_kvs(after_samples, "after"))
+        line = " ".join(tokens)
+        sched = NodeAffinitySchedulingStrategy(node_id=node_id, soft=False)
+        futures.append(
+            _append_finalize_line.options(scheduling_strategy=sched).remote(line)
+        )
+    return ray.get(futures) if futures else []
+
+
+def collect_spill_metrics(
+    start_ts: float = 0.0,
+    output_dir: str = ".",
+    snapshot_before: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Scrape metrics and collect raw spill logs from all nodes.
+
+    If ``snapshot_before`` is provided, the returned ``aggregated`` and
+    ``per_node`` fields reflect the **delta** since that snapshot (i.e.
+    only what this benchmark contributed).  The raw post-benchmark
+    snapshot is preserved under ``raw_after`` so Grafana / external
+    dashboards that consume the cumulative Prometheus values stay
+    untouched.  When ``snapshot_before`` is None, behavior is unchanged
+    from the pre-delta version (per_node = raw post snapshot).
+    """
+    per_node: Dict[str, Any] = snapshot_spill_metrics()
+    raw_after = per_node
+    delta_per_node: Optional[Dict[str, Any]] = None
+    if snapshot_before is not None:
+        delta_per_node = compute_metrics_delta(snapshot_before, raw_after)
+        per_node = delta_per_node
+    nodes = [n for n in ray.nodes() if n.get("Alive")]
 
     # 2. Collect raw spill logs from all nodes
     log_futures = []
@@ -256,25 +456,48 @@ def collect_spill_metrics(start_ts: float = 0.0, output_dir: str = ".") -> Dict[
     event_summary = _aggregate_events([{"events": all_events}])
     event_summary["num_nodes_with_events"] = num_nodes_with_content
 
-    return {
+    result = {
         "per_node": per_node,
         "aggregated": _aggregate(per_node),
         "events": {
             "summary": event_summary,
             "num_nodes_collected": len(per_node_logs),
-            "num_nodes_with_content": num_nodes_with_content
-        }
+            "num_nodes_with_content": num_nodes_with_content,
+        },
     }
+    if snapshot_before is not None:
+        # Preserve raw cumulative values for Grafana / external dashboards
+        # and so callers can show both views side-by-side.
+        result["raw_after"] = raw_after
+        result["raw_after_aggregated"] = _aggregate(raw_after)
+        result["is_delta"] = True
+    else:
+        result["is_delta"] = False
+    return result
 
 
 def summarize(metrics: Dict[str, Any]) -> str:
     """Render a compact human-readable summary of the aggregated metrics."""
-    lines = ["Spill metrics (aggregated across nodes):"]
+    delta_mode = metrics.get("is_delta", False)
+    header = (
+        "Spill metrics (THIS BENCHMARK ONLY — delta from start):"
+        if delta_mode
+        else "Spill metrics (aggregated across nodes):"
+    )
+    lines = [header]
     for base in sorted(metrics["aggregated"]):
         by_label = metrics["aggregated"][base]
         for label, stat in sorted(by_label.items()):
             tag = f"[{label}]" if label != "_no_label" else ""
             lines.append(f"  {base}{tag}  value={stat['value']:.2f}")
+    if delta_mode and "raw_after_aggregated" in metrics:
+        lines.append("")
+        lines.append("Raw cumulative (cluster lifetime, matches Grafana):")
+        for base in sorted(metrics["raw_after_aggregated"]):
+            by_label = metrics["raw_after_aggregated"][base]
+            for label, stat in sorted(by_label.items()):
+                tag = f"[{label}]" if label != "_no_label" else ""
+                lines.append(f"  {base}{tag}  value={stat['value']:.2f}")
             
     if "events" in metrics:
         s = metrics["events"]["summary"]

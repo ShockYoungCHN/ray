@@ -83,8 +83,18 @@ def _summarize(per_node: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     total_events = 0
     fn_calls: Dict[str, int] = defaultdict(int)
+    benchmark_finalize_count = 0
     for n in per_node:
         for ev in n["events"]:
+            phase = ev.get("phase")
+            # Per-benchmark finalize lines (written by
+            # spill_metrics_dump.write_benchmark_summary_to_raylet_logs)
+            # carry post-run cumulative + delta gauges, not individual
+            # spill events.  Count them separately so they don't pollute
+            # the spilled/deleted buckets.
+            if phase == "benchmark_finalize":
+                benchmark_finalize_count += 1
+                continue
             total_events += 1
             # Entry-point breadcrumbs (LOM_ENTRY): `fn=SpillObjectUptoMaxThroughput ...`
             fn = ev.get("fn")
@@ -94,7 +104,6 @@ def _summarize(per_node: List[Dict[str, Any]]) -> Dict[str, Any]:
             trigger = ev.get("trigger", "?")
             creator = ev.get("creator", "?")
             key = (trigger, creator)
-            phase = ev.get("phase")
             if phase == "spilled":
                 spilled[key]["count"] += 1
                 spilled[key]["bytes_sum"] += float(ev.get("size", 0))
@@ -109,6 +118,7 @@ def _summarize(per_node: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     out: Dict[str, Any] = {
         "total_events": total_events,
+        "benchmark_finalize_lines": benchmark_finalize_count,
         "num_nodes_with_events": sum(1 for n in per_node if n["num_events"] > 0),
         "num_nodes_scanned": len(per_node),
         "lom_entry_calls": dict(fn_calls),

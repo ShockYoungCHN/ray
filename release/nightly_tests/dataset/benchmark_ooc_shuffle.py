@@ -23,7 +23,9 @@ from ray.data.context import ShuffleStrategy
 from spill_metrics_dump import (
     collect_spill_metrics,
     default_output_dir,
+    snapshot_spill_metrics,
     summarize,
+    write_benchmark_summary_to_raylet_logs,
 )
 
 # Env vars that must be visible inside Ray worker processes (driver-side
@@ -179,11 +181,43 @@ def main():
         f"({ratio:.1f}x of in-core limit, {zone}) ---"
     )
 
+    # Baseline snapshot before workload so the post-run delta is just this
+    # benchmark, not cluster-lifetime cumulative.
+    print("Snapshotting spill metrics baseline ...", flush=True)
+    snapshot_before = snapshot_spill_metrics()
+
     benchmark_start_ts = time.time()
     info = run_one(data_size_gb, num_partitions, strategy_name=strategy_name, uncap_reduce=args.uncap_reduce)
 
-    # Collect metrics and pull raw log files from all nodes into experiment_dir
-    spill_metrics = collect_spill_metrics(start_ts=benchmark_start_ts, output_dir=experiment_dir)
+    # Collect metrics and pull raw log files from all nodes into experiment_dir.
+    # Delta against snapshot_before; raw cumulative preserved under raw_after.
+    spill_metrics = collect_spill_metrics(
+        start_ts=benchmark_start_ts,
+        output_dir=experiment_dir,
+        snapshot_before=snapshot_before,
+    )
+
+    # Append a BENCHMARK_FINALIZE line to every node's spill events log so
+    # the per-run delta lives next to the per-spill events.
+    try:
+        finalize_writes = write_benchmark_summary_to_raylet_logs(
+            benchmark_tag=ts_str,
+            snapshot_before=snapshot_before,
+            snapshot_after=spill_metrics.get("raw_after", {}),
+            delta_per_node=spill_metrics["per_node"],
+        )
+        ok = sum(1 for r in finalize_writes if r.get("ok"))
+        print(
+            f"BENCHMARK_FINALIZE written to {ok}/{len(finalize_writes)} "
+            f"raylet spill logs",
+            flush=True,
+        )
+    except Exception as e:
+        print(
+            f"WARN: failed to write BENCHMARK_FINALIZE to raylet logs: "
+            f"{type(e).__name__}: {e}",
+            flush=True,
+        )
 
     result = {
         "timestamp": datetime.now().isoformat(),

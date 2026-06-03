@@ -51,7 +51,9 @@ import ray
 from spill_metrics_dump import (
     collect_spill_metrics,
     default_output_dir,
+    snapshot_spill_metrics,
     summarize,
+    write_benchmark_summary_to_raylet_logs,
 )
 from ray.data.aggregate import Count, Mean, Sum
 from ray.data.context import ShuffleStrategy
@@ -494,6 +496,14 @@ def main():
     )
     print()
 
+    # Snapshot all spill-related Prometheus gauges BEFORE running anything
+    # so we can later subtract this baseline.  Without it, every query's
+    # reported "spill throughput" / "spill request count" is the cluster
+    # lifetime cumulative — identical-looking across runs even when the
+    # actual workload spilled wildly different amounts.
+    print("Snapshotting spill metrics baseline ...", flush=True)
+    snapshot_before = snapshot_spill_metrics()
+
     results: List[Dict] = []
     benchmark_start_ts = time.time()
     for name in selected:
@@ -517,8 +527,44 @@ def main():
         results.append(info)
         print()
 
-    # Collect metrics and pull raw log files from all nodes into experiment_dir
-    spill_metrics = collect_spill_metrics(start_ts=benchmark_start_ts, output_dir=experiment_dir)
+    # Collect metrics and pull raw log files from all nodes into experiment_dir.
+    # Passing snapshot_before computes the BENCHMARK-ONLY delta for cumulative
+    # spill gauges (throughput_mb, request_total, objects_bytes[Spilled]) so
+    # numbers change run-to-run with the actual workload, while raw cumulative
+    # values (the ones Grafana already records) are preserved under
+    # spill_metrics["raw_after"] / ["raw_after_aggregated"].
+    spill_metrics = collect_spill_metrics(
+        start_ts=benchmark_start_ts,
+        output_dir=experiment_dir,
+        snapshot_before=snapshot_before,
+    )
+
+    # Fan out a BENCHMARK_FINALIZE line to every node's raylet spill events
+    # log so the per-benchmark delta is preserved alongside in-flight spill
+    # events.  Each node appends one line of the form:
+    #   <epoch_ts> BENCHMARK_FINALIZE tag=<ts> endpoint=<ip:port>
+    #     samples_before=<json> samples_after=<json> samples_delta=<json>
+    # aggregate_observ_spill.py can scrape these to recover per-run history.
+    finalize_tag = ts_str
+    try:
+        finalize_writes = write_benchmark_summary_to_raylet_logs(
+            benchmark_tag=finalize_tag,
+            snapshot_before=snapshot_before,
+            snapshot_after=spill_metrics.get("raw_after", {}),
+            delta_per_node=spill_metrics["per_node"],
+        )
+        ok = sum(1 for r in finalize_writes if r.get("ok"))
+        print(
+            f"BENCHMARK_FINALIZE written to {ok}/{len(finalize_writes)} "
+            f"raylet spill logs",
+            flush=True,
+        )
+    except Exception as e:
+        print(
+            f"WARN: failed to write BENCHMARK_FINALIZE to raylet logs: "
+            f"{type(e).__name__}: {e}",
+            flush=True,
+        )
 
     out = {
         "timestamp": datetime.now().isoformat(),
