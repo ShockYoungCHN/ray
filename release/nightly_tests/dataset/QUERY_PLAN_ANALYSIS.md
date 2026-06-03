@@ -376,3 +376,115 @@ For "broadcast join useless" baselines (every join side > 10 MB threshold):
 fact chain). q3 also qualifies at sf ≥ 10. q5 has region/nation/supplier as
 broadcast candidates at any sf, so it does **not** qualify as a
 "broadcast-irrelevant" workload.
+
+---
+
+## BHJ (Broadcast Hash Join) suitability
+
+Ray Data does **not currently implement BHJ** (confirmed by grep —
+`JoinOperator` always goes through hash shuffle whether v1 or v2). This
+section is a forward-looking analysis: **if BHJ were added** with a
+default threshold of 10 MB on the build side, which joins would benefit
+and which wouldn't.
+
+### Per-join verdict
+
+Convention used below:
+- "BHJ ✓" — build side ≤ 10 MB at this sf; broadcast wins big (probe side
+  avoids shuffle entirely)
+- "BHJ ✗" — build side > 10 MB; must shuffle, BHJ would actively hurt
+  (broadcast latency dominates)
+- "BHJ marginal" — build side near 10 MB threshold; benefit depends on
+  network speed and cluster size
+
+| Query | Join | Smaller side raw bytes (per sf) | sf=1 | sf=10 | sf=100 | sf=1000 |
+|---|---|---|---|---|---|---|
+| **q1** | _no joins_ | — | — | — | — | — |
+| **q3** | customer(BUILDING) ⋈ orders | filtered customer ~5 MB | ✓ BHJ on customer | marginal (~50 MB) | ✗ shuffle | ✗ shuffle |
+| **q3** | (co) ⋈ lineitem | co ~20 MB | marginal | ✗ shuffle | ✗ shuffle | ✗ shuffle |
+| **q4** | orders ⋈ lineitem (LEFT_SEMI) | filtered orders ~5 MB | ✓ BHJ on orders¹ | marginal (~50 MB) | ✗ shuffle | ✗ shuffle |
+| **q5** | customer ⋈ orders | filtered orders ~24 MB | marginal | ✗ shuffle | ✗ shuffle | ✗ shuffle |
+| **q5** | (co) ⋈ lineitem | co ~35 MB | ✗ shuffle | ✗ shuffle | ✗ shuffle | ✗ shuffle |
+| **q5** | (col) ⋈ supplier (composite) | supplier ~1 MB | ✓✓ **BHJ** | ✓ BHJ (~10 MB) | marginal (~100 MB) | ✗ shuffle |
+| **q5** | (cols) ⋈ nation | nation < 2 KB | ✓✓✓ **always BHJ** | ✓✓✓ | ✓✓✓ | ✓✓✓ |
+| **q5** | (colsn) ⋈ region | region < 1 KB | ✓✓✓ **always BHJ** | ✓✓✓ | ✓✓✓ | ✓✓✓ |
+| **q12** | orders ⋈ lineitem | filtered lineitem ~75 MB | ✗ shuffle | ✗ shuffle | ✗ shuffle | ✗ shuffle |
+| **q18** | orders LEFT_SEMI hot_orderkeys | hot_orderkeys ~4 KB (heavy filter) | ✓✓✓ **always BHJ** | ✓✓✓ | ✓✓✓ | ✓✓✓ |
+| **q18** | customer ⋈ orders_hot | orders_hot ~4 KB | ✓✓✓ **always BHJ** | ✓✓✓ | ✓✓✓ | ✓✓✓ |
+| **q18** | (co) ⋈ lineitem #2 | co ~5 KB (carries through tiny rowset) | ✓✓✓ **always BHJ** | ✓✓✓ | ✓✓✓ | ✓✓✓ |
+
+¹ For LEFT_SEMI, the standard impl picks the smaller side regardless of
+join role: build hash table on the small side, stream the big side
+through, emit big-side row when hash table lookup succeeds. The output
+columns belong to whichever side is preserved by the join_type — for
+LEFT_SEMI the output is the **left** schema, so if we broadcast right
+the implementation matches naturally.
+
+### Which queries would benefit the most from BHJ
+
+| Query | Joins where BHJ helps | Joins where BHJ doesn't | Net verdict |
+|---|---|---|---|
+| **q1** | n/a | n/a | irrelevant (no joins) |
+| **q3** | 0–1 of 2 (sf-dependent) | 1–2 of 2 | small win at sf≤1, no win at sf≥10 |
+| **q4** | 0–1 of 1 (sf-dependent) | 1 of 1 at sf≥10 | small win at sf≤1, no win at sf≥10 |
+| **q5** | **3 of 5 always** (supplier sf≤10, nation always, region always) | 2 of 5 (the big-table fact chain) | **medium-large win at every sf** — saves the small-table shuffles, which are otherwise full hash partition over 500 partitions for ~25 rows |
+| **q12** | 0 of 1 | 1 of 1 | no win at any sf |
+| **q18** | **3 of 3 always** | 0 of 3 | ⭐ **huge win at every sf** — after the heavy filter chain, every join probe side is full lineitem/customer while build side is tiny; the current shuffle implementation re-shuffles 750 MB lineitem just to find ~230 matching rows |
+
+### Why q18 is the killer BHJ candidate
+
+After Stage 1 + 2 in q18, the "hot" branch carries < 1 KB × sf of
+metadata. Stage 3 joins this against `customer` (25 MB × sf) and then
+against `lineitem` (750 MB × sf). With the current shuffle impl, each
+of those joins **redistributes every customer / lineitem row** across
+500 partitions so they can be partition-aligned with the ~57 hot
+order-keys — which then get matched by ~57 reducers, while the other
+443 reducers do nothing useful.
+
+With BHJ:
+- Broadcast 4 KB of hot-orderkeys to every node (one-time cost ≈ μs)
+- Each customer / lineitem block reads its share of the parquet, probes
+  the in-memory hash table locally, emits matching rows
+- Total network bytes for the join ≈ # nodes × 4 KB instead of `~250 MB × sf`
+- Disk / plasma churn for the join ≈ 0 instead of `~750 MB × sf`
+
+**Estimated speedup for q18 with BHJ at sf=100:** the join-chain
+shuffle goes from ~75 GB through plasma down to ~kB through Ray's
+object broadcast layer. That's the same order of magnitude as moving
+from "spill-bound" to "scan-bound" — could cut wall-clock by 5–10×.
+
+### Why q12 / q4 are "BHJ-irrelevant" benchmarks
+
+Filtered orders (q4) and filtered lineitem (q12) sit at ~5 MB and
+~75 MB per sf respectively. Beyond sf=1, the smaller side is already
+multiple times the broadcast threshold. There is no way to short-cut
+the shuffle; the planner has no choice but to hash-partition both
+sides. That makes q4 and q12 a good **pair of "BHJ-doesn't-apply"
+baselines** to measure pure hash-shuffle performance against q5/q18
+where BHJ would change the plan shape.
+
+### Implementation cost estimate
+
+If we wanted to add BHJ to Ray Data:
+
+1. **Logical layer:** add `BroadcastJoin` as a logical operator (or
+   stash a `prefer_broadcast=True` hint on `Join`).
+2. **Planner:** in `plan_join_op`, estimate each side's size via
+   `LogicalOperator.estimated_num_outputs() * estimated_row_size`. If
+   the smaller side ≤ `data_context.broadcast_join_threshold` (default
+   ~10 MB), emit `BroadcastJoinOp` instead of `JoinOperator`.
+3. **Physical layer:** `BroadcastJoinOp` materializes the build side
+   once (small `ds.materialize()` + `ray.put` → single ObjectRef), then
+   runs a TaskPoolMapOperator on the probe side where each task does
+   `ray.get` of the build ref + `pa.Table.join` in-process. No shuffle
+   barrier, no `ShuffleReduceOp`. About 100–200 lines of Python.
+4. **Outer join semantics:** LEFT/RIGHT/FULL OUTER need null-padding
+   logic identical to what `JoiningAggregation._preprocess` /
+   `_postprocess` already does — can be reused verbatim.
+
+The main risk is **size estimation**:
+`LogicalOperator.estimated_num_outputs()` is rough; mis-estimating a
+"small" side as 10 MB when it's actually 200 MB will OOM every worker
+when they all `ray.get` it. Need a fallback "if `ray.get` shows the
+broadcast object is much larger than estimated, fall back to shuffle"
+path, or just be conservative with the threshold.
