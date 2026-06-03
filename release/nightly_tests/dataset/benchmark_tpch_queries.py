@@ -375,11 +375,11 @@ def wait_for_object_store_to_drain(threshold_pct=20, timeout_s=180, poll_s=5):
     print(f"    object store drain timed out after {timeout_s}s", flush=True)
 
 
-def run_one(name: str, sf: int, num_partitions: int) -> Dict:
+def run_one(name: str, sf: int, num_partitions: int, strategy_name: str) -> Dict:
     qfn = QUERIES[name]
     print(f"  [{name}] building plan ... ", end="", flush=True)
     ds = qfn(sf, num_partitions)
-    ds.context.shuffle_strategy = ShuffleStrategy.HASH_SHUFFLE
+    ds.context.shuffle_strategy = ShuffleStrategy(strategy_name)
 
     start = time.perf_counter()
     rows, batches = materialize(ds)
@@ -420,6 +420,11 @@ def main():
     parser.add_argument(
         "--num-partitions", type=int, default=200,
         help="Shuffle partitions for joins and groupbys.",
+    )
+    parser.add_argument(
+        "--strategy", type=str, default="hash_shuffle", 
+        choices=["hash_shuffle", "gpu_shuffle", "sort_shuffle_pull_based", "sort_shuffle_push_based"],
+        help="Shuffle strategy to use."
     )
     parser.add_argument(
         "--queries", type=str, default="q1,q3,q5,q12",
@@ -464,7 +469,7 @@ def main():
     )
     print(
         f"Config: sf={args.scale_factor}, num_partitions={args.num_partitions},"
-        f" queries={selected}"
+        f" strategy={args.strategy}, queries={selected}"
     )
     print()
 
@@ -473,7 +478,7 @@ def main():
     for name in selected:
         print(f"--- {name} (sf{args.scale_factor}) ---")
         try:
-            info = run_one(name, args.scale_factor, args.num_partitions)
+            info = run_one(name, args.scale_factor, args.num_partitions, args.strategy)
         except Exception as e:
             print(f"  [{name}] FAILED: {type(e).__name__}: {e}", flush=True)
             info = {
