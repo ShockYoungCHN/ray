@@ -382,9 +382,12 @@ def run_one(name: str, sf: int, num_partitions: int, strategy_name: str) -> Dict
     ds.context.shuffle_strategy = ShuffleStrategy(strategy_name)
 
     start = time.perf_counter()
-    rows, batches = materialize(ds)
+    # Collect results for TPC-H queries since they are small enough.
+    result_df = ds.to_pandas()
     elapsed = time.perf_counter() - start
-    print(f"{elapsed:.1f}s ({rows:,} rows, {batches} batches)")
+    
+    print(f"{elapsed:.1f}s")
+    print(f"  [Result]\n{result_df}\n")
 
     if os.environ.get("RAY_DATA_SHUFFLE_PROFILE") == "1":
         print(f"\n========== {name} ds.stats() ==========")
@@ -395,8 +398,7 @@ def run_one(name: str, sf: int, num_partitions: int, strategy_name: str) -> Dict
     info = {
         "query": name,
         "elapsed_s": round(elapsed, 3),
-        "num_rows": rows,
-        "num_batches": batches,
+        "num_rows": len(result_df),
         "status": "ok",
     }
 
