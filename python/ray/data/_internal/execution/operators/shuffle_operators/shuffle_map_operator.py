@@ -25,6 +25,7 @@ from ray.data._internal.execution.operators.base_physical_operator import (
     InternalQueueOperatorMixin,
 )
 from ray.data._internal.execution.operators.shuffle_operators._shuffle_tasks import (
+    MapBlockTransformer,
     PartitionFn,
     _shuffle_map_task,
 )
@@ -149,6 +150,7 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
         pre_map_merge_threshold: int = _DEFAULT_PRE_MAP_MERGE_THRESHOLD,
         map_runtime_env: Optional[Dict[str, Any]] = None,
         map_cpus: float = _DEFAULT_SHUFFLE_MAP_TASK_NUM_CPUS,
+        input_block_transformer: Optional["MapBlockTransformer"] = None,
         input_seq_index: int = 0,
         name: str = "ShuffleMap",
     ):
@@ -160,6 +162,11 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
 
         self._num_partitions: int = num_partitions
         self._partition_fn: PartitionFn = partition_fn
+        # Optional per-block transform applied inside the map task before
+        # partitioning (e.g. partial pre-aggregation for HashAggregate).
+        self._input_block_transformer: Optional["MapBlockTransformer"] = (
+            input_block_transformer
+        )
         # Marks which upstream sequence this mapper represents in a multi-input
         # reduce (e.g. join left=0, right=1).  Stamped onto every output bundle
         # so a multi-input ShuffleReduceOp can route shards by side.
@@ -337,6 +344,7 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
             *block_refs,
             partition_fn=self._partition_fn,
             num_partitions=self._num_partitions,
+            input_block_transformer=self._input_block_transformer,
         )
         metadata_ref = map_refs[0]
         partition_refs = list(map_refs[1:])
