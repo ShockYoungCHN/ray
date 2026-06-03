@@ -341,11 +341,116 @@ def q12(sf: int, num_partitions: int):
     )
 
 
+def q4(sf: int, num_partitions: int):
+    """Q4: Order Priority Checking.
+
+    EXISTS subquery is realized as ``LEFT_SEMI`` join of ``orders`` against
+    the filtered ``lineitem`` on ``o_orderkey = l_orderkey``.  Both inputs
+    are big tables (no small-table side eligible for broadcast even at
+    sf=1), and the join is the only shuffle in the plan — so this is a
+    clean "must-shuffle" benchmark for the V2 join path and a way to
+    exercise the LEFT_SEMI code path that q3/q5/q12 do not touch.
+    """
+    orders = load_table(
+        "orders", sf, columns=["o_orderkey", "o_orderdate", "o_orderpriority"],
+    )
+    orders = orders.filter(
+        expr=(col("o_orderdate") >= lit(date(1993, 7, 1)))
+        & (col("o_orderdate") < lit(date(1993, 10, 1)))
+    )
+
+    lineitem = load_table(
+        "lineitem", sf, columns=["l_orderkey", "l_commitdate", "l_receiptdate"],
+    )
+    lineitem = lineitem.filter(expr=col("l_commitdate") < col("l_receiptdate"))
+
+    # EXISTS (...) = LEFT_SEMI: keep an order only if it has at least one
+    # qualifying lineitem.  Output schema is orders' columns only.
+    matched = orders.join(
+        lineitem, join_type="left_semi", num_partitions=num_partitions,
+        on=("o_orderkey",), right_on=("l_orderkey",),
+    )
+    return (
+        matched.groupby(["o_orderpriority"], num_partitions=num_partitions)
+        .aggregate(Count())
+    )
+
+
+def q18(sf: int, num_partitions: int):
+    """Q18: Large Volume Customer.
+
+    Two-stage plan, all big-table joins:
+
+    1. Pre-aggregate lineitem by ``l_orderkey``, filter
+       ``sum(l_quantity) > 300`` → "hot" orderkeys (a few %% of orders).
+    2. Semi-join orders against hot orderkeys, then chain
+       ``customer ⋈ orders_hot ⋈ lineitem`` to pull qty per (customer,
+       order) pair, then groupby + sum.
+
+    None of the join sides ever fit in broadcast budget at sf>=1
+    (customer/orders/lineitem all >> 10 MB even before filtering).  The
+    LEFT_SEMI in stage 2 + INNER joins in stages 3/4 stress the V2 join
+    path on a 3-table fact chain.
+    """
+    lineitem = load_table(
+        "lineitem", sf,
+        columns=["l_orderkey", "l_quantity"],
+    )
+
+    # Stage 1: per-orderkey quantity sum, then filter > 300.  V2 hash
+    # aggregate's map-side pre-agg collapses lineitem into orderkey-keyed
+    # partial sums, so the shuffle width here is ~|distinct orderkeys|
+    # rows * (orderkey + sum) bytes.
+    qty_per_order = (
+        lineitem.groupby(["l_orderkey"], num_partitions=num_partitions)
+        .aggregate(Sum("l_quantity"))
+    )
+    hot_orderkeys = qty_per_order.filter(expr=col("sum(l_quantity)") > lit(300))
+
+    customer = load_table(
+        "customer", sf, columns=["c_custkey", "c_name"],
+    )
+    orders = load_table(
+        "orders", sf,
+        columns=["o_orderkey", "o_custkey", "o_orderdate", "o_totalprice"],
+    )
+
+    # Stage 2: orders semi-joined with hot_orderkeys keeps only the
+    # orders whose key sums to >300 lineitem quantity.
+    orders_hot = orders.join(
+        hot_orderkeys, join_type="left_semi", num_partitions=num_partitions,
+        on=("o_orderkey",), right_on=("l_orderkey",),
+    )
+
+    # Stage 3: customer ⋈ orders_hot ⋈ lineitem to recover per-row
+    # quantities for the final aggregation.  All three are large.
+    co = customer.join(
+        orders_hot, join_type="inner", num_partitions=num_partitions,
+        on=("c_custkey",), right_on=("o_custkey",),
+    )
+    col_lo = co.join(
+        lineitem, join_type="inner", num_partitions=num_partitions,
+        on=("o_orderkey",), right_on=("l_orderkey",),
+    )
+
+    # Stage 4: groupby on the 5-column key produces one row per heavy
+    # (customer, order) pair.  Sum collapses lineitem qty back per pair.
+    return (
+        col_lo.groupby(
+            ["c_name", "c_custkey", "o_orderkey", "o_orderdate", "o_totalprice"],
+            num_partitions=num_partitions,
+        )
+        .aggregate(Sum("l_quantity"))
+    )
+
+
 QUERIES: Dict[str, Callable] = {
     "q1": q1,
     "q3": q3,
+    "q4": q4,
     "q5": q5,
     "q12": q12,
+    "q18": q18,
 }
 
 
