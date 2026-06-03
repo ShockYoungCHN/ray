@@ -774,6 +774,7 @@ void LocalObjectManager::FillObjectStoreStats(rpc::GetNodeStatsReply *reply) con
 void LocalObjectManager::RecordMetrics() const {
   /// Record Metrics.
   if (spilled_bytes_total_ != 0 && spill_time_total_s_ != 0) {
+
     spill_manager_metrics_.spill_manager_throughput_mb_gauge.Record(
         spilled_bytes_total_ / 1024 / 1024 / spill_time_total_s_, {{"Type", "Spilled"}});
   }
@@ -810,6 +811,51 @@ void LocalObjectManager::RecordMetrics() const {
 
   spill_manager_metrics_.spill_manager_request_total_gauge.Record(
       num_failed_deletion_requests_, {{"Type", "FailedDeletion"}});
+
+  // Also write a flat key=value snapshot of the same numbers into the
+  // dedicated spill events log so Python tooling has an independent
+  // data source to cross-check against Prometheus.
+  LogSpillManagerSummary();
+}
+
+void LocalObjectManager::LogSpillManagerSummary() const {
+  // Pre-compute the derived throughput fields the same way RecordMetrics
+  // does so consumers don't have to re-derive them from totals + time.
+  double spill_throughput_mb = 0.0;
+  if (spilled_bytes_total_ != 0 && spill_time_total_s_ != 0) {
+    spill_throughput_mb = static_cast<double>(spilled_bytes_total_) / 1024.0 /
+                          1024.0 / spill_time_total_s_;
+  }
+  double restore_throughput_mb = 0.0;
+  if (restored_bytes_total_ != 0 && restore_time_total_s_ != 0) {
+    restore_throughput_mb = static_cast<double>(restored_bytes_total_) / 1024.0 /
+                            1024.0 / restore_time_total_s_;
+  }
+  EmitSpillEvent(
+      "phase=spill_manager_summary source=raylet_cpp "
+      "spilled_bytes_total={} spilled_objects_total={} spill_time_total_s={} "
+      "spill_throughput_mb={} "
+      "restored_bytes_total={} restored_objects_total={} "
+      "restore_time_total_s={} restore_throughput_mb={} "
+      "pinned_size_bytes={} pinned_count={} "
+      "pending_spill_bytes={} pending_spill_count={} "
+      "pending_restore_bytes={} pending_restore_count={} "
+      "failed_deletions={}",
+      spilled_bytes_total_,
+      spilled_objects_total_,
+      spill_time_total_s_,
+      spill_throughput_mb,
+      restored_bytes_total_,
+      restored_objects_total_,
+      restore_time_total_s_,
+      restore_throughput_mb,
+      pinned_objects_size_,
+      pinned_objects_.size(),
+      num_bytes_pending_spill_,
+      objects_pending_spill_.size(),
+      num_bytes_pending_restore_,
+      objects_pending_restore_.size(),
+      num_failed_deletion_requests_);
 }
 
 int64_t LocalObjectManager::GetPrimaryBytes() const {
