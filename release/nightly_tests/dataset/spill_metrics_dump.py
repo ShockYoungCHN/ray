@@ -90,8 +90,26 @@ def _aggregate_events(per_node_events: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     total_events = 0
     fn_calls: Dict[str, int] = defaultdict(int)
+    # Independent C++ data source: the raylet writes a flat key=val summary
+    # line into its spill events log every metric tick (see
+    # LocalObjectManager::LogSpillManagerSummary).  We aggregate the latest
+    # snapshot per endpoint here so callers can cross-check against the
+    # Prometheus-derived numbers — the two paths must agree, divergence is
+    # a bug somewhere in the scrape pipeline.
+    latest_cpp_summary_per_endpoint: Dict[str, Dict[str, str]] = {}
+    benchmark_finalize_count = 0
     for n in per_node_events:
         for ev in n["events"]:
+            phase = ev.get("phase")
+            if phase == "spill_manager_summary":
+                # Sum across endpoints below — keep only the last (newest)
+                # summary per node since the counters are cumulative.
+                endpoint = ev.get("endpoint", n.get("node_ip", "?"))
+                latest_cpp_summary_per_endpoint[endpoint] = ev
+                continue
+            if phase == "benchmark_finalize":
+                benchmark_finalize_count += 1
+                continue
             total_events += 1
             fn = ev.get("fn")
             if fn is not None:
@@ -100,7 +118,6 @@ def _aggregate_events(per_node_events: List[Dict[str, Any]]) -> Dict[str, Any]:
             trigger = ev.get("trigger", "?")
             creator = ev.get("creator", "?")
             key = (trigger, creator)
-            phase = ev.get("phase")
             if phase == "spilled":
                 spilled[key]["count"] += 1
                 spilled[key]["bytes_sum"] += float(ev.get("size", 0))
@@ -113,8 +130,29 @@ def _aggregate_events(per_node_events: List[Dict[str, Any]]) -> Dict[str, Any]:
                 )
                 d["bytes_sum"] += float(ev.get("size", 0))
 
+    # Sum the latest C++ snapshot per node so we get cluster-wide totals.
+    NUMERIC_KEYS = (
+        "spilled_bytes_total", "spilled_objects_total", "spill_time_total_s",
+        "spill_throughput_mb", "restored_bytes_total", "restored_objects_total",
+        "restore_time_total_s", "restore_throughput_mb",
+        "pinned_size_bytes", "pinned_count",
+        "pending_spill_bytes", "pending_spill_count",
+        "pending_restore_bytes", "pending_restore_count",
+        "failed_deletions",
+    )
+    cpp_summary_aggregated: Dict[str, float] = {k: 0.0 for k in NUMERIC_KEYS}
+    for ev in latest_cpp_summary_per_endpoint.values():
+        for k in NUMERIC_KEYS:
+            try:
+                cpp_summary_aggregated[k] += float(ev.get(k, 0.0))
+            except (TypeError, ValueError):
+                pass
+
     return {
         "total_events": total_events,
+        "benchmark_finalize_lines": benchmark_finalize_count,
+        "cpp_summary_aggregated": cpp_summary_aggregated,
+        "cpp_summary_nodes_reporting": len(latest_cpp_summary_per_endpoint),
         "lom_entry_calls": dict(fn_calls),
         "by_trigger_creator": {
             "spilled": {
@@ -504,14 +542,39 @@ def summarize(metrics: Dict[str, Any]) -> str:
         lines.append("\nSpill Event Summary:")
         lines.append(f"  Total events: {s['total_events']}")
         lines.append(f"  Nodes with events: {s.get('num_nodes_with_events', 'N/A')}")
-        
+
         lines.append("  Spilled by trigger|creator:")
         for k, v in s["by_trigger_creator"]["spilled"].items():
             lines.append(f"    {k}: {v['count']} objects, {v['bytes_sum']/1e9:.2f} GB")
-            
+
         lines.append("  LOM entry calls:")
         for k, v in s["lom_entry_calls"].items():
             lines.append(f"    {k}: {v}")
+
+        # Independent C++ data source cross-check.  These come from
+        # LocalObjectManager::LogSpillManagerSummary writing directly out of
+        # raylet internal state — should match the Prometheus-derived values
+        # above; any divergence is a scraping bug.
+        cpp = s.get("cpp_summary_aggregated")
+        if cpp and s.get("cpp_summary_nodes_reporting", 0) > 0:
+            lines.append(
+                f"\nC++ raylet self-reported summary "
+                f"({s['cpp_summary_nodes_reporting']} nodes):"
+            )
+            lines.append(
+                f"  spilled: {cpp['spilled_objects_total']:.0f} objects, "
+                f"{cpp['spilled_bytes_total']/1e9:.2f} GB, "
+                f"throughput {cpp['spill_throughput_mb']:.1f} MB/s"
+            )
+            lines.append(
+                f"  restored: {cpp['restored_objects_total']:.0f} objects, "
+                f"{cpp['restored_bytes_total']/1e9:.2f} GB, "
+                f"throughput {cpp['restore_throughput_mb']:.1f} MB/s"
+            )
+            lines.append(
+                f"  pinned: {cpp['pinned_count']:.0f} objects, "
+                f"{cpp['pinned_size_bytes']/1e9:.2f} GB"
+            )
             
     return "\n".join(lines)
 

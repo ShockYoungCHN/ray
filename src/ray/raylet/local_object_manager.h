@@ -211,6 +211,15 @@ class LocalObjectManager : public LocalObjectManagerInterface {
   /// Record object spilling stats to metrics.
   void RecordMetrics() const override;
 
+  /// Emit a single-line summary of the spill-manager state to the
+  /// dedicated spill events log file.  This gives Python tooling an
+  /// independent source of truth for cumulative spill counters
+  /// (Prometheus exposes the same numbers but goes through a separate
+  /// scrape path and label-flattening; comparing the two surfaces
+  /// scraper/labelling bugs).  Called from ``RecordMetrics`` so the
+  /// cadence is the same as Prometheus reporting.
+  void LogSpillManagerSummary() const;
+
   /// Return the spilled object URL if the object is spilled locally,
   /// or the empty string otherwise.
   /// If the external storage is cloud, this will always return an empty string.
