@@ -151,6 +151,7 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
         map_runtime_env: Optional[Dict[str, Any]] = None,
         map_cpus: float = _DEFAULT_SHUFFLE_MAP_TASK_NUM_CPUS,
         input_block_transformer: Optional["MapBlockTransformer"] = None,
+        per_partition_post_transformer: Optional["MapBlockTransformer"] = None,
         input_seq_index: int = 0,
         name: str = "ShuffleMap",
     ):
@@ -166,6 +167,13 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
         # partitioning (e.g. partial pre-aggregation for HashAggregate).
         self._input_block_transformer: Optional["MapBlockTransformer"] = (
             input_block_transformer
+        )
+        # Optional per-task per-partition transform applied after concat,
+        # before IPC encoding.  SEMI/ANTI joins set this to the same
+        # dedup function as input_block_transformer to also collapse
+        # cross-block duplication within a single map task.
+        self._per_partition_post_transformer: Optional["MapBlockTransformer"] = (
+            per_partition_post_transformer
         )
         # Marks which upstream sequence this mapper represents in a multi-input
         # reduce (e.g. join left=0, right=1).  Stamped onto every output bundle
@@ -345,6 +353,7 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
             partition_fn=self._partition_fn,
             num_partitions=self._num_partitions,
             input_block_transformer=self._input_block_transformer,
+            per_partition_post_transformer=self._per_partition_post_transformer,
         )
         metadata_ref = map_refs[0]
         partition_refs = list(map_refs[1:])

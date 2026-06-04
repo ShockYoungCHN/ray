@@ -196,6 +196,10 @@ def _plan_hash_shuffle_join_v2(
         map_runtime_env=_SHUFFLE_MAP_RUNTIME_ENV,
         input_seq_index=0,
         input_block_transformer=left_map_transformer,
+        # Same dedup fn run again after per-pid concat collapses cross-
+        # block duplication inside a single map task.  No-op for non-
+        # SEMI/ANTI joins (transformer is None).
+        per_partition_post_transformer=left_map_transformer,
         name=(
             f"JoinShuffleMapLeft(keys={left_keys}, "
             f"partitions={target_num_partitions})"
@@ -209,6 +213,7 @@ def _plan_hash_shuffle_join_v2(
         map_runtime_env=_SHUFFLE_MAP_RUNTIME_ENV,
         input_seq_index=1,
         input_block_transformer=right_map_transformer,
+        per_partition_post_transformer=right_map_transformer,
         name=(
             f"JoinShuffleMapRight(keys={right_keys}, "
             f"partitions={target_num_partitions})"

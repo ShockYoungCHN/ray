@@ -175,6 +175,7 @@ def _shuffle_map_task(
     partition_fn: PartitionFn,
     num_partitions: int,
     input_block_transformer: Optional["MapBlockTransformer"] = None,
+    per_partition_post_transformer: Optional["MapBlockTransformer"] = None,
 ):
     """Map stage: partition input blocks and return one shard per partition.
 
@@ -189,6 +190,17 @@ def _shuffle_map_task(
         partition_fn: Callable (pa.Table) -> Dict[int, pa.Table] that
             assigns rows to output partitions.
         num_partitions: Total number of output partitions.
+        input_block_transformer: Optional per-block transformer applied
+            before partitioning (e.g. partial pre-aggregation for
+            HashAggregate, per-block dedup for SEMI/ANTI joins).
+        per_partition_post_transformer: Optional transformer applied
+            once per (task, partition) **after** the per-pid concat,
+            right before IPC encoding.  Used by SEMI/ANTI joins to do
+            a per-task cluster-incremental dedup on the merged
+            partition shard — collapses cross-block duplication that
+            the per-block ``input_block_transformer`` can't catch.
+            Must be idempotent (called even when shards already
+            unique).
 
     Returns:
         Tuple of ``num_partitions + 1`` values:
@@ -248,6 +260,13 @@ def _shuffle_map_task(
                 merged = pa.concat_tables(tables)
         else:
             merged = tables[0]
+        # Per-task cluster-incremental transform applied after concat.
+        # For SEMI/ANTI joins this is the dedup function; collapsing
+        # cross-block duplication that the per-block path missed before
+        # the IPC encode cuts plasma+network bytes for free.
+        if per_partition_post_transformer is not None:
+            with timings.record("map.post_concat_transform_s"):
+                merged = per_partition_post_transformer(merged)
         shard_sizes[pid] = (merged.num_rows, merged.nbytes)
         timings.add("map.zstd_bytes_in", float(merged.nbytes))
         with timings.record("map.ipc_encode_s"):
