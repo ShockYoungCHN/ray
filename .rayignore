@@ -1,0 +1,18 @@
+# .rayignore — excluded from ray.init / runtime_env working_dir uploads ONLY.
+#
+# Paths listed here STAY on local disk AND in Anyscale workspace snapshots.
+# They are only kept out of the package Ray ships to the cluster on ray.init.
+# Do NOT move these to .gitignore or .anyscaleignore — that would also drop
+# them from workspace snapshots, which we want to keep.
+#
+# Syntax: gitwildmatch (identical to .gitignore), relative to the working_dir
+# root (/home/ray/default). Parsed by ray._private.runtime_env.packaging.
+
+# Benchmark results + per-node raw spill logs
+benchmark_logs/
+[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]/
+*_spill_log.txt
+raylet_spill_events.out
+
+# CloudSort working repo (separate nested git repo; no need to ship in runtime_env)
+cloudsort/

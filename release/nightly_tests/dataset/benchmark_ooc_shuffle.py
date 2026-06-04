@@ -133,6 +133,11 @@ def main():
         help="Set map_reduce_max_concurrent_reducers to a large value so the"
         " scheduler is the only authority on reducer concurrency.",
     )
+    parser.add_argument(
+        "--timeline-out", type=str, default=None,
+        help="If set, dump ray.timeline() (Chrome trace) to this path after the"
+        " workload, for task:store_outputs / task:execute phase analysis.",
+    )
     args = parser.parse_args()
 
     # Define unique experiment output directory
@@ -187,7 +192,15 @@ def main():
     snapshot_before = snapshot_spill_metrics()
 
     benchmark_start_ts = time.time()
+    print(f"BENCHMARK_START_TS {benchmark_start_ts:.6f}", flush=True)
     info = run_one(data_size_gb, num_partitions, strategy_name=strategy_name, uncap_reduce=args.uncap_reduce)
+
+    if args.timeline_out:
+        # Dump the cluster timeline from this same Ray session.  Includes
+        # task:execute and task:store_outputs profile events; filter by
+        # BENCHMARK_START_TS downstream to scope to this run.
+        ray.timeline(filename=args.timeline_out)
+        print(f"TIMELINE written to {args.timeline_out}", flush=True)
 
     # Collect metrics and pull raw log files from all nodes into experiment_dir.
     # Delta against snapshot_before; raw cumulative preserved under raw_after.
