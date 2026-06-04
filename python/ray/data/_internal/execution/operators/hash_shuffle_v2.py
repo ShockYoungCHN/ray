@@ -79,6 +79,20 @@ def _make_join_partition_fn(
     return _partition
 
 
+def _make_semi_join_dedup_transformer(key_columns: List[str]) -> MapBlockTransformer:
+    """Return a transformer that deduplicates a block by ``key_columns``.
+
+    Used for the build side of semi/anti joins to shrink the shuffle payload
+    when we only care about key existence.
+    """
+
+    def _dedup(block: pa.Table) -> pa.Table:
+        # Deduplicate and project to key columns.
+        return block.select(key_columns).group_by(key_columns).aggregate([])
+
+    return _dedup
+
+
 def _make_join_reduce_fn(
     *,
     join_type: JoinType,

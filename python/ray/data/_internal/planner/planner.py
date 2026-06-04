@@ -165,6 +165,7 @@ def _plan_hash_shuffle_join_v2(
         _SHUFFLE_MAP_RUNTIME_ENV,
         _make_join_partition_fn,
         _make_join_reduce_fn,
+        _make_semi_join_dedup_transformer,
     )
     from ray.data._internal.execution.operators.shuffle_operators.shuffle_map_operator import (  # noqa: E501
         ShuffleMapOp,
@@ -172,12 +173,20 @@ def _plan_hash_shuffle_join_v2(
     from ray.data._internal.execution.operators.shuffle_operators.shuffle_reduce_operator import (  # noqa: E501
         ShuffleReduceOp,
     )
+    from ray.data._internal.logical.operators import JoinType
 
     left_keys = tuple(logical_op.left_key_columns)
     right_keys = tuple(logical_op.right_key_columns)
     target_num_partitions = (
         logical_op.num_outputs or data_context.default_hash_shuffle_parallelism
     )
+
+    left_map_transformer = None
+    right_map_transformer = None
+    if logical_op.join_type in (JoinType.LEFT_SEMI, JoinType.LEFT_ANTI):
+        right_map_transformer = _make_semi_join_dedup_transformer(list(right_keys))
+    elif logical_op.join_type in (JoinType.RIGHT_SEMI, JoinType.RIGHT_ANTI):
+        left_map_transformer = _make_semi_join_dedup_transformer(list(left_keys))
 
     left_map = ShuffleMapOp(
         left_physical_op,
@@ -186,6 +195,7 @@ def _plan_hash_shuffle_join_v2(
         partition_fn=_make_join_partition_fn(list(left_keys), target_num_partitions),
         map_runtime_env=_SHUFFLE_MAP_RUNTIME_ENV,
         input_seq_index=0,
+        input_block_transformer=left_map_transformer,
         name=(
             f"JoinShuffleMapLeft(keys={left_keys}, "
             f"partitions={target_num_partitions})"
@@ -198,6 +208,7 @@ def _plan_hash_shuffle_join_v2(
         partition_fn=_make_join_partition_fn(list(right_keys), target_num_partitions),
         map_runtime_env=_SHUFFLE_MAP_RUNTIME_ENV,
         input_seq_index=1,
+        input_block_transformer=right_map_transformer,
         name=(
             f"JoinShuffleMapRight(keys={right_keys}, "
             f"partitions={target_num_partitions})"
