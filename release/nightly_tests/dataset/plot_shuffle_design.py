@@ -30,7 +30,7 @@ def main() -> None:
 
     fig, ax = plt.subplots(figsize=(17, 11))
     ax.set_xlim(0, 16)
-    ax.set_ylim(0, 11)
+    ax.set_ylim(-0.9, 11)
     ax.axis("off")
     ax.set_title("Ray Data V2 Hash Shuffle — design + measured behavior (500 partitions, OOC study)",
                  fontsize=13, fontweight="bold", y=0.99)
@@ -96,8 +96,23 @@ def main() -> None:
          "• reduce.ray_get_s ~20×; restore = 1 obj/RPC,\n  max_io_workers=4 (write fuses, read doesn't)", "#fdeee6")
 
     # legend for spill arrows
-    ax.text(5.75, 0.05, "↓ spill (async)   ↑ restore (sync, on reduce path)", fontsize=6.5,
+    ax.text(3.5, -0.12, "↓ spill (async)   ↑ restore (sync, on reduce path)", fontsize=6.5,
             color="#555", ha="center")
+
+    # shuffle barrier between phase 1 and phase 2
+    ax.plot([8.95, 8.95], [-0.55, 8.75], ls=(0, (5, 3)), color="#888", lw=1.6, zorder=2)
+    ax.text(8.95, 8.78, "shuffle barrier\n(reduce waits for ALL maps)", ha="center",
+            va="bottom", fontsize=7, color="#555", style="italic")
+
+    # phase brackets along the bottom (total = T(read+map) + T(reduce+write))
+    def bracket(x0, x1, y, label):
+        ax.plot([x0, x0, x1, x1], [y + 0.12, y, y, y + 0.12], color="#444", lw=1.2)
+        ax.text((x0 + x1) / 2, y - 0.18, label, ha="center", va="top", fontsize=8,
+                fontweight="bold", color="#333")
+    bracket(0.3, 8.8, -0.45, "PHASE 1: read + map   (~51% of runtime, read-bound)")
+    bracket(9.1, 15.7, -0.45, "PHASE 2: reduce + write   (~47%; spill restore ~10-16%)")
+    ax.text(8.0, -0.82, "total time ≈ T(phase1) + T(phase2)  →  speeding up any binding stage raises GB/s",
+            ha="center", fontsize=7.5, color="#a11", fontweight="bold")
 
     fig.tight_layout()
     fig.savefig(args.out, dpi=140, bbox_inches="tight")

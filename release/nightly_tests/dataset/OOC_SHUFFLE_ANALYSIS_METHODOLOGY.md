@@ -92,6 +92,62 @@ python analyze_scheduling.py --progress-log benchmark_logs/sweep_500p/sweep.log 
   not a block — and widening read wouldn't help end-to-end since reduce+write
   dominate the back half. Net: the only large spill cost is reduce restore.
 
+## Throughput model (corrected)
+
+The job is NOT a single fully-overlapped pipeline. The hash-shuffle **barrier**
+(a reducer needs every mapper's shard for its partition) splits it into two
+largely-sequential phases:
+
+    total_time  ≈  T(read+map)  +  T(reduce+write)        # barrier between them
+    GB/s        =  data / total_time
+
+So the ceiling is **the current binding stage's rate, across ALL stages**
+— read (S3 + decode), map (partition + encode), reduce (restore + decode +
+reduce_fn), AND **write** (encode + local-disk write). It is NOT a hard wall:
+speeding up any stage shortens its phase and **raises GB/s by ~that stage's
+share of total time** (whack-a-mole — the next stage then binds). Data size
+alone does not raise the ceiling; optimizing a binding stage does.
+
+Measured shares at 512 GB (from stage spans; phases overlap internally):
+
+| phase | stages | span | ~share | binding factor |
+|---|---|---|---|---|
+| 1 | read (~124s) ‖ map (~112s) | ~124 s | **~51%** | read (S3 + parquet decode) |
+| 2 | reduce (~108s) ‖ write (~113s) | ~113 s | **~47%** | reduce restore + write |
+
+Within phase 2, reduce restore (`ray_get` wall ~47 s, spill-portion ~25-40 s)
+≈ **10-16% of total**. So at 512 GB: **read is the biggest single lever
+(~51%)**, write is a non-trivial phase-2 cost (easy to overlook), and efficient
+spill buys ~10-16% now — a share that **grows super-linearly with data** as
+restore degrades, eventually becoming the dominant lever (and bending the GB/s
+plateau downward if left unfixed).
+
+## Reduce restore path — inefficiencies & proposed fixes
+
+Where the dominant spill cost lives and how to cut it (highest-value first):
+
+1. **No fetch/decode overlap** (`_shuffle_tasks.py:423-435`): strictly serial
+   `ray.get(batch)` → decode → next `ray.get`; no prefetch / `ray.wait`. While
+   decoding, the raylet isn't restoring the next batch. *Fix:* prefetch the next
+   batch / consume via `ray.wait` in completion order → hide restore behind decode.
+2. **In-flight restore window capped at batch=16** (`_REDUCE_BATCH_SIZE`, line 47):
+   only 16 refs ever requested at once. *Fix:* decouple the pull window (large,
+   to saturate disk) from the decoded-accumulator memory cap (small).
+3. **Head-of-line blocking within a batch**: `ray.get(16)` waits for the slowest
+   of 16 (one spilled straggler stalls 15 in-memory). *Fix:* `ray.wait`.
+4. **`max_io_workers=4`** (`ray_config_def.h:719`), shared by spill AND restore →
+   ≤4 concurrent restores/node. *Fix:* raise it to match NVMe parallelism.
+5. **Write/read fusing asymmetry**: spill fuses ≤2000 objs / 100 MB into one file
+   (`min_spilling_size`, `max_fused_object_count`), but `AsyncRestoreSpilledObject`
+   restores **1 object per RPC** (`local_object_manager.cc:574`) → many small reads
+   of the median ~0.7 MiB shard. *Fix:* batch-restore by fused file (core change).
+6. **Tiny shards** (median 0.7 MiB) amplify per-object RPC/io-worker overhead.
+   *Fix:* coarser partitioning / fewer-larger shards (trade vs parallelism/skew).
+
+Cheapest high-impact combo: **#1 + #4** (overlap restore with decode + raise
+restore concurrency). Verify with the no-spill counterfactual (bump object store,
+rerun 512 GB, watch `reduce.ray_get_s` collapse).
+
 ## File index (under benchmark_logs/)
 
 - `sweep_500p/summary_table.{md,csv}` — per-stage wall + shuffle sub-timers, all sizes (Ray Data `ds.stats`)
