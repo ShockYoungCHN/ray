@@ -18,6 +18,8 @@ map-store blind spot.
 | per-task total durations (the ×1.1 / ×3.3 table) | `ray.util.state.list_tasks` `end_time_ms − start_time_ms` | **Ray Core** (GCS task state) | whole task (deserialize + execute + store_outputs) |
 | phase breakdown (`task:execute` / `store_outputs` / `deserialize_arguments`) — create-stall + read decomposition | `ray.timeline()` profile events (`_raylet.pyx:1836,1985`) | **Ray Core** (profiling) | per-phase per-task |
 | spilled GB, throughput, EvictionOnCreate/ThresholdMonitor, size dist, burstiness | `raylet_spill_events.out` (C++ `LocalObjectManager`) + Prometheus | **raylet / Core** | spill events |
+| per-op concurrency / effective parallelism + cluster CPU saturation | `ray.timeline` execute spans, sweep-line (`analyze_scheduling.py`) | **Ray Core** (profiling) | how many tasks of an op run simultaneously vs total CPUs |
+| op output-queue (backpressure) + running tasks + CPU over time | streaming-executor progress log (`sweep.log`) | **Ray Data** (executor) | is an op throttled by a full output queue / starved of CPU |
 
 Key consequence: `ds.stats()` "Remote wall time" wraps only `task:execute`, so
 it is **blind to the `task:store_outputs` epilogue** (where spill-create
@@ -59,6 +61,16 @@ python analyze_task_phases.py benchmark_logs/timeline/timeline_512.json \
     --since <BENCHMARK_START_TS_512> --until <+elapsed> --label 512_spill \
     --out-prefix benchmark_logs/timeline/tl512
 #   -> tl512_phase_breakdown.{csv,md}   (n/sum/mean/p50/p99/max per task×phase)
+
+# 5. Scheduling: per-op concurrency + cluster saturation, and read backpressure
+python analyze_scheduling.py --timeline benchmark_logs/timeline/timeline_512.json \
+    --tasks benchmark_logs/timeline/task_records.json \
+    --since <BENCHMARK_START_TS_512> --until <+elapsed> --total-cpus 256 \
+    --label 512_spill --out-prefix benchmark_logs/timeline/sched512
+python analyze_scheduling.py --progress-log benchmark_logs/sweep_500p/sweep.log \
+    --run-size 512 --op ReadFilesParquetV2 --out-prefix benchmark_logs/timeline/sched512
+#   -> sched512_concurrency.{csv,md} (eff parallelism + cluster max/p90 conc)
+#   -> sched512_backpressure.{csv,md} (read output-queue + CPU over progress ticks)
 ```
 
 ## Headline numbers (this run, 500 partitions)
@@ -71,6 +83,14 @@ python analyze_task_phases.py benchmark_logs/timeline/timeline_512.json \
 - read is NOT plasma/spill-affected: `store_outputs` flat 0.08 ms; its growth
   is entirely in `execute` (4882 → 19078 ms = S3 fetch + parquet decode, and
   the two runs read different datasets sf100 vs sf1000 — a dirty A/B for read).
+- read is NOT scheduling-blocked: cluster never CPU-saturated (512 GB execute
+  conc max 195/256, 64 GB max 203/256); read runs the WIDEST of all ops
+  (eff_parallel 134 at 512) and its output queue DRAINS (839→0 blocks, not
+  backpressured); read also finishes early (~half the run), so it is not on the
+  critical path. The persistent idle CPU (cluster tops ~193-195/256) is a
+  packing inefficiency (read tasks are IO-bound on S3 yet reserve 1 CPU each),
+  not a block — and widening read wouldn't help end-to-end since reduce+write
+  dominate the back half. Net: the only large spill cost is reduce restore.
 
 ## File index (under benchmark_logs/)
 
@@ -79,4 +99,6 @@ python analyze_task_phases.py benchmark_logs/timeline/timeline_512.json \
 - `20260604_0948*/` — per-node raw `*_spill_log.txt` (256/384/512 GB); `094821/plots*/` spill PNGs
 - `timeline/timeline_{512,64}.json` — ray.timeline Chrome traces
 - `timeline/task_records.json` — list_tasks snapshot (worker_id, name, start/end) for the join
-- `timeline/tl{512,64}_phase_breakdown.{csv,md}` — per-task-type phase breakdown (this analysis)
+- `timeline/tl{512,64}_phase_breakdown.{csv,md}` — per-task-type phase breakdown (create-stall + read decomposition)
+- `timeline/sched{512,64}_concurrency.{csv,md}` — per-op effective parallelism + cluster CPU saturation
+- `timeline/sched512_backpressure.{csv,md}` — read output-queue + CPU over progress ticks (not backpressured)
