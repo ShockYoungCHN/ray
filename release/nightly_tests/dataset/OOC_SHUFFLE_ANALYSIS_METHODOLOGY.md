@@ -135,8 +135,26 @@ Where the dominant spill cost lives and how to cut it (highest-value first):
    to saturate disk) from the decoded-accumulator memory cap (small).
 3. **Head-of-line blocking within a batch**: `ray.get(16)` waits for the slowest
    of 16 (one spilled straggler stalls 15 in-memory). *Fix:* `ray.wait`.
-4. **`max_io_workers=4`** (`ray_config_def.h:719`), shared by spill AND restore →
-   ≤4 concurrent restores/node. *Fix:* raise it to match NVMe parallelism.
+4. **Restore concurrency vs the spill BACKEND** (`max_io_workers=4`,
+   `ray_config_def.h:719`, shared by spill AND restore). The right fix depends
+   entirely on what spill lands on — "raise io_workers" is only correct for
+   local NVMe:
+   - **Local NVMe (instance store: m5d/i3/i4i):** concurrency-limited → raise
+     `max_io_workers` to the device's parallelism. Best case for spill perf.
+   - **EBS (THIS cluster — m5.2xlarge, root `nvme0n1` = "Amazon Elastic Block
+     Store", NO instance store):** bandwidth-CAPPED. Measured spill ≈ **600 MB/s
+     per node**, which matches the m5.2xlarge **instance-level EBS bandwidth cap
+     (~593 MB/s / 4750 Mbps)** — i.e. the bottleneck is the instance's EBS pipe,
+     not the volume and definitely not NVMe (which would be multi-GB/s). 4
+     io_workers already saturate this pipe → **raising `max_io_workers` does
+     nothing here.** *Fix:* use instance-store NVMe nodes (m5d/i3/i4i) to lift
+     the cap to GB/s, OR reduce spill VOLUME so less crosses the capped pipe
+     (bigger object store / better overlap), OR a larger instance with more EBS
+     bandwidth. ⚠ the page-cache `spill_throughput_mb` metric (>1000 MB/s) HIDES
+     this — the real rate is ~600 MB/s (`iostat -dx` under load confirms).
+   - **S3 object spilling:** latency-bound (~tens of ms/request) → raise
+     concurrency a LOT to hide latency, AND fix #5 first: per-object GETs of the
+     0.7 MiB median shard are catastrophic on S3.
 5. **Write/read fusing asymmetry**: spill fuses ≤2000 objs / 100 MB into one file
    (`min_spilling_size`, `max_fused_object_count`), but `AsyncRestoreSpilledObject`
    restores **1 object per RPC** (`local_object_manager.cc:574`) → many small reads
