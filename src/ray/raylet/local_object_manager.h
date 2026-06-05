@@ -220,6 +220,33 @@ class LocalObjectManager : public LocalObjectManagerInterface {
   /// cadence is the same as Prometheus reporting.
   void LogSpillManagerSummary() const;
 
+ private:
+  /// A single deferred restore request held in the per-LOM batch queue
+  /// between the moment ``AsyncRestoreSpilledObject`` is called and the
+  /// moment ``FlushPendingRestoreBatch`` actually dispatches RPCs.
+  struct PendingRestoreRequest {
+    ObjectID object_id;
+    int64_t object_size;
+    std::string object_url;
+    std::function<void(const ray::Status &)> callback;
+  };
+
+  /// Flush the per-LOM pending restore batch by grouping requests by
+  /// their spill file's base URL and dispatching one ``RestoreSpilledObjects``
+  /// RPC per group.  Posted onto ``io_service_`` from
+  /// ``AsyncRestoreSpilledObject`` so multiple restore requests issued
+  /// inside the same event-loop callback batch get coalesced into a
+  /// single RPC per spill file.  Zero-timer; relies on Asio's "execute
+  /// posted tasks after current callback batch finishes" semantics.
+  void FlushPendingRestoreBatch();
+
+  /// Issue one ``RestoreSpilledObjects`` RPC carrying every entry in
+  /// ``group``.  ``group`` is moved into the RPC continuation so the
+  /// per-object callbacks remain alive until the IO worker replies.
+  void SendBatchRestoreRPC(std::vector<PendingRestoreRequest> group);
+
+ public:
+
   /// Return the spilled object URL if the object is spilled locally,
   /// or the empty string otherwise.
   /// If the external storage is cloud, this will always return an empty string.
@@ -357,6 +384,19 @@ class LocalObjectManager : public LocalObjectManagerInterface {
   /// The field is used to dedup the same restore request while restoration is in
   /// progress.
   absl::flat_hash_set<ObjectID> objects_pending_restore_;
+
+  /// Requests queued in the current event-loop iteration that are waiting
+  /// for ``FlushPendingRestoreBatch`` to run on the io_service post queue.
+  /// Reset to empty after each flush; size is bounded by how many
+  /// AsyncRestoreSpilledObject calls happen back-to-back inside a single
+  /// epoll wakeup (typically a Subscribe-reply burst or a Tick).
+  std::vector<PendingRestoreRequest> pending_restore_batch_;
+
+  /// True when a ``FlushPendingRestoreBatch`` task is already sitting on
+  /// the io_service post queue waiting to run.  Prevents re-scheduling the
+  /// flush task for every push when many requests arrive in one tick.
+  /// Reset back to false at the start of FlushPendingRestoreBatch.
+  bool batch_flush_scheduled_ = false;
 
   /// The time that we last sent a FreeObjects request to other nodes for
   /// objects that have gone out of scope in the application.
