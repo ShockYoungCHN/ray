@@ -576,7 +576,8 @@ TEST_F(LocalObjectManagerTest, TestRestoreSpilledObject) {
 
 // AsyncRestoreSpilledObject defers the actual RPC dispatch onto
 // io_service_ via post().  A single call with nothing else in the queue
-// should still produce exactly one RPC after io_service_ pumps once.
+// should still produce exactly one RPC after io_service_ pumps once and
+// an IO worker becomes available.
 TEST_F(LocalObjectManagerTest, TestRestoreBatch_SingleObject) {
   ObjectID object_id = ObjectID::FromRandom();
   const std::string url = BuildURL("file_A", /*offset=*/0);
@@ -592,14 +593,18 @@ TEST_F(LocalObjectManagerTest, TestRestoreBatch_SingleObject) {
   // Before draining, no RPC has been issued.
   ASSERT_EQ(worker_pool.io_worker_client->restore_request_object_counts.size(), 0u);
 
-  // Pump the io_service_; the posted FlushPendingRestoreBatch runs once.
+  // Pump the io_service_; the posted FlushPendingRestoreBatch runs once
+  // and calls PopRestoreWorker which queues a callback waiting for an
+  // io worker.
   io_service_.run_one();
+  // Provide the io worker — its arrival fires the queued callback which
+  // sends the actual RPC the mock can observe.
+  worker_pool.RestoreWorkerPushed();
 
   // Exactly one RPC dispatched, carrying exactly one object.
   ASSERT_EQ(worker_pool.io_worker_client->restore_request_object_counts.size(), 1u);
   ASSERT_EQ(worker_pool.io_worker_client->restore_request_object_counts[0], 1);
 
-  worker_pool.RestoreWorkerPushed();
   worker_pool.io_worker_client->ReplyRestoreObjects(/*bytes_restored=*/1024);
   ASSERT_EQ(num_times_fired, 1);
 }
@@ -631,7 +636,8 @@ TEST_F(LocalObjectManagerTest, TestRestoreBatch_SameFileCoalesces) {
   }
 
   ASSERT_EQ(worker_pool.io_worker_client->restore_request_object_counts.size(), 0u);
-  io_service_.run_one();
+  io_service_.run_one();   // flushes the batch, calls PopRestoreWorker once
+  worker_pool.RestoreWorkerPushed();   // hands the worker so RPC actually sends
 
   // One RPC, carrying all 5 objects (same base url).
   ASSERT_EQ(worker_pool.io_worker_client->restore_request_object_counts.size(), 1u);
@@ -639,7 +645,6 @@ TEST_F(LocalObjectManagerTest, TestRestoreBatch_SameFileCoalesces) {
   ASSERT_EQ(worker_pool.io_worker_client->restore_request_urls[0].size(),
             static_cast<size_t>(N));
 
-  worker_pool.RestoreWorkerPushed();
   worker_pool.io_worker_client->ReplyRestoreObjects(/*bytes_restored=*/N * 256);
   // Per-object callbacks each fire once.
   ASSERT_EQ(num_times_fired, N);
@@ -670,7 +675,10 @@ TEST_F(LocalObjectManagerTest, TestRestoreBatch_SplitByBaseUrl) {
         [&](const Status &s) { ASSERT_TRUE(s.ok()); num_times_fired++; });
   }
 
-  io_service_.run_one();
+  io_service_.run_one();   // flushes, queues two PopRestoreWorker callbacks
+  // Need to push twice — one for each file-group RPC.
+  worker_pool.RestoreWorkerPushed();
+  worker_pool.RestoreWorkerPushed();
 
   // Two RPCs — sizes (3, 2) in some order (unordered_map iteration).
   ASSERT_EQ(worker_pool.io_worker_client->restore_request_object_counts.size(), 2u);
@@ -679,10 +687,8 @@ TEST_F(LocalObjectManagerTest, TestRestoreBatch_SplitByBaseUrl) {
   ASSERT_EQ(sizes[0], 2);
   ASSERT_EQ(sizes[1], 3);
 
-  // Drain both RPCs.
-  worker_pool.RestoreWorkerPushed();
+  // Drain both RPC replies.
   worker_pool.io_worker_client->ReplyRestoreObjects(/*bytes_restored=*/3 * 128);
-  worker_pool.RestoreWorkerPushed();
   worker_pool.io_worker_client->ReplyRestoreObjects(/*bytes_restored=*/2 * 128);
   ASSERT_EQ(num_times_fired, static_cast<int>(ids_a.size() + ids_b.size()));
 }
