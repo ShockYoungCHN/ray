@@ -162,6 +162,15 @@ class MockIOWorkerClient : public rpc::FakeCoreWorkerClient {
   void RestoreSpilledObjects(
       const rpc::RestoreSpilledObjectsRequest &request,
       const rpc::ClientCallback<rpc::RestoreSpilledObjectsReply> &callback) override {
+    // Capture the multi-object payload shape so AsyncRestoreSpilledObjects()
+    // bulk-API tests can assert grouping behavior.
+    restore_request_object_counts.push_back(request.object_ids_to_restore_size());
+    std::vector<std::string> urls;
+    urls.reserve(request.spilled_objects_url_size());
+    for (const auto &u : request.spilled_objects_url()) {
+      urls.push_back(u);
+    }
+    restore_request_urls.push_back(std::move(urls));
     restore_callbacks.push_back(callback);
   }
 
@@ -221,6 +230,10 @@ class MockIOWorkerClient : public rpc::FakeCoreWorkerClient {
   }
 
   std::vector<int> spill_request_object_counts;
+  // One entry per RestoreSpilledObjects RPC the mock has seen. Used by
+  // AsyncRestoreSpilledObjects() bulk-API tests to assert by-file grouping behavior.
+  std::vector<int> restore_request_object_counts;
+  std::vector<std::vector<std::string>> restore_request_urls;
   std::list<rpc::ClientCallback<rpc::SpillObjectsReply>> callbacks;
   std::list<rpc::ClientCallback<rpc::DeleteSpilledObjectsReply>> delete_callbacks;
   std::list<rpc::ClientCallback<rpc::RestoreSpilledObjectsReply>> restore_callbacks;
@@ -550,6 +563,119 @@ TEST_F(LocalObjectManagerTest, TestRestoreSpilledObject) {
   worker_pool.io_worker_client->ReplyRestoreObjects(10);
   // The restore should've been invoked.
   ASSERT_EQ(num_times_fired, 1);
+}
+
+// AsyncRestoreSpilledObjects(vec) on N objects sharing the same spill file
+// should emit ONE RPC carrying all N — the IO worker then reads N offsets
+// out of a single fused file sequentially.
+TEST_F(LocalObjectManagerTest, TestAsyncRestoreSpilledObjects_SameFileCoalesces) {
+  const std::string base = "file_A";
+  constexpr int N = 5;
+  std::vector<LocalObjectManager::RestoreObjectRequest> reqs;
+  reqs.reserve(N);
+  int num_times_fired = 0;
+
+  EXPECT_CALL(worker_pool, PushRestoreWorker(_));
+
+  for (int i = 0; i < N; ++i) {
+    reqs.push_back(LocalObjectManager::RestoreObjectRequest{
+        ObjectID::FromRandom(),
+        /*object_size=*/256,
+        BuildURL(base, /*offset=*/i * 256),
+        [&](const Status &status) {
+          ASSERT_TRUE(status.ok());
+          num_times_fired++;
+        }});
+  }
+
+  manager.AsyncRestoreSpilledObjects(std::move(reqs));
+  worker_pool.RestoreWorkerPushed();
+
+  // One RPC, carrying all N objects (same base url).
+  ASSERT_EQ(worker_pool.io_worker_client->restore_request_object_counts.size(), 1u);
+  ASSERT_EQ(worker_pool.io_worker_client->restore_request_object_counts[0], N);
+  ASSERT_EQ(worker_pool.io_worker_client->restore_request_urls[0].size(),
+            static_cast<size_t>(N));
+
+  worker_pool.io_worker_client->ReplyRestoreObjects(/*bytes_restored=*/N * 256);
+  ASSERT_EQ(num_times_fired, N);
+}
+
+// Mixed base URLs inside a single AsyncRestoreSpilledObjects call: by-file
+// grouping splits them into one RPC per spill file.
+TEST_F(LocalObjectManagerTest, TestAsyncRestoreSpilledObjects_SplitByBaseUrl) {
+  std::vector<LocalObjectManager::RestoreObjectRequest> reqs;
+  int num_times_fired = 0;
+
+  EXPECT_CALL(worker_pool, PushRestoreWorker(_)).Times(2);
+
+  for (int i = 0; i < 3; ++i) {
+    reqs.push_back(LocalObjectManager::RestoreObjectRequest{
+        ObjectID::FromRandom(), 128, BuildURL("file_A", i * 128),
+        [&](const Status &s) { ASSERT_TRUE(s.ok()); num_times_fired++; }});
+  }
+  for (int i = 0; i < 2; ++i) {
+    reqs.push_back(LocalObjectManager::RestoreObjectRequest{
+        ObjectID::FromRandom(), 128, BuildURL("file_B", i * 128),
+        [&](const Status &s) { ASSERT_TRUE(s.ok()); num_times_fired++; }});
+  }
+
+  manager.AsyncRestoreSpilledObjects(std::move(reqs));
+  worker_pool.RestoreWorkerPushed();
+  worker_pool.RestoreWorkerPushed();
+
+  // Two RPCs — sizes (3, 2) in some order (flat_hash_map iteration).
+  ASSERT_EQ(worker_pool.io_worker_client->restore_request_object_counts.size(), 2u);
+  std::vector<int> sizes = worker_pool.io_worker_client->restore_request_object_counts;
+  std::sort(sizes.begin(), sizes.end());
+  ASSERT_EQ(sizes[0], 2);
+  ASSERT_EQ(sizes[1], 3);
+
+  worker_pool.io_worker_client->ReplyRestoreObjects(/*bytes_restored=*/3 * 128);
+  worker_pool.io_worker_client->ReplyRestoreObjects(/*bytes_restored=*/2 * 128);
+  ASSERT_EQ(num_times_fired, 5);
+}
+
+// Dedup: an in-flight single restore + a bulk batch containing the same
+// object → the duplicate is silently dropped from the batch.
+TEST_F(LocalObjectManagerTest, TestAsyncRestoreSpilledObjects_DedupAgainstInFlight) {
+  ObjectID dup_id = ObjectID::FromRandom();
+  const std::string url_dup = BuildURL("file_A", /*offset=*/0);
+  int single_fired = 0;
+  int batch_fired = 0;
+
+  EXPECT_CALL(worker_pool, PushRestoreWorker(_)).Times(2);
+
+  // Kick off a single restore — RPC pending in the mock.
+  manager.AsyncRestoreSpilledObject(
+      dup_id, /*object_size=*/256, url_dup,
+      [&](const Status &) { single_fired++; });
+  worker_pool.RestoreWorkerPushed();
+  ASSERT_EQ(worker_pool.io_worker_client->restore_request_object_counts.size(), 1u);
+  ASSERT_EQ(worker_pool.io_worker_client->restore_request_object_counts[0], 1);
+
+  // Bulk-submit a batch that includes the in-flight one + a new one in
+  // the same file. Only the new one should hit the wire.
+  std::vector<LocalObjectManager::RestoreObjectRequest> reqs;
+  reqs.push_back(LocalObjectManager::RestoreObjectRequest{
+      dup_id, 256, url_dup, [&](const Status &) { batch_fired++; }});
+  ObjectID new_id = ObjectID::FromRandom();
+  reqs.push_back(LocalObjectManager::RestoreObjectRequest{
+      new_id, 256, BuildURL("file_A", 256),
+      [&](const Status &) { batch_fired++; }});
+  manager.AsyncRestoreSpilledObjects(std::move(reqs));
+  worker_pool.RestoreWorkerPushed();
+
+  // Two RPCs total. Second one carries exactly one object (the new id);
+  // the duplicate was dedup'd out.
+  ASSERT_EQ(worker_pool.io_worker_client->restore_request_object_counts.size(), 2u);
+  ASSERT_EQ(worker_pool.io_worker_client->restore_request_object_counts[1], 1);
+
+  // Drain both replies.
+  worker_pool.io_worker_client->ReplyRestoreObjects(/*bytes_restored=*/256);
+  worker_pool.io_worker_client->ReplyRestoreObjects(/*bytes_restored=*/256);
+  ASSERT_EQ(single_fired, 1);
+  ASSERT_EQ(batch_fired, 1);  // dropped dup never fired; new_id fired
 }
 
 TEST_F(LocalObjectManagerTest, TestExplicitSpill) {

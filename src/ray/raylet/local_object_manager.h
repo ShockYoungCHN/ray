@@ -144,10 +144,28 @@ class LocalObjectManager : public LocalObjectManagerInterface {
   void SpillObjects(const std::vector<ObjectID> &objects_ids,
                     std::function<void(const ray::Status &)> callback) override;
 
+  /// A single restore request. Public so explicit bulk callers can
+  /// build a vector and submit via ``AsyncRestoreSpilledObjects`` in one shot.
+  struct RestoreObjectRequest {
+    ObjectID object_id;
+    int64_t object_size;
+    std::string object_url;
+    std::function<void(const ray::Status &)> callback;
+  };
+
   /// Restore a spilled object from external storage back into local memory.
   /// Note: This is no-op if the same restoration request is in flight or the requested
   /// object wasn't spilled yet. The caller should ensure to retry object restoration in
   /// this case.
+  ///
+  /// Single-object path: dispatches exactly one RestoreSpilledObjects RPC
+  /// for this object, with no queueing or coalescing. Matches mainline
+  /// Ray's per-call semantics.
+  ///
+  /// Callers that already have multiple objects to restore should use
+  /// ``AsyncRestoreSpilledObjects`` instead — it groups by spill-file base URL and
+  /// emits one multi-object RPC per file, so the IO worker amortizes
+  /// the file open + sequential read across the whole group.
   ///
   /// \param object_id The ID of the object to restore.
   /// \param object_url The URL where the object is spilled.
@@ -158,6 +176,22 @@ class LocalObjectManager : public LocalObjectManagerInterface {
       int64_t object_size,
       const std::string &object_url,
       std::function<void(const ray::Status &)> callback) override;
+
+  /// Restore many spilled objects in one shot. Requests are grouped by
+  /// their spill file's base URL (everything before ``?offset=``) and
+  /// each group becomes one ``RestoreSpilledObjects`` RPC, so the IO
+  /// worker reads multiple offsets from a single fused spill file
+  /// sequentially — amortizing file open, kernel readahead, and per-RPC
+  /// overhead across the whole group.
+  ///
+  /// Use this from places that already have a batch ready (e.g. a
+  /// PullManager tick draining its queue, or any caller that wants
+  /// file-group locality on cross-node FS-spill fetches).
+  ///
+  /// Dedup against in-flight restores is per-object — already-in-flight
+  /// entries are silently dropped from the batch, same semantics as the
+  /// single-object path.
+  void AsyncRestoreSpilledObjects(std::vector<RestoreObjectRequest> requests);
 
   /// Clear any freed objects. This will trigger the callback for freed
   /// objects.
@@ -211,6 +245,14 @@ class LocalObjectManager : public LocalObjectManagerInterface {
   std::string DebugString() const override;
 
  private:
+  /// Issue one ``RestoreSpilledObjects`` RPC carrying every entry in
+  /// ``group``. Used by both ``AsyncRestoreSpilledObject`` (size-1 group)
+  /// and ``AsyncRestoreSpilledObjects`` (size-N group after by-file partitioning).
+  /// Caller is responsible for ensuring all entries in ``group`` share
+  /// the same spill file base URL — the IO worker reads multiple
+  /// offsets into a single fused spill file.
+  void SendRestoreRPC(std::vector<RestoreObjectRequest> group);
+
   struct LocalObjectInfo {
     LocalObjectInfo(const rpc::Address &owner_address,
                     const ObjectID &generator_id,

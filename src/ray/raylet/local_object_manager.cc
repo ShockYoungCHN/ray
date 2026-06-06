@@ -461,6 +461,18 @@ std::string LocalObjectManager::GetLocalSpilledObjectURL(const ObjectID &object_
   }
 }
 
+namespace {
+
+// Strip the ``?offset=...&size=...`` query string from a spilled-object
+// URL so two URLs that point to different offsets in the **same** backing
+// file group together for batch IO.
+std::string ParseBaseSpillUrl(const std::string &url) {
+  const auto pos = url.find('?');
+  return (pos == std::string::npos) ? url : url.substr(0, pos);
+}
+
+}  // namespace
+
 void LocalObjectManager::AsyncRestoreSpilledObject(
     const ObjectID &object_id,
     int64_t object_size,
@@ -474,31 +486,79 @@ void LocalObjectManager::AsyncRestoreSpilledObject(
   RAY_CHECK(objects_pending_restore_.emplace(object_id).second)
       << "Object dedupe wasn't done properly. Please report if you see this issue.";
   num_bytes_pending_restore_ += object_size;
-  io_worker_pool_.PopRestoreWorker([this, object_id, object_size, object_url, callback](
-                                       std::shared_ptr<WorkerInterface> io_worker) {
-    auto start_time = absl::GetCurrentTimeNanos();
-    RAY_LOG(DEBUG) << "Sending restore spilled object request";
+
+  std::vector<RestoreObjectRequest> group;
+  group.reserve(1);
+  group.push_back(
+      RestoreObjectRequest{object_id, object_size, object_url, std::move(callback)});
+  SendRestoreRPC(std::move(group));
+}
+
+void LocalObjectManager::AsyncRestoreSpilledObjects(
+    std::vector<RestoreObjectRequest> requests) {
+  if (requests.empty()) {
+    return;
+  }
+
+  // Per-object dedup + accounting; drop in-flight entries from the batch
+  // entirely so they don't reach the RPC.
+  absl::flat_hash_map<std::string, std::vector<RestoreObjectRequest>> by_file;
+  by_file.reserve(requests.size());
+  for (auto &req : requests) {
+    if (!objects_pending_restore_.emplace(req.object_id).second) {
+      continue;  // already restoring — same dedup behavior as single path
+    }
+    num_bytes_pending_restore_ += req.object_size;
+    auto base = ParseBaseSpillUrl(req.object_url);
+    by_file[std::move(base)].push_back(std::move(req));
+  }
+
+  // One RPC per spill-file base URL so the IO worker can issue sequential
+  // offsets into a single fused file in one shot.
+  for (auto &kv : by_file) {
+    SendRestoreRPC(std::move(kv.second));
+  }
+}
+
+void LocalObjectManager::SendRestoreRPC(std::vector<RestoreObjectRequest> group) {
+  RAY_CHECK(!group.empty());
+  io_worker_pool_.PopRestoreWorker(
+      [this, group = std::move(group)](
+          std::shared_ptr<WorkerInterface> io_worker) mutable {
+    const auto start_time = absl::GetCurrentTimeNanos();
+    RAY_LOG(DEBUG) << "Sending restore spilled object request, n_objects="
+                   << group.size();
     rpc::RestoreSpilledObjectsRequest request;
-    request.add_spilled_objects_url(object_url);
-    request.add_object_ids_to_restore(object_id.Binary());
+    for (const auto &req : group) {
+      request.add_spilled_objects_url(req.object_url);
+      request.add_object_ids_to_restore(req.object_id.Binary());
+    }
     io_worker->rpc_client()->RestoreSpilledObjects(
         request,
-        [this, start_time, object_id, object_size, callback, io_worker](
-            const ray::Status &status, const rpc::RestoreSpilledObjectsReply &r) {
+        [this, start_time, group = std::move(group), io_worker](
+            const ray::Status &status,
+            const rpc::RestoreSpilledObjectsReply &reply) mutable {
           io_worker_pool_.PushRestoreWorker(io_worker);
-          num_bytes_pending_restore_ -= object_size;
-          objects_pending_restore_.erase(object_id);
+          // Per-object accounting. Each object in the batch shares the
+          // batch-level status — the IO worker either restored all of
+          // them or none.
+          for (auto &req : group) {
+            num_bytes_pending_restore_ -= req.object_size;
+            objects_pending_restore_.erase(req.object_id);
+          }
           if (!status.ok()) {
             RAY_LOG(ERROR) << "Failed to send restore spilled object request: "
                            << status.ToString();
           } else {
-            auto now = absl::GetCurrentTimeNanos();
-            auto restored_bytes = r.bytes_restored_total();
+            const auto now = absl::GetCurrentTimeNanos();
+            const auto restored_bytes = reply.bytes_restored_total();
             RAY_LOG(DEBUG) << "Restored " << restored_bytes << " in "
-                           << (now - start_time) / 1e6 << "ms. Object id:" << object_id;
+                           << (now - start_time) / 1e6 << "ms. n_objects="
+                           << group.size();
             restored_bytes_total_ += restored_bytes;
-            restored_objects_total_ += 1;
-            // Adjust throughput timing to account for concurrent restore operations.
+            restored_objects_total_ += group.size();
+            // Adjust throughput timing to account for concurrent restore
+            // operations — count once per RPC, not once per object.
             restore_time_total_s_ +=
                 (now - std::max(start_time, last_restore_finish_ns_)) / 1e9;
             if (now - last_restore_log_ns_ > 1e9) {
@@ -513,8 +573,12 @@ void LocalObjectManager::AsyncRestoreSpilledObject(
             }
             last_restore_finish_ns_ = now;
           }
-          if (callback) {
-            callback(status);
+          // Fire per-object callbacks last so any caller follow-up runs
+          // after our internal bookkeeping is settled.
+          for (auto &req : group) {
+            if (req.callback) {
+              req.callback(status);
+            }
           }
         });
   });
