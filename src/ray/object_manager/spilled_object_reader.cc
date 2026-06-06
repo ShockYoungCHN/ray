@@ -14,29 +14,44 @@
 
 #include "ray/object_manager/spilled_object_reader.h"
 
+#include <fcntl.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <cstring>
 #include <fstream>
 #include <regex>
 #include <string>
 #include <utility>
 
+#include "absl/strings/internal/resize_uninitialized.h"
 #include "ray/util/logging.h"
 
 namespace ray {
 namespace {
 const size_t UINT64_size = sizeof(uint64_t);
 
-bool ReadFileSection(const std::string &path,
-                     uint64_t offset,
-                     uint64_t size,
-                     std::string &output) {
-  std::ifstream file(path, std::ios::binary);
-  if (!file.seekg(static_cast<std::streamoff>(offset))) {
+// Append `size` bytes read at `offset` from `fd` to `output`. Uses pread() so
+// it is thread-safe without external synchronization (no shared file offset)
+// and amortizes the open()/seek() syscalls across multiple chunk reads of the
+// same spilled object — the previous implementation opened std::ifstream on
+// every call, paying ~3 syscalls per chunk.
+bool PreadAppend(int fd, uint64_t offset, uint64_t size, std::string &output) {
+  if (fd < 0) {
     return false;
   }
   const size_t old_size = output.size();
-  output.resize(old_size + size);
-  file.read(&output[old_size], static_cast<std::streamsize>(size));
-  return static_cast<uint64_t>(file.gcount()) == size;
+  // Grows size to old_size+size reusing reserved capacity; does NOT init the
+  // new bytes (unlike std::string::resize, which value-inits to '\0').
+  // todo: use std::string::resize_uninitialized when we can require C++23
+  absl::strings_internal::STLStringResizeUninitialized(&output, old_size + size);
+  ssize_t n = ::pread(fd, &output[old_size], size, static_cast<off_t>(offset));
+  if (n < 0 || static_cast<uint64_t>(n) != size) {
+    output.resize(old_size);  // roll back: leave `output` exactly as we found it
+    return false;
+  }
+  return true;
 }
 }  // namespace
 
@@ -70,6 +85,29 @@ SpilledObjectReader::CreateSpilledObjectReader(const std::string &object_url) {
     return std::optional<SpilledObjectReader>();
   }
 
+  // Open a persistent fd for the data-read path. Header parsing above already
+  // succeeded via std::ifstream (one-shot, perf-irrelevant); from here on the
+  // chunked reads share this single fd via pread().
+  int fd = ::open(file_path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    RAY_LOG(WARNING) << "Failed to open spilled object file " << file_path
+                     << " for read: " << std::strerror(errno);
+    return std::optional<SpilledObjectReader>();
+  }
+#if defined(__linux__)
+  // Hint the kernel: reads will be sequential within this object's window;
+  // start prefetching the object payload immediately. WILLNEED is advisory —
+  // safe to ignore failure. Range [object_offset, object_offset+object_size).
+  ::posix_fadvise(fd,
+                  static_cast<off_t>(object_offset),
+                  static_cast<off_t>(object_size),
+                  POSIX_FADV_SEQUENTIAL);
+  ::posix_fadvise(fd,
+                  static_cast<off_t>(object_offset),
+                  static_cast<off_t>(object_size),
+                  POSIX_FADV_WILLNEED);
+#endif
+
   return std::optional<SpilledObjectReader>(
       SpilledObjectReader(std::move(file_path),
                           object_size,
@@ -77,7 +115,8 @@ SpilledObjectReader::CreateSpilledObjectReader(const std::string &object_url) {
                           data_size,
                           metadata_offset,
                           metadata_size,
-                          std::move(owner_address)));
+                          std::move(owner_address),
+                          fd));
 }
 
 uint64_t SpilledObjectReader::GetDataSize() const { return data_size_; }
@@ -94,14 +133,36 @@ SpilledObjectReader::SpilledObjectReader(std::string file_path,
                                          uint64_t data_size,
                                          uint64_t metadata_offset,
                                          uint64_t metadata_size,
-                                         rpc::Address owner_address)
+                                         rpc::Address owner_address,
+                                         int fd)
     : file_path_(std::move(file_path)),
       object_size_(object_size),
       data_offset_(data_offset),
       data_size_(data_size),
       metadata_offset_(metadata_offset),
       metadata_size_(metadata_size),
-      owner_address_(std::move(owner_address)) {}
+      owner_address_(std::move(owner_address)),
+      fd_(fd) {}
+
+SpilledObjectReader::~SpilledObjectReader() {
+  if (fd_ >= 0) {
+    ::close(fd_);
+  }
+}
+
+SpilledObjectReader::SpilledObjectReader(SpilledObjectReader &&other) noexcept
+    // const members can't be moved-from; copy is equivalent to the implicit
+    // move ctor we used to rely on.
+    : file_path_(other.file_path_),
+      object_size_(other.object_size_),
+      data_offset_(other.data_offset_),
+      data_size_(other.data_size_),
+      metadata_offset_(other.metadata_offset_),
+      metadata_size_(other.metadata_size_),
+      owner_address_(other.owner_address_),
+      fd_(other.fd_) {
+  other.fd_ = -1;  // transfer fd ownership; source becomes a no-op on destruction
+}
 
 /* static */ bool SpilledObjectReader::ParseObjectURL(const std::string &object_url,
                                                       std::string &file_path,
@@ -185,12 +246,12 @@ uint64_t SpilledObjectReader::ToUINT64(const std::string &s) {
 bool SpilledObjectReader::ReadFromDataSection(uint64_t offset,
                                               uint64_t size,
                                               std::string &output) const {
-  return ReadFileSection(file_path_, data_offset_ + offset, size, output);
+  return PreadAppend(fd_, data_offset_ + offset, size, output);
 }
 
 bool SpilledObjectReader::ReadFromMetadataSection(uint64_t offset,
                                                   uint64_t size,
                                                   std::string &output) const {
-  return ReadFileSection(file_path_, metadata_offset_ + offset, size, output);
+  return PreadAppend(fd_, metadata_offset_ + offset, size, output);
 }
 }  // namespace ray
