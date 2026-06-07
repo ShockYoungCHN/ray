@@ -28,6 +28,7 @@ from ray.data._internal.execution.operators.shuffle_operators.shuffle_map_operat
     extract_partition_id,
 )
 from ray.data._internal.execution.operators.sub_progress import SubProgressBarMixin
+from ray.data._internal.stats import OpRuntimeMetrics
 from ray.data.block import BlockStats, TaskExecWorkerStats, to_stats
 from ray.data.context import DataContext
 
@@ -174,6 +175,11 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
 
         # -- Sub-progress bars -----------------------------------------------
         self._reduce_bar: Optional["BaseProgressBar"] = None
+        # Private metrics instance: keeps reducer task state out of
+        # self._metrics (which the framework's ResourceManager reads).
+        # Surfacing reducer state to ResourceManager triggers spurious
+        # backpressure under shuffle-heavy workloads.
+        self._reduce_metrics = OpRuntimeMetrics(self)
 
     # -----------------------------------------------------------------------
     # Input handling: one bundle → one reducer task
@@ -192,6 +198,7 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
         """
         if not self._multi_input:
             assert input_index == 0
+        self._reduce_metrics.on_input_received(input_bundle)
 
         if not input_bundle.block_refs:
             # Defensive: ShuffleMapOp skips empty partitions, but a future
@@ -370,7 +377,7 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
         # Per-input on_task_submitted call (executor expects one per input
         # bundle that contributed to this task).
         for bundle in done_bundles:
-            self._metrics.on_task_submitted(
+            self._reduce_metrics.on_task_submitted(
                 partition_id, bundle, task_id=data_task.get_task_id()
             )
 
@@ -383,7 +390,8 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
 
     def _get_next_inner(self) -> RefBundle:
         bundle: RefBundle = self._output_queue.popleft()
-        self._metrics.on_output_dequeued(bundle)
+        self._reduce_metrics.on_output_dequeued(bundle)
+        self._reduce_metrics.on_output_taken(bundle)
         self._output_blocks_stats.extend(to_stats(bundle.metadata))
         return bundle
 
@@ -400,12 +408,14 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
 
     def _handle_reduce_output_ready(self, partition_id: int, bundle: RefBundle) -> None:
         self._output_queue.append(bundle)
-        self._metrics.on_output_queued(bundle)
-        self._metrics.on_task_output_generated(task_index=partition_id, output=bundle)
+        self._reduce_metrics.on_output_queued(bundle)
+        self._reduce_metrics.on_task_output_generated(
+            task_index=partition_id, output=bundle
+        )
         _, num_outputs, num_rows = estimate_total_num_of_blocks(
             self._num_reduce_tasks_submitted,
             self.upstream_op_num_outputs(),
-            self._metrics,
+            self._reduce_metrics,
             total_num_tasks=self._num_partitions,
         )
         self._estimated_num_output_bundles = num_outputs
@@ -430,7 +440,7 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
         if partition_id not in self._shuffle_reduce_tasks:
             return
         self._shuffle_reduce_tasks.pop(partition_id)
-        self._metrics.on_task_finished(
+        self._reduce_metrics.on_task_finished(
             task_index=partition_id,
             exception=exc,
             task_exec_stats=task_exec_stats,
@@ -493,6 +503,15 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
 
     def get_stats(self) -> Dict[str, List[BlockStats]]:
         return {self._name: self._output_blocks_stats}
+
+    def _extra_metrics(self) -> Dict[str, Any]:
+        # See ShuffleMapOp._extra_metrics for the full explanation -- in
+        # short, reading from self._metrics here causes infinite nesting
+        # because PhysicalOperator.metrics writes our result back into
+        # self._metrics._extra_metrics every access, and as_dict() then
+        # re-reads it.  _reduce_metrics is private and its _extra_metrics
+        # stays empty, so the snapshot is finite.
+        return {self._name: self._reduce_metrics.as_dict()}
 
     # -----------------------------------------------------------------------
     # Resource accounting

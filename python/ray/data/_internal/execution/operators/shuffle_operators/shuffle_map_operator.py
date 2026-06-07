@@ -30,6 +30,7 @@ from ray.data._internal.execution.operators.shuffle_operators._shuffle_tasks imp
     _shuffle_map_task,
 )
 from ray.data._internal.execution.operators.sub_progress import SubProgressBarMixin
+from ray.data._internal.stats import OpRuntimeMetrics
 from ray.data.block import BlockMetadata, BlockStats
 from ray.data.context import DataContext
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
@@ -232,6 +233,11 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
 
         # -- Sub-progress bars -----------------------------------------------
         self._map_bar: Optional["BaseProgressBar"] = None
+        # Private metrics instance: tracks per-task progress without exposing
+        # ShuffleMapOp's intermediate state to ResourceManager (which reads
+        # self._metrics). Keeping this private avoids the framework applying
+        # backpressure to downstream ops based on transient map state.
+        self._map_metrics = OpRuntimeMetrics(self)
 
     # -----------------------------------------------------------------------
     # InternalQueueOperatorMixin
@@ -262,6 +268,7 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
 
     def _add_input_inner(self, input_bundle: RefBundle, input_index: int) -> None:
         assert input_index == 0
+        self._map_metrics.on_input_received(input_bundle)
 
         if self._input_schema is None and input_bundle.schema is not None:
             self._input_schema = input_bundle.schema
@@ -380,7 +387,7 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
             for bundle in input_bundles
             for ref, meta in zip(bundle.block_refs, bundle.metadata)
         ]
-        self._metrics.on_task_submitted(
+        self._map_metrics.on_task_submitted(
             cur_task_idx,
             RefBundle(all_blocks_meta, schema=None, owns_blocks=False),
             task_id=task.get_task_id(),
@@ -390,7 +397,7 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
             _, _, num_rows = estimate_total_num_of_blocks(
                 cur_task_idx + 1,
                 self.upstream_op_num_outputs(),
-                self._metrics,
+                self._map_metrics,
                 total_num_tasks=None,
             )
             self._map_bar.update(total=num_rows)
@@ -436,7 +443,7 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
         self._total_input_bytes += input_meta.size_bytes or 0
         self._map_blocks_stats.append(input_meta.to_stats())
 
-        self._metrics.on_task_finished(
+        self._map_metrics.on_task_finished(
             task_idx,
             None,
             task_exec_stats=None,
@@ -495,7 +502,7 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
                 owns_blocks=merged.owns_blocks,
             )
             self._output_queue.add(stamped)
-            self._metrics.on_output_queued(stamped)
+            self._map_metrics.on_output_queued(stamped)
 
     # -----------------------------------------------------------------------
     # Output handling
@@ -506,7 +513,8 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
 
     def _get_next_inner(self) -> RefBundle:
         bundle: RefBundle = self._output_queue.get_next()
-        self._metrics.on_output_dequeued(bundle)
+        self._map_metrics.on_output_dequeued(bundle)
+        self._map_metrics.on_output_taken(bundle)
         return bundle
 
     # -----------------------------------------------------------------------
@@ -565,6 +573,20 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
     def get_stats(self) -> Dict[str, List[BlockStats]]:
         return {self._name: self._map_blocks_stats}
 
+    def _extra_metrics(self) -> Dict[str, Any]:
+        # NOTE: read from the private _map_metrics, NOT self._metrics.
+        # PhysicalOperator.metrics writes the result of this function
+        # back into self._metrics._extra_metrics every time `op.metrics`
+        # is accessed.  If we read self._metrics here, as_dict()'s
+        # `result.extend(self._extra_metrics.items())` line picks up the
+        # previous-call snapshot, and the dict nests one level deeper
+        # each scheduler tick -- {name: {..., name: {..., name: {...}}}}
+        # -- until repr / pickle hits Python's recursion limit.
+        # _map_metrics is private and its `_extra_metrics` stays at the
+        # initial empty `{}`, so reading it produces a stable finite
+        # dict each call.
+        return {self._name: self._map_metrics.as_dict()}
+
     # -----------------------------------------------------------------------
     # Resource accounting
     # -----------------------------------------------------------------------
@@ -586,7 +608,7 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
         # to Ray Core (`estimated_bytes * 2`).  We don't know the next
         # input's size up front, so use the running average across
         # already-submitted tasks; 0 until the first task is submitted.
-        avg_input = self._metrics.average_bytes_inputs_per_task
+        avg_input = self._map_metrics.average_bytes_inputs_per_task
         memory = int(avg_input * 2) if avg_input else 0
         return ExecutionResources(
             cpu=self._shuffle_map_task_num_cpus,
