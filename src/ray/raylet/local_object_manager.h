@@ -221,6 +221,12 @@ class LocalObjectManager : public LocalObjectManagerInterface {
   void LogSpillManagerSummary() const;
 
  private:
+#if 0  // === BEGIN disabled: post-based batched restore =====================
+  // Kept verbatim for reference. To re-enable, flip both this and the
+  // matching ``#if 0`` block in local_object_manager.cc to ``#if 1`` and
+  // remove the mainline-style AsyncRestoreSpilledObject implementation
+  // currently active in the .cc.
+
   /// A single deferred restore request held in the per-LOM batch queue
   /// between the moment ``AsyncRestoreSpilledObject`` is called and the
   /// moment ``FlushPendingRestoreBatch`` actually dispatches RPCs.
@@ -233,17 +239,14 @@ class LocalObjectManager : public LocalObjectManagerInterface {
 
   /// Flush the per-LOM pending restore batch by grouping requests by
   /// their spill file's base URL and dispatching one ``RestoreSpilledObjects``
-  /// RPC per group.  Posted onto ``io_service_`` from
-  /// ``AsyncRestoreSpilledObject`` so multiple restore requests issued
-  /// inside the same event-loop callback batch get coalesced into a
-  /// single RPC per spill file.  Zero-timer; relies on Asio's "execute
-  /// posted tasks after current callback batch finishes" semantics.
+  /// RPC per group.
   void FlushPendingRestoreBatch();
 
   /// Issue one ``RestoreSpilledObjects`` RPC carrying every entry in
-  /// ``group``.  ``group`` is moved into the RPC continuation so the
-  /// per-object callbacks remain alive until the IO worker replies.
+  /// ``group``.
   void SendBatchRestoreRPC(std::vector<PendingRestoreRequest> group);
+
+#endif  // === END disabled: post-based batched restore =====================
 
  public:
 
@@ -385,18 +388,15 @@ class LocalObjectManager : public LocalObjectManagerInterface {
   /// progress.
   absl::flat_hash_set<ObjectID> objects_pending_restore_;
 
+#if 0  // === BEGIN disabled: post-based batched restore (state fields) =====
   /// Requests queued in the current event-loop iteration that are waiting
   /// for ``FlushPendingRestoreBatch`` to run on the io_service post queue.
-  /// Reset to empty after each flush; size is bounded by how many
-  /// AsyncRestoreSpilledObject calls happen back-to-back inside a single
-  /// epoll wakeup (typically a Subscribe-reply burst or a Tick).
   std::vector<PendingRestoreRequest> pending_restore_batch_;
 
   /// True when a ``FlushPendingRestoreBatch`` task is already sitting on
-  /// the io_service post queue waiting to run.  Prevents re-scheduling the
-  /// flush task for every push when many requests arrive in one tick.
-  /// Reset back to false at the start of FlushPendingRestoreBatch.
+  /// the io_service post queue waiting to run.
   bool batch_flush_scheduled_ = false;
+#endif  // === END disabled: post-based batched restore (state fields) ======
 
   /// The time that we last sent a FreeObjects request to other nodes for
   /// objects that have gone out of scope in the application.

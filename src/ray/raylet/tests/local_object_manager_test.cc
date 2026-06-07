@@ -558,11 +558,10 @@ TEST_F(LocalObjectManagerTest, TestRestoreSpilledObject) {
         });
   }
   ASSERT_EQ(num_times_fired, 0);
-  // Drain the post-based batch flush task that AsyncRestoreSpilledObject
-  // queues on io_service_.  In production raylet the io_service is being
-  // run() on the main thread; in unit tests we must pump it manually so
-  // FlushPendingRestoreBatch fires and PopRestoreWorker is invoked.
-  io_service_.run_one();
+  // Mainline-style direct dispatch is active: AsyncRestoreSpilledObject
+  // calls PopRestoreWorker synchronously, no io_service pump needed.
+  // (When the post-based batched restore path is re-enabled, this is the
+  // line that needs ``io_service_.run_one()`` back in.)
 
   // When restore workers are pushed, the request should be dedupped.
   for (int i = 0; i < 10; i++) {
@@ -573,6 +572,11 @@ TEST_F(LocalObjectManagerTest, TestRestoreSpilledObject) {
   // The restore should've been invoked.
   ASSERT_EQ(num_times_fired, 1);
 }
+
+#if 0  // === BEGIN disabled: batched restore tests =========================
+// These tests exercise the post-based batched-restore path which is
+// currently disabled (see ``#if 0`` block in local_object_manager.cc).
+// Re-enable in lockstep with that block.
 
 // AsyncRestoreSpilledObject defers the actual RPC dispatch onto
 // io_service_ via post().  A single call with nothing else in the queue
@@ -692,6 +696,8 @@ TEST_F(LocalObjectManagerTest, TestRestoreBatch_SplitByBaseUrl) {
   worker_pool.io_worker_client->ReplyRestoreObjects(/*bytes_restored=*/2 * 128);
   ASSERT_EQ(num_times_fired, static_cast<int>(ids_a.size() + ids_b.size()));
 }
+
+#endif  // === END disabled: batched restore tests ==========================
 
 TEST_F(LocalObjectManagerTest, TestExplicitSpill) {
   std::vector<ObjectID> object_ids;

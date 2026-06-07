@@ -571,6 +571,76 @@ std::string LocalObjectManager::GetLocalSpilledObjectURL(const ObjectID &object_
   }
 }
 
+// === Restored mainline-style direct dispatch ================================
+// Each AsyncRestoreSpilledObject call dispatches one RestoreSpilledObjects
+// RPC carrying exactly one object — no queueing, no by-file grouping. The
+// previously enabled post-based batching path is kept just below inside an
+// ``#if 0`` block for reference / quick re-enable.
+void LocalObjectManager::AsyncRestoreSpilledObject(
+    const ObjectID &object_id,
+    int64_t object_size,
+    const std::string &object_url,
+    std::function<void(const ray::Status &)> callback) {
+  if (objects_pending_restore_.count(object_id) > 0) {
+    // If the same object is restoring, we dedup here.
+    return;
+  }
+
+  RAY_CHECK(objects_pending_restore_.emplace(object_id).second)
+      << "Object dedupe wasn't done properly. Please report if you see this issue.";
+  num_bytes_pending_restore_ += object_size;
+  io_worker_pool_.PopRestoreWorker([this, object_id, object_size, object_url, callback](
+                                       std::shared_ptr<WorkerInterface> io_worker) {
+    auto start_time = absl::GetCurrentTimeNanos();
+    RAY_LOG(DEBUG) << "Sending restore spilled object request";
+    rpc::RestoreSpilledObjectsRequest request;
+    request.add_spilled_objects_url(object_url);
+    request.add_object_ids_to_restore(object_id.Binary());
+    io_worker->rpc_client()->RestoreSpilledObjects(
+        request,
+        [this, start_time, object_id, object_size, callback, io_worker](
+            const ray::Status &status, const rpc::RestoreSpilledObjectsReply &r) {
+          io_worker_pool_.PushRestoreWorker(io_worker);
+          num_bytes_pending_restore_ -= object_size;
+          objects_pending_restore_.erase(object_id);
+          if (!status.ok()) {
+            RAY_LOG(ERROR) << "Failed to send restore spilled object request: "
+                           << status.ToString();
+          } else {
+            auto now = absl::GetCurrentTimeNanos();
+            auto restored_bytes = r.bytes_restored_total();
+            RAY_LOG(DEBUG) << "Restored " << restored_bytes << " in "
+                           << (now - start_time) / 1e6 << "ms. Object id:" << object_id;
+            restored_bytes_total_ += restored_bytes;
+            restored_objects_total_ += 1;
+            // Adjust throughput timing to account for concurrent restore operations.
+            restore_time_total_s_ +=
+                (now - std::max(start_time, last_restore_finish_ns_)) / 1e9;
+            if (now - last_restore_log_ns_ > 1e9) {
+              last_restore_log_ns_ = now;
+              RAY_LOG(INFO) << "Restored "
+                            << static_cast<int>(restored_bytes_total_ / (1024 * 1024))
+                            << " MiB, " << restored_objects_total_
+                            << " objects, read throughput "
+                            << static_cast<int>(restored_bytes_total_ / (1024 * 1024) /
+                                                restore_time_total_s_)
+                            << " MiB/s";
+            }
+            last_restore_finish_ns_ = now;
+          }
+          if (callback) {
+            callback(status);
+          }
+        });
+  });
+}
+
+#if 0  // === BEGIN disabled: post-based batched restore =====================
+// Kept verbatim for reference. To re-enable, flip ``#if 0`` -> ``#if 1`` and
+// remove the mainline-style implementation above. The corresponding queue
+// fields + helper declarations in local_object_manager.h are also gated by
+// the same #if 0 block.
+
 namespace {
 
 /// Strip ``?offset=...&size=...`` query-string from a spilled-object URL
@@ -601,7 +671,7 @@ void LocalObjectManager::AsyncRestoreSpilledObject(
   // end of the current event-loop iteration.  Multiple AsyncRestoreSpilled
   // Object calls inside the same callback batch (e.g. a Subscribe-reply
   // burst, a Tick iteration, or a Pull bundle activation) all coalesce
-  // into one flush — see ``FlushPendingRestoreBatch`` for the grouping.
+  // into one flush -- see FlushPendingRestoreBatch for the grouping.
   pending_restore_batch_.push_back(PendingRestoreRequest{
       object_id, object_size, object_url, std::move(callback)});
   if (!batch_flush_scheduled_) {
@@ -652,7 +722,7 @@ void LocalObjectManager::SendBatchRestoreRPC(
             const rpc::RestoreSpilledObjectsReply &reply) mutable {
           io_worker_pool_.PushRestoreWorker(io_worker);
           // Update per-object accounting + fire user callbacks.  Each
-          // object in the batch shares the batch-level status — IO
+          // object in the batch shares the batch-level status -- IO
           // worker either restored all of them or none.
           for (auto &req : group) {
             num_bytes_pending_restore_ -= req.object_size;
@@ -696,6 +766,8 @@ void LocalObjectManager::SendBatchRestoreRPC(
         });
   });
 }
+
+#endif  // === END disabled: post-based batched restore =====================
 
 void LocalObjectManager::ProcessSpilledObjectsDeleteQueue(uint32_t max_batch_size) {
   if (!spilled_object_pending_delete_.empty()) {
