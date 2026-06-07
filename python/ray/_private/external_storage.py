@@ -595,14 +595,113 @@ class SlowFileStorage(FileSystemStorage):
         return super().spill_objects(object_refs, owner_addresses)
 
 
+class PyArrowFsStorage(ExternalStorage):
+    """Cython-accelerated FileSystemStorage replacement.
+
+    Delegates the spill / restore / delete hot loops to
+    ``external_storage_fast.PyArrowFsStorage`` (compiled .pyx). Falls
+    back to ``FileSystemStorage`` automatically if the .pyx extension
+    is not importable in this process — keeps mixed-version clusters
+    safe.
+
+    On-disk format and URL scheme are byte-for-byte identical to
+    ``FileSystemStorage`` so a cluster can roll forward / back between
+    the two implementations without rewriting spill files.
+
+    Opt-in via either the ``RAY_EXTERNAL_STORAGE_FAST=1`` env var or
+    ``object_spilling_config={"type": "filesystem_fast", ...}``.
+    """
+
+    def __init__(
+        self,
+        node_id: str,
+        directory_path,
+        buffer_size: Optional[int] = None,
+    ):
+        super().__init__()
+        try:
+            from ray._private import external_storage_fast
+        except ImportError as e:
+            raise ImportError(
+                "ray._private.external_storage_fast is not built; either "
+                "run python/ray/_private/build_external_storage_fast.py "
+                "build_ext --inplace, or set RAY_EXTERNAL_STORAGE_FAST=0 "
+                "to fall back to FileSystemStorage."
+            ) from e
+
+        # The Cython class needs access to ``self.core_worker`` lazily
+        # (the worker may not be connected at __init__ time on the
+        # io_worker), so we hand it a thunk instead of the attribute
+        # itself.
+        self._impl = external_storage_fast.PyArrowFsStorage(
+            node_id=node_id,
+            directory_path=directory_path,
+            core_worker_provider=lambda: self.core_worker,
+        )
+
+    def spill_objects(
+        self, object_refs, owner_addresses
+    ) -> List[str]:
+        return self._impl.spill_objects(list(object_refs), list(owner_addresses))
+
+    def restore_spilled_objects(
+        self,
+        object_refs: List[ObjectRef],
+        url_with_offset_list: List[str],
+    ) -> int:
+        return self._impl.restore_spilled_objects(
+            list(object_refs), list(url_with_offset_list)
+        )
+
+    def delete_spilled_objects(self, urls: List[str]) -> None:
+        self._impl.delete_spilled_objects(list(urls))
+
+
+def _try_pyarrow_fs_storage(node_id: str, params: dict):
+    """Return a ``PyArrowFsStorage`` if the .pyx extension is built and
+    importable; otherwise log + return ``None`` so the caller can fall
+    back to the legacy ``FileSystemStorage``."""
+    try:
+        return PyArrowFsStorage(node_id, **params)
+    except ImportError as e:
+        logger.warning(
+            "RAY_EXTERNAL_STORAGE_FAST requested but external_storage_fast "
+            "is not built (%s); falling back to FileSystemStorage. "
+            "Run python/ray/_private/build_external_storage_fast.py "
+            "build_ext --inplace to enable.",
+            e,
+        )
+        return None
+
+
 def setup_external_storage(config, node_id, session_name):
     """Setup the external storage according to the config."""
     assert node_id is not None, "node_id should be provided."
     global _external_storage
+    # Env-var opt-in is a low-friction toggle: any deployment that wants
+    # the Cython fast path can set RAY_EXTERNAL_STORAGE_FAST=1 in
+    # raylet's environment without changing the spill config block.
+    _force_fast = os.environ.get("RAY_EXTERNAL_STORAGE_FAST", "0") == "1"
     if config:
         storage_type = config["type"]
         if storage_type == "filesystem":
-            _external_storage = FileSystemStorage(node_id, **config["params"])
+            # If env-var forces fast path AND the .pyx is buildable, use
+            # it; otherwise the legacy path is unchanged.
+            if _force_fast:
+                fast = _try_pyarrow_fs_storage(node_id, config["params"])
+                if fast is not None:
+                    _external_storage = fast
+                else:
+                    _external_storage = FileSystemStorage(
+                        node_id, **config["params"]
+                    )
+            else:
+                _external_storage = FileSystemStorage(node_id, **config["params"])
+        elif storage_type == "filesystem_fast":
+            # Explicit config-level opt-in (no env var needed). If the
+            # .pyx is not built this is a hard error — user asked for
+            # it, so don't silently swap to legacy.
+            _external_storage = PyArrowFsStorage(node_id, **config["params"])
         elif storage_type == "smart_open":
             _external_storage = ExternalStorageSmartOpenImpl(
                 node_id, **config["params"]
