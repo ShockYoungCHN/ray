@@ -3,7 +3,7 @@ import functools
 import logging
 import typing
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import ray
 from ray import ObjectRef
@@ -25,11 +25,11 @@ from ray.data._internal.execution.operators.base_physical_operator import (
     InternalQueueOperatorMixin,
 )
 from ray.data._internal.execution.operators.shuffle_operators._shuffle_tasks import (
-    MapBlockTransformer,
     PartitionFn,
     _shuffle_map_task,
 )
 from ray.data._internal.execution.operators.sub_progress import SubProgressBarMixin
+from ray.data._internal.stats import OpRuntimeMetrics
 from ray.data.block import BlockMetadata, BlockStats
 from ray.data.context import DataContext
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
@@ -40,53 +40,34 @@ if typing.TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# Sentinels carried on a block's BlockMetadata.input_files so the downstream
-# ShuffleReduceOp can recover (a) which partition this bundle represents and
-# (b) for joins / multi-input reduces, which upstream input sequence produced
-# it.  Both share a single list entry: "__partition__<pid>__seq__<seq>".
+# Sentinel prefix used to carry partition_id on a block's
+# BlockMetadata.input_files.  The downstream ShuffleReduceOp parses this
+# out of each input bundle to recover which partition it represents.
 _PARTITION_ID_SENTINEL = "__partition__"
-_INPUT_SEQ_SENTINEL = "__seq__"
 
 
-def make_partition_sentinel(partition_id: int, input_seq_index: int = 0) -> List[str]:
-    """Build the `BlockMetadata.input_files` list used to mark a block with
-    its (partition_id, input_seq_index).
-
-    For single-input shuffles (e.g. HashAggregate), input_seq_index is 0 and
-    the sentinel is backward-compatible with the previous one-field form
-    because parsing only inspects the prefix-anchored substrings."""
-    return [f"{_PARTITION_ID_SENTINEL}{partition_id}{_INPUT_SEQ_SENTINEL}{input_seq_index}"]
+def make_partition_sentinel(partition_id: int) -> List[str]:
+    """Build the `BlockMetadata.input_files` list used to mark a block
+    with its partition_id.  Kept as a module-level helper so the reduce op
+    can use the same encoding without depending on map-op internals."""
+    return [f"{_PARTITION_ID_SENTINEL}{partition_id}"]
 
 
-def extract_partition_and_seq(bundle: RefBundle) -> Tuple[int, int]:
-    """Recover (partition_id, input_seq_index) stamped onto an upstream bundle.
-
-    Falls back to input_seq_index=0 when the sentinel lacks the `__seq__`
-    suffix (older single-input encoding) so the multi-input path stays
-    backward-compatible during rollout."""
+def extract_partition_id(bundle: RefBundle) -> int:
+    """Recover the partition_id stamped onto an upstream bundle by
+    `make_partition_sentinel`.  Raises if no sentinel is found."""
     for _, meta in bundle.blocks:
         files = meta.input_files
         if not files:
             continue
         for f in files:
-            if not f.startswith(_PARTITION_ID_SENTINEL):
-                continue
-            rest = f[len(_PARTITION_ID_SENTINEL) :]
-            if _INPUT_SEQ_SENTINEL in rest:
-                pid_str, seq_str = rest.split(_INPUT_SEQ_SENTINEL, 1)
-                return int(pid_str), int(seq_str)
-            return int(rest), 0
+            if f.startswith(_PARTITION_ID_SENTINEL):
+                return int(f[len(_PARTITION_ID_SENTINEL) :])
     raise ValueError(
         "ShuffleMapOp bundle is missing a partition_id sentinel in "
         "BlockMetadata.input_files; this should never happen in the planner-"
         "wired ShuffleMapOp → ShuffleReduceOp pipeline."
     )
-
-
-def extract_partition_id(bundle: RefBundle) -> int:
-    """Recover only the partition_id (compat shim for single-input reducers)."""
-    pid, _ = extract_partition_and_seq(bundle)
-    return pid
 
 
 class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarMixin):
@@ -150,9 +131,6 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
         pre_map_merge_threshold: int = _DEFAULT_PRE_MAP_MERGE_THRESHOLD,
         map_runtime_env: Optional[Dict[str, Any]] = None,
         map_cpus: float = _DEFAULT_SHUFFLE_MAP_TASK_NUM_CPUS,
-        input_block_transformer: Optional["MapBlockTransformer"] = None,
-        per_partition_post_transformer: Optional["MapBlockTransformer"] = None,
-        input_seq_index: int = 0,
         name: str = "ShuffleMap",
     ):
         super().__init__(
@@ -163,22 +141,6 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
 
         self._num_partitions: int = num_partitions
         self._partition_fn: PartitionFn = partition_fn
-        # Optional per-block transform applied inside the map task before
-        # partitioning (e.g. partial pre-aggregation for HashAggregate).
-        self._input_block_transformer: Optional["MapBlockTransformer"] = (
-            input_block_transformer
-        )
-        # Optional per-task per-partition transform applied after concat,
-        # before IPC encoding.  SEMI/ANTI joins set this to the same
-        # dedup function as input_block_transformer to also collapse
-        # cross-block duplication within a single map task.
-        self._per_partition_post_transformer: Optional["MapBlockTransformer"] = (
-            per_partition_post_transformer
-        )
-        # Marks which upstream sequence this mapper represents in a multi-input
-        # reduce (e.g. join left=0, right=1).  Stamped onto every output bundle
-        # so a multi-input ShuffleReduceOp can route shards by side.
-        self._input_seq_index: int = input_seq_index
 
         # -- Map task config -------------------------------------------------
         self._shuffle_map_task_num_cpus: float = map_cpus
@@ -217,14 +179,6 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
         self._output_queue: FIFOBundleQueue = FIFOBundleQueue()
         self._partition_bundles_emitted: bool = False
 
-        # -- Cached input schema --------------------------------------------
-        # Captured from the first non-None upstream RefBundle.schema we see
-        # in _add_input_inner.  Stamped onto every emitted partition bundle
-        # so a downstream multi-input ShuffleReduceOp can recover the
-        # schema for sides that produced zero rows for a given partition
-        # (necessary for joins where a partition may be empty on one side).
-        self._input_schema = None
-
         # -- Stats -----------------------------------------------------------
         self._total_input_rows: int = 0
         self._total_input_bytes: int = 0
@@ -232,6 +186,7 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
 
         # -- Sub-progress bars -----------------------------------------------
         self._map_bar: Optional["BaseProgressBar"] = None
+        self._map_metrics = OpRuntimeMetrics(self)
 
     # -----------------------------------------------------------------------
     # InternalQueueOperatorMixin
@@ -262,9 +217,7 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
 
     def _add_input_inner(self, input_bundle: RefBundle, input_index: int) -> None:
         assert input_index == 0
-
-        if self._input_schema is None and input_bundle.schema is not None:
-            self._input_schema = input_bundle.schema
+        self._map_metrics.on_input_received(input_bundle)
 
         if not input_bundle.block_refs:
             input_bundle.destroy_if_owned()
@@ -352,8 +305,6 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
             *block_refs,
             partition_fn=self._partition_fn,
             num_partitions=self._num_partitions,
-            input_block_transformer=self._input_block_transformer,
-            per_partition_post_transformer=self._per_partition_post_transformer,
         )
         metadata_ref = map_refs[0]
         partition_refs = list(map_refs[1:])
@@ -380,7 +331,7 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
             for bundle in input_bundles
             for ref, meta in zip(bundle.block_refs, bundle.metadata)
         ]
-        self._metrics.on_task_submitted(
+        self._map_metrics.on_task_submitted(
             cur_task_idx,
             RefBundle(all_blocks_meta, schema=None, owns_blocks=False),
             task_id=task.get_task_id(),
@@ -390,7 +341,7 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
             _, _, num_rows = estimate_total_num_of_blocks(
                 cur_task_idx + 1,
                 self.upstream_op_num_outputs(),
-                self._metrics,
+                self._map_metrics,
                 total_num_tasks=None,
             )
             self._map_bar.update(total=num_rows)
@@ -423,9 +374,7 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
                 exec_stats=None,
                 input_files=None,
             )
-            shard_bundle = RefBundle(
-                [(ref, shard_meta)], schema=self._input_schema, owns_blocks=True
-            )
+            shard_bundle = RefBundle([(ref, shard_meta)], schema=None, owns_blocks=True)
             self._partition_staging[pid].add(shard_bundle)
             self._partition_bytes[pid] += nbytes
 
@@ -436,7 +385,7 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
         self._total_input_bytes += input_meta.size_bytes or 0
         self._map_blocks_stats.append(input_meta.to_stats())
 
-        self._metrics.on_task_finished(
+        self._map_metrics.on_task_finished(
             task_idx,
             None,
             task_exec_stats=None,
@@ -483,10 +432,7 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
             for i, (ref, meta) in enumerate(merged.blocks):
                 if i == 0:
                     meta = dataclasses.replace(
-                        meta,
-                        input_files=make_partition_sentinel(
-                            pid, self._input_seq_index
-                        ),
+                        meta, input_files=make_partition_sentinel(pid)
                     )
                 stamped_blocks.append((ref, meta))
             stamped = RefBundle(
@@ -495,7 +441,7 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
                 owns_blocks=merged.owns_blocks,
             )
             self._output_queue.add(stamped)
-            self._metrics.on_output_queued(stamped)
+            self._map_metrics.on_output_queued(stamped)
 
     # -----------------------------------------------------------------------
     # Output handling
@@ -506,7 +452,8 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
 
     def _get_next_inner(self) -> RefBundle:
         bundle: RefBundle = self._output_queue.get_next()
-        self._metrics.on_output_dequeued(bundle)
+        self._map_metrics.on_output_dequeued(bundle)
+        self._map_metrics.on_output_taken(bundle)
         return bundle
 
     # -----------------------------------------------------------------------
@@ -565,6 +512,9 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
     def get_stats(self) -> Dict[str, List[BlockStats]]:
         return {self._name: self._map_blocks_stats}
 
+    def _extra_metrics(self) -> Dict[str, Any]:
+        return {self._name: self._map_metrics.as_dict()}
+
     # -----------------------------------------------------------------------
     # Resource accounting
     # -----------------------------------------------------------------------
@@ -586,7 +536,7 @@ class ShuffleMapOp(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarM
         # to Ray Core (`estimated_bytes * 2`).  We don't know the next
         # input's size up front, so use the running average across
         # already-submitted tasks; 0 until the first task is submitted.
-        avg_input = self._metrics.average_bytes_inputs_per_task
+        avg_input = self._map_metrics.average_bytes_inputs_per_task
         memory = int(avg_input * 2) if avg_input else 0
         return ExecutionResources(
             cpu=self._shuffle_map_task_num_cpus,

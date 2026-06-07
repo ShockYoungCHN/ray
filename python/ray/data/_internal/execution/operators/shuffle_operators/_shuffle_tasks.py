@@ -1,9 +1,7 @@
 """Shared remote tasks + helpers for ShuffleMapOp / ShuffleReduceOp."""
 
-import os
 import pickle
 import time
-from contextlib import contextmanager
 from typing import Callable, Dict, Generator, Iterable, List, Optional, Tuple, Union
 
 import pyarrow as pa
@@ -31,63 +29,9 @@ PartitionFn = Callable[[pa.Table], Dict[int, pa.Table]]
 # See ShuffleReduceOp for streaming vs. blocking call semantics.
 ReduceFn = Callable[[int, List[pa.Table]], Iterable[Block]]
 
-# Multi-input variant for joins / N-way combiners.  Receives a dict mapping
-# input_seq_index -> list of decoded shard tables.  Always blocking: the
-# reducer task collects every shard from every side before invoking the fn.
-MultiSeqReduceFn = Callable[[int, Dict[int, List[pa.Table]]], Iterable[Block]]
-
-# Optional per-block transform applied inside the map task before partitioning
-# (e.g. partial pre-aggregation, projection pushdown).  Must preserve the
-# semantics expected by the paired reduce_fn — typically reducing the block's
-# byte footprint without changing the row set in ways the reducer can't merge.
-MapBlockTransformer = Callable[[Block], Block]
-
 
 # Number of ObjectRefs fetched per ray.get() call in reducers.
 _REDUCE_BATCH_SIZE = 16
-
-
-# Env-var gated stage-level profiling.  Read once at import; the worker imports
-# this module on first task dispatch so the env value at that moment is what
-# applies for the rest of the worker's lifetime.
-SHUFFLE_PROFILE_ENV_VAR = "RAY_DATA_SHUFFLE_PROFILE"
-_SHUFFLE_PROFILE_ENABLED = os.environ.get(SHUFFLE_PROFILE_ENV_VAR) == "1"
-
-
-class _StageTimings:
-    """Accumulator for stage-level wall-clock timings and byte counters.
-
-    When shuffle profiling is disabled, ``record``/``add`` are no-ops and
-    ``as_dict`` returns None, so callers can unconditionally call them
-    without paying any cost on the hot path.
-    """
-
-    __slots__ = ("_timings", "_enabled")
-
-    def __init__(self):
-        self._enabled = _SHUFFLE_PROFILE_ENABLED
-        self._timings: Optional[Dict[str, float]] = {} if self._enabled else None
-
-    @contextmanager
-    def record(self, key: str):
-        if not self._enabled:
-            yield
-            return
-        t0 = time.perf_counter()
-        try:
-            yield
-        finally:
-            self._timings[key] = self._timings.get(key, 0.0) + (
-                time.perf_counter() - t0
-            )
-
-    def add(self, key: str, value: float) -> None:
-        if not self._enabled:
-            return
-        self._timings[key] = self._timings.get(key, 0.0) + value
-
-    def as_dict(self) -> Optional[Dict[str, float]]:
-        return self._timings
 
 
 # ---------------------------------------------------------------------------
@@ -96,10 +40,7 @@ class _StageTimings:
 
 
 def _partition_blocks_to_shards(
-    blocks: Tuple[Block, ...],
-    partition_fn: PartitionFn,
-    timings: Optional["_StageTimings"] = None,
-    input_block_transformer: Optional["MapBlockTransformer"] = None,
+    blocks: Tuple[Block, ...], partition_fn: PartitionFn
 ) -> Dict[int, List[pa.Table]]:
     """Run partition_fn on each block; collect non-empty shards by pid.
 
@@ -109,13 +50,7 @@ def _partition_blocks_to_shards(
     performance constraint, not optional: hash_partition's per-column take
     is sensitive to chunk count, and leaving chunked input alone halves map
     throughput.
-
-    If ``input_block_transformer`` is provided, it runs on each input block
-    before chunk defragmentation and partitioning — used by hash-aggregate
-    for partial pre-aggregation that shrinks the shuffle payload.
     """
-    if timings is None:
-        timings = _StageTimings()
     partition_accumulators: Dict[int, List[pa.Table]] = {}
     for block in blocks:
         block = TableBlockAccessor.try_convert_block_type(
@@ -123,20 +58,10 @@ def _partition_blocks_to_shards(
         )
         if block.num_rows == 0:
             continue
-        if input_block_transformer is not None:
-            with timings.record("map.input_transform_s"):
-                block = input_block_transformer(block)
-                block = TableBlockAccessor.try_convert_block_type(
-                    block, block_type=BlockType.ARROW
-                )
-            if block.num_rows == 0:
-                continue
         assert isinstance(block, pa.Table), f"Expected pa.Table, got {type(block)}"
         if any(col.num_chunks > 1 for col in block.columns):
-            with timings.record("map.combine_chunks_s"):
-                block = block.combine_chunks()
-        with timings.record("map.partition_fn_s"):
-            block_partitions = partition_fn(block)
+            block = block.combine_chunks()
+        block_partitions = partition_fn(block)
         for pid, shard in block_partitions.items():
             if shard.num_rows > 0:
                 partition_accumulators.setdefault(pid, []).append(shard)
@@ -174,8 +99,6 @@ def _shuffle_map_task(
     *blocks: Block,
     partition_fn: PartitionFn,
     num_partitions: int,
-    input_block_transformer: Optional["MapBlockTransformer"] = None,
-    per_partition_post_transformer: Optional["MapBlockTransformer"] = None,
 ):
     """Map stage: partition input blocks and return one shard per partition.
 
@@ -190,17 +113,6 @@ def _shuffle_map_task(
         partition_fn: Callable (pa.Table) -> Dict[int, pa.Table] that
             assigns rows to output partitions.
         num_partitions: Total number of output partitions.
-        input_block_transformer: Optional per-block transformer applied
-            before partitioning (e.g. partial pre-aggregation for
-            HashAggregate, per-block dedup for SEMI/ANTI joins).
-        per_partition_post_transformer: Optional transformer applied
-            once per (task, partition) **after** the per-pid concat,
-            right before IPC encoding.  Used by SEMI/ANTI joins to do
-            a per-task cluster-incremental dedup on the merged
-            partition shard — collapses cross-block duplication that
-            the per-block ``input_block_transformer`` can't catch.
-            Must be idempotent (called even when shards already
-            unique).
 
     Returns:
         Tuple of ``num_partitions + 1`` values:
@@ -214,14 +126,10 @@ def _shuffle_map_task(
     from dataclasses import replace as _dc_replace
 
     stats = BlockExecStats.builder()
-    timings = _StageTimings()
 
     if not blocks:
         empty_meta = BlockAccessor.for_block(pa.table({})).get_metadata(
-            block_exec_stats=stats.build(
-                block_ser_time_s=0,
-                shuffle_stage_timings_s=timings.as_dict(),
-            )
+            block_exec_stats=stats.build(block_ser_time_s=0)
         )
         return (empty_meta, {}), *([None] * num_partitions)
 
@@ -234,20 +142,12 @@ def _shuffle_map_task(
     # Empty-input fast path.
     if total_rows == 0:
         input_meta = BlockAccessor.for_block(blocks[0]).get_metadata(
-            block_exec_stats=stats.build(
-                block_ser_time_s=0,
-                shuffle_stage_timings_s=timings.as_dict(),
-            ),
+            block_exec_stats=stats.build(block_ser_time_s=0),
         )
         return (input_meta, {}), *([None] * num_partitions)
 
     # Step 1: partition each input block into (pid -> [shard_table, ...]).
-    partition_accumulators = _partition_blocks_to_shards(
-        blocks,
-        partition_fn,
-        timings=timings,
-        input_block_transformer=input_block_transformer,
-    )
+    partition_accumulators = _partition_blocks_to_shards(blocks, partition_fn)
 
     # Step 2: merge per-pid shards and ZSTD-encode each partition.
     ipc_write_options = pa.ipc.IpcWriteOptions(compression=pa.Codec("zstd"))
@@ -255,32 +155,14 @@ def _shuffle_map_task(
     partition_bufs: List[Optional[pa.Buffer]] = [None] * num_partitions
     for pid in sorted(partition_accumulators.keys()):
         tables = partition_accumulators.pop(pid)
-        if len(tables) > 1:
-            with timings.record("map.concat_tables_s"):
-                merged = pa.concat_tables(tables)
-        else:
-            merged = tables[0]
-        # Per-task cluster-incremental transform applied after concat.
-        # For SEMI/ANTI joins this is the dedup function; collapsing
-        # cross-block duplication that the per-block path missed before
-        # the IPC encode cuts plasma+network bytes for free.
-        if per_partition_post_transformer is not None:
-            with timings.record("map.post_concat_transform_s"):
-                merged = per_partition_post_transformer(merged)
+        merged = pa.concat_tables(tables) if len(tables) > 1 else tables[0]
         shard_sizes[pid] = (merged.num_rows, merged.nbytes)
-        timings.add("map.zstd_bytes_in", float(merged.nbytes))
-        with timings.record("map.ipc_encode_s"):
-            buf = _encode_partition_ipc(merged, ipc_write_options)
-        timings.add("map.zstd_bytes_out", float(len(buf)))
-        partition_bufs[pid] = buf
+        partition_bufs[pid] = _encode_partition_ipc(merged, ipc_write_options)
         del merged
 
     # Step 3: build aggregate input metadata and return.
     input_meta = BlockAccessor.for_block(blocks[0]).get_metadata(
-        block_exec_stats=stats.build(
-            block_ser_time_s=0,
-            shuffle_stage_timings_s=timings.as_dict(),
-        ),
+        block_exec_stats=stats.build(block_ser_time_s=0),
     )
     input_meta = _dc_replace(input_meta, num_rows=total_rows, size_bytes=total_bytes)
     return (input_meta, shard_sizes), *partition_bufs
@@ -289,24 +171,6 @@ def _shuffle_map_task(
 # ---------------------------------------------------------------------------
 # Reduce-side helpers
 # ---------------------------------------------------------------------------
-
-
-def _maybe_empty_table_for_schema(schema) -> Optional[pa.Table]:
-    """Build a zero-row pa.Table that has the given ``schema``.
-
-    Returns ``None`` for non-pyarrow schemas (e.g. PandasBlockSchema) so
-    callers can fall back to the original empty-list semantics.
-
-    Used by multi-input reduce tasks to substitute for sides that
-    produced no rows for a given partition.  Carrying the typed empty
-    table forward lets reduce_fn (e.g. JoiningAggregation.finalize)
-    resolve column references against the empty side instead of
-    failing with "no match for field reference" on a schemaless block.
-    """
-    if not isinstance(schema, pa.Schema):
-        return None
-    arrays = [pa.array([], type=field.type) for field in schema]
-    return pa.Table.from_arrays(arrays, schema=schema)
 
 
 def _read_partition_ipc(buf: pa.Buffer) -> Optional[pa.Table]:
@@ -373,7 +237,6 @@ def _shuffle_reduce_task(
         partitions that received no rows produce no output.
     """
     start_time_s = time.perf_counter()
-    timings = _StageTimings()
 
     accum_tables: List[pa.Table] = []
     accum_bytes: int = 0
@@ -386,7 +249,6 @@ def _shuffle_reduce_task(
         gen_stats: StreamingGeneratorStats = yield block
         exec_stats = exec_stats_builder.build(
             block_ser_time_s=(gen_stats.object_creation_dur_s if gen_stats else None),
-            shuffle_stage_timings_s=timings.as_dict(),
         )
         yield pickle.dumps(
             BlockMetadataWithSchema.from_block(
@@ -406,29 +268,20 @@ def _shuffle_reduce_task(
                     target_max_block_size=target_max_block_size,
                 )
             )
-        with timings.record("reduce.reduce_fn_s"):
-            produced_blocks = list(reduce_fn(partition_id, tables))
-        for block in produced_blocks:
-            with timings.record("reduce.output_buffer_s"):
-                output_buffer.add_block(block)
-                ready = []
-                while output_buffer.has_next():
-                    ready.append(output_buffer.next())
-            for out_block in ready:
-                yield from _yield_with_stats(out_block)
+        for block in reduce_fn(partition_id, tables):
+            output_buffer.add_block(block)
+            while output_buffer.has_next():
+                yield from _yield_with_stats(output_buffer.next())
 
     # Step 1: fetch shard refs in batches, decompress, accumulate.  In
     # streaming mode, when the accumulator reaches target_max_block_size,
     # flush through reduce_fn and yield any ready output blocks.
     for batch_start in range(0, len(shard_refs), _REDUCE_BATCH_SIZE):
         batch = shard_refs[batch_start : batch_start + _REDUCE_BATCH_SIZE]
-        with timings.record("reduce.ray_get_s"):
-            fetched = ray.get(batch)
-        for buf in fetched:
+        for buf in ray.get(batch):
             if buf is None:
                 continue
-            with timings.record("reduce.ipc_decode_s"):
-                table = _read_partition_ipc(buf)
+            table = _read_partition_ipc(buf)
             if table is None:
                 continue
             accum_tables.append(table)
@@ -451,108 +304,6 @@ def _shuffle_reduce_task(
     # Step 3: if reduce_fn ran at least once, finalize the buffer to flush
     # any partial block.
     if output_buffer is not None:
-        with timings.record("reduce.finalize_s"):
-            output_buffer.finalize()
-            ready = []
-            while output_buffer.has_next():
-                ready.append(output_buffer.next())
-        for out_block in ready:
-            yield from _yield_with_stats(out_block)
-
-
-@ray.remote(max_calls=1)
-def _shuffle_multi_seq_reduce_task(
-    shard_refs_by_seq: Dict[int, List[ObjectRef]],
-    partition_id: int,
-    reduce_fn: "MultiSeqReduceFn",
-    target_max_block_size: Optional[int],
-    schemas_by_seq: Optional[Dict[int, "pa.Schema"]] = None,
-) -> Generator[Union[Block, bytes], None, None]:
-    """Multi-input (e.g. join) reduce stage.
-
-    Decodes every input sequence's shards for this partition, then invokes
-    ``reduce_fn(partition_id, {seq -> [tables]})`` exactly once.  Multi-input
-    combiners (joins, set ops) need the full partition on every side before
-    they can produce a correct output, so streaming flush is not supported
-    here.
-
-    Empty sides (a partition where one side produced no rows) are replaced
-    with a single schema-aware empty Table when ``schemas_by_seq`` carries
-    that seq's schema, so reduce_fn always sees a Table that knows its
-    columns even when the side contributed zero rows.  Without this,
-    PyArrow operations (e.g. Table.join) cannot resolve key column
-    references against the empty side.
-
-    Output blocks are pushed through a BlockOutputBuffer so they respect
-    ``target_max_block_size`` — same contract as the single-input task.
-    """
-    start_time_s = time.perf_counter()
-    timings = _StageTimings()
-    if schemas_by_seq is None:
-        schemas_by_seq = {}
-
-    decoded_by_seq: Dict[int, List[pa.Table]] = {}
-    for seq_idx, refs in shard_refs_by_seq.items():
-        tables: List[pa.Table] = []
-        for batch_start in range(0, len(refs), _REDUCE_BATCH_SIZE):
-            batch = refs[batch_start : batch_start + _REDUCE_BATCH_SIZE]
-            with timings.record("reduce.ray_get_s"):
-                fetched = ray.get(batch)
-            for buf in fetched:
-                if buf is None:
-                    continue
-                with timings.record("reduce.ipc_decode_s"):
-                    table = _read_partition_ipc(buf)
-                if table is not None:
-                    tables.append(table)
-        if not tables and seq_idx in schemas_by_seq:
-            empty = _maybe_empty_table_for_schema(schemas_by_seq[seq_idx])
-            if empty is not None:
-                # Materialize a typed empty Table so PyArrow ops downstream
-                # can resolve column references against this side.
-                tables = [empty]
-        decoded_by_seq[seq_idx] = tables
-
-    output_buffer = BlockOutputBuffer(
-        OutputBlockSizeOption.of(
-            target_max_block_size=target_max_block_size,
-        )
-    )
-
-    with timings.record("reduce.reduce_fn_s"):
-        produced_blocks = list(reduce_fn(partition_id, decoded_by_seq))
-
-    def _yield_with_stats(block: Block):
-        exec_stats_builder = BlockExecStats.builder()
-        exec_stats_builder.finish()
-        gen_stats: StreamingGeneratorStats = yield block
-        exec_stats = exec_stats_builder.build(
-            block_ser_time_s=(gen_stats.object_creation_dur_s if gen_stats else None),
-            shuffle_stage_timings_s=timings.as_dict(),
-        )
-        yield pickle.dumps(
-            BlockMetadataWithSchema.from_block(
-                block,
-                block_exec_stats=exec_stats,
-                task_exec_stats=TaskExecWorkerStats(
-                    task_wall_time_s=time.perf_counter() - start_time_s,
-                ),
-            )
-        )
-
-    for block in produced_blocks:
-        with timings.record("reduce.output_buffer_s"):
-            output_buffer.add_block(block)
-            ready = []
-            while output_buffer.has_next():
-                ready.append(output_buffer.next())
-        for out_block in ready:
-            yield from _yield_with_stats(out_block)
-
-    with timings.record("reduce.finalize_s"):
         output_buffer.finalize()
-        ready = []
         while output_buffer.has_next():
-            ready.append(output_buffer.next())
-    for out_block in ready:
-        yield from _yield_with_stats(out_block)
+            yield from _yield_with_stats(output_buffer.next())

@@ -1,10 +1,9 @@
 import functools
 import logging
 import typing
-from collections import defaultdict, deque
-from typing import Any, Dict, List, Optional, Union
+from collections import deque
+from typing import Any, Dict, List, Optional
 
-from ray import ObjectRef
 from ray.data._internal.execution.interfaces import (
     ExecutionResources,
     PhysicalOperator,
@@ -17,17 +16,15 @@ from ray.data._internal.execution.interfaces.physical_operator import (
     estimate_total_num_of_blocks,
 )
 from ray.data._internal.execution.operators.shuffle_operators._shuffle_tasks import (
-    MultiSeqReduceFn,
     ReduceFn,
-    _shuffle_multi_seq_reduce_task,
     _shuffle_reduce_task,
 )
 from ray.data._internal.execution.operators.shuffle_operators.shuffle_map_operator import (  # noqa: E501
     ShuffleMapOp,
-    extract_partition_and_seq,
     extract_partition_id,
 )
 from ray.data._internal.execution.operators.sub_progress import SubProgressBarMixin
+from ray.data._internal.stats import OpRuntimeMetrics
 from ray.data.block import BlockStats, TaskExecWorkerStats, to_stats
 from ray.data.context import DataContext
 
@@ -81,50 +78,28 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
 
     def __init__(
         self,
-        input_op: Union[ShuffleMapOp, List[ShuffleMapOp]],
+        input_op: ShuffleMapOp,
         data_context: DataContext,
         *,
         num_partitions: int,
-        reduce_fn: Union[ReduceFn, MultiSeqReduceFn],
+        reduce_fn: ReduceFn,
         streaming_reduce: bool = True,
         disallow_block_splitting: bool = False,
         reduce_cpus: Optional[float] = None,
         name: str = "ShuffleReduce",
     ):
-        # Normalize input_op: a single ShuffleMapOp behaves exactly as before
-        # (single-input semantics, ReduceFn signature, streaming allowed).  A
-        # list activates the multi-input path used by joins: bundles are
-        # stashed by (partition_id, input_seq_index) and the reduce task
-        # only fires once every upstream has delivered shards for that
-        # partition.  Multi-input forces blocking mode — joins need both
-        # sides complete before any output row can be emitted.
-        if isinstance(input_op, list):
-            input_ops: List[ShuffleMapOp] = list(input_op)
-            self._num_input_seqs: int = len(input_ops)
-            assert self._num_input_seqs >= 1
-            self._multi_input: bool = self._num_input_seqs > 1
-        else:
-            input_ops = [input_op]
-            self._num_input_seqs = 1
-            self._multi_input = False
-
         super().__init__(
             name=name,
-            input_dependencies=input_ops,
+            input_dependencies=[input_op],
             data_context=data_context,
         )
 
         self._num_partitions: int = num_partitions
-        self._reduce_fn: Union[ReduceFn, MultiSeqReduceFn] = reduce_fn
+        self._reduce_fn: ReduceFn = reduce_fn
         self._disallow_block_splitting: bool = disallow_block_splitting
         # Block-splitting disallowed → reducer must see entire partition
         # before emitting, so force blocking mode regardless of the flag.
-        # Multi-input is also forced to blocking mode (joins can't stream).
-        self._streaming_reduce: bool = (
-            streaming_reduce
-            and not disallow_block_splitting
-            and not self._multi_input
-        )
+        self._streaming_reduce: bool = streaming_reduce and not disallow_block_splitting
 
         # -- Reduce task config & tracking -----------------------------------
         self._shuffle_reduce_task_num_cpus: float = (
@@ -135,37 +110,6 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
         self._shuffle_reduce_tasks: Dict[int, DataOpTask] = {}
         self._num_reduce_tasks_submitted: int = 0
 
-        # -- Multi-input staging ---------------------------------------------
-        # Maps partition_id -> input_seq -> list of shard refs received so
-        # far.  When the dict has an entry for every input_seq in
-        # range(self._num_input_seqs), the partition is ready and we
-        # submit its reduce task.  Empty when self._multi_input is False.
-        self._pending_partition_shards: Dict[
-            int, Dict[int, List[ObjectRef]]
-        ] = defaultdict(dict)
-        # Cached per-partition byte total for memory sizing of the reduce
-        # task (multi-input path only).
-        self._pending_partition_bytes: Dict[int, int] = defaultdict(int)
-        # Bundles held alive until their reduce task finishes — destroyed
-        # in _handle_reduce_done.  Single-input path keeps the upstream
-        # bundle reference for free via task_done_callback's closure; we
-        # need an explicit list here because we collect 2+ bundles per
-        # partition before submitting.
-        self._pending_partition_bundles: Dict[int, List[RefBundle]] = defaultdict(list)
-        # Tracks which input_seqs have signalled all_inputs_done so we
-        # know when a partition with missing sides should still be
-        # flushed with empty shards (outer joins).
-        self._inputs_done_per_seq: Dict[int, bool] = {
-            i: False for i in range(self._num_input_seqs)
-        }
-        # Per-seq cached schema, captured from the first input bundle that
-        # carried one.  Needed so the multi-seq reduce task can reconstruct
-        # an empty-but-typed Table when a partition produced zero rows on
-        # one side (e.g. inner join with very small right side).  Without
-        # this, PyArrow's Table.join fails with "No match for key field
-        # reference" because an empty Block has no columns.
-        self._schemas_by_seq: Dict[int, Any] = {}
-
         # -- Output queue ----------------------------------------------------
         self._output_queue: deque = deque()
 
@@ -174,24 +118,23 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
 
         # -- Sub-progress bars -----------------------------------------------
         self._reduce_bar: Optional["BaseProgressBar"] = None
+        self._reduce_metrics = OpRuntimeMetrics(self)
 
     # -----------------------------------------------------------------------
     # Input handling: one bundle → one reducer task
     # -----------------------------------------------------------------------
 
     def _add_input_inner(self, input_bundle: RefBundle, input_index: int) -> None:
-        """Submit one reducer task per partition-bundle (single-input mode), or
-        stash a partition's shards until every upstream sequence has reported
-        them in (multi-input mode).
+        """Submit one reducer task for this partition-bundle.
 
-        Each upstream bundle is one partition's shards (M blocks from M
-        mappers of that side).  The partition_id and input_seq_index are
-        encoded in the first block's `input_files`.  This is the framework-
-        gated entry point — the executor only calls it when all configured
-        backpressure policies say the op can accept another input.
+        Each upstream bundle is a single partition's shards (M blocks from
+        M mappers).  The partition_id is encoded in the first block's
+        `input_files`.  This is the framework-gated entry point — the
+        executor only calls it when all configured backpressure policies
+        say the op can accept another input.
         """
-        if not self._multi_input:
-            assert input_index == 0
+        assert input_index == 0
+        self._reduce_metrics.on_input_received(input_bundle)
 
         if not input_bundle.block_refs:
             # Defensive: ShuffleMapOp skips empty partitions, but a future
@@ -199,40 +142,7 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
             input_bundle.destroy_if_owned()
             return
 
-        if not self._multi_input:
-            partition_id = extract_partition_id(input_bundle)
-            self._submit_single_input_task(partition_id, input_bundle)
-            return
-
-        # Multi-input path: stash this side's shards; if every other side
-        # has also reported (or we know they're done with this partition
-        # empty), fire the reduce task.
-        partition_id, seq_idx = extract_partition_and_seq(input_bundle)
-        if seq_idx not in self._schemas_by_seq and input_bundle.schema is not None:
-            self._schemas_by_seq[seq_idx] = input_bundle.schema
-        assert input_index == seq_idx, (
-            f"input bundle's seq sentinel ({seq_idx}) disagrees with the "
-            f"framework's input_index ({input_index}) — the upstream "
-            f"ShuffleMapOps were likely wired to ShuffleReduceOp in the "
-            f"wrong order"
-        )
-        assert seq_idx not in self._pending_partition_shards[partition_id], (
-            f"partition_id={partition_id} received a second bundle from "
-            f"input_seq={seq_idx}; each (partition, side) must produce at "
-            f"most one bundle"
-        )
-        self._pending_partition_shards[partition_id][seq_idx] = list(
-            input_bundle.block_refs
-        )
-        self._pending_partition_bytes[partition_id] += sum(
-            (m.size_bytes or 0) for m in input_bundle.metadata
-        )
-        self._pending_partition_bundles[partition_id].append(input_bundle)
-        self._maybe_submit_multi_input_task(partition_id)
-
-    def _submit_single_input_task(
-        self, partition_id: int, input_bundle: RefBundle
-    ) -> None:
+        partition_id = extract_partition_id(input_bundle)
         shard_refs = list(input_bundle.block_refs)
         # Sum of per-shard `size_bytes`, which ShuffleMapOp set to the
         # uncompressed Arrow `nbytes` at map time.  This is the total
@@ -240,7 +150,22 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
         # sizing the reducer's heap, since the reducer decompresses
         # every shard before reducing.
         estimated_bytes = sum((m.size_bytes or 0) for m in input_bundle.metadata)
-        reduce_resources, reduce_options = self._reduce_task_resources(estimated_bytes)
+
+        # Per-task ask: 1 CPU + `2 × estimated_bytes` memory.  The
+        # 2× covers peak USS (decompressed accumulator + transient
+        # concat copy + small overhead share).  Relies on
+        # `@ray.remote(max_calls=1)` on `_shuffle_reduce_task` to
+        # keep the worker heap baseline clean between consecutive tasks.
+        reduce_resources: Dict[str, Any] = {
+            "num_cpus": self._shuffle_reduce_task_num_cpus,
+        }
+        if estimated_bytes > 0:
+            reduce_resources["memory"] = int(estimated_bytes * 2)
+        reduce_options = {
+            **reduce_resources,
+            "scheduling_strategy": "SPREAD",
+            "num_returns": "streaming",
+        }
 
         block_gen = _shuffle_reduce_task.options(**reduce_options).remote(
             shard_refs,
@@ -253,99 +178,7 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
             ),
             streaming=self._streaming_reduce,
         )
-        self._register_reduce_task(
-            partition_id=partition_id,
-            block_gen=block_gen,
-            done_bundles=[input_bundle],
-            reduce_resources=reduce_resources,
-        )
 
-    def _maybe_submit_multi_input_task(self, partition_id: int) -> None:
-        """Fire the multi-seq reduce task once we know every side's shards.
-
-        A side may be missing because (a) we haven't received its bundle
-        yet, or (b) ShuffleMapOp already finished all inputs for that side
-        and the partition was empty there.  Case (b) is detected via
-        ``_inputs_done_per_seq`` — if every upstream is done, any side
-        with no stashed bundle is treated as having contributed an empty
-        shard list (necessary for outer-join semantics).
-        """
-        per_seq = self._pending_partition_shards[partition_id]
-        all_inputs_done = all(self._inputs_done_per_seq.values())
-        ready = all(
-            seq in per_seq or all_inputs_done
-            for seq in range(self._num_input_seqs)
-        )
-        if not ready:
-            return
-
-        # Materialize the per-seq ref dict, filling in empty lists for
-        # missing-and-known-done sides.
-        shard_refs_by_seq: Dict[int, List[ObjectRef]] = {
-            seq: per_seq.get(seq, []) for seq in range(self._num_input_seqs)
-        }
-        # If literally no side has any shard, this partition is fully
-        # empty across the whole join — skip submitting a no-op task.
-        if all(not refs for refs in shard_refs_by_seq.values()):
-            del self._pending_partition_shards[partition_id]
-            for b in self._pending_partition_bundles.pop(partition_id, []):
-                b.destroy_if_owned()
-            self._pending_partition_bytes.pop(partition_id, None)
-            return
-
-        estimated_bytes = self._pending_partition_bytes.pop(partition_id, 0)
-        reduce_resources, reduce_options = self._reduce_task_resources(estimated_bytes)
-
-        block_gen = _shuffle_multi_seq_reduce_task.options(**reduce_options).remote(
-            shard_refs_by_seq,
-            partition_id=partition_id,
-            reduce_fn=self._reduce_fn,
-            schemas_by_seq=dict(self._schemas_by_seq),
-            target_max_block_size=(
-                None
-                if self._disallow_block_splitting
-                else self.data_context.target_max_block_size
-            ),
-        )
-        done_bundles = self._pending_partition_bundles.pop(partition_id, [])
-        del self._pending_partition_shards[partition_id]
-        self._register_reduce_task(
-            partition_id=partition_id,
-            block_gen=block_gen,
-            done_bundles=done_bundles,
-            reduce_resources=reduce_resources,
-        )
-
-    def _reduce_task_resources(
-        self, estimated_bytes: int
-    ) -> "tuple[Dict[str, Any], Dict[str, Any]]":
-        """Build the (resources, ray_remote_options) pair for a reduce task.
-
-        Per-task ask: 1 CPU + `2 × estimated_bytes` memory.  The 2× covers
-        peak USS (decompressed accumulator + transient concat copy + small
-        overhead share).  Relies on ``@ray.remote(max_calls=1)`` to keep
-        the worker heap baseline clean between consecutive tasks.
-        """
-        reduce_resources: Dict[str, Any] = {
-            "num_cpus": self._shuffle_reduce_task_num_cpus,
-        }
-        if estimated_bytes > 0:
-            reduce_resources["memory"] = int(estimated_bytes * 2)
-        reduce_options = {
-            **reduce_resources,
-            "scheduling_strategy": "SPREAD",
-            "num_returns": "streaming",
-        }
-        return reduce_resources, reduce_options
-
-    def _register_reduce_task(
-        self,
-        *,
-        partition_id: int,
-        block_gen,
-        done_bundles: List[RefBundle],
-        reduce_resources: Dict[str, Any],
-    ) -> None:
         data_task = DataOpTask(
             task_index=partition_id,
             streaming_gen=block_gen,
@@ -353,7 +186,7 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
                 self._handle_reduce_output_ready, partition_id
             ),
             task_done_callback=functools.partial(
-                self._handle_reduce_done, partition_id, done_bundles
+                self._handle_reduce_done, partition_id, input_bundle
             ),
             task_resource_bundle=ExecutionResources.from_resource_dict(
                 reduce_resources
@@ -363,16 +196,13 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
 
         assert partition_id not in self._shuffle_reduce_tasks, (
             f"partition_id {partition_id} already has an in-flight reducer "
-            f"task; each partition must produce at most one reduce task"
+            f"task; ShuffleMapOp must emit at most one bundle per partition"
         )
         self._shuffle_reduce_tasks[partition_id] = data_task
         self._num_reduce_tasks_submitted += 1
-        # Per-input on_task_submitted call (executor expects one per input
-        # bundle that contributed to this task).
-        for bundle in done_bundles:
-            self._metrics.on_task_submitted(
-                partition_id, bundle, task_id=data_task.get_task_id()
-            )
+        self._reduce_metrics.on_task_submitted(
+            partition_id, input_bundle, task_id=data_task.get_task_id()
+        )
 
     # -----------------------------------------------------------------------
     # Output handling
@@ -383,7 +213,8 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
 
     def _get_next_inner(self) -> RefBundle:
         bundle: RefBundle = self._output_queue.popleft()
-        self._metrics.on_output_dequeued(bundle)
+        self._reduce_metrics.on_output_dequeued(bundle)
+        self._reduce_metrics.on_output_taken(bundle)
         self._output_blocks_stats.extend(to_stats(bundle.metadata))
         return bundle
 
@@ -400,12 +231,14 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
 
     def _handle_reduce_output_ready(self, partition_id: int, bundle: RefBundle) -> None:
         self._output_queue.append(bundle)
-        self._metrics.on_output_queued(bundle)
-        self._metrics.on_task_output_generated(task_index=partition_id, output=bundle)
+        self._reduce_metrics.on_output_queued(bundle)
+        self._reduce_metrics.on_task_output_generated(
+            task_index=partition_id, output=bundle
+        )
         _, num_outputs, num_rows = estimate_total_num_of_blocks(
             self._num_reduce_tasks_submitted,
             self.upstream_op_num_outputs(),
-            self._metrics,
+            self._reduce_metrics,
             total_num_tasks=self._num_partitions,
         )
         self._estimated_num_output_bundles = num_outputs
@@ -419,18 +252,17 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
     def _handle_reduce_done(
         self,
         partition_id: int,
-        input_bundles: List[RefBundle],
+        input_bundle: RefBundle,
         exc: Optional[Exception],
         task_exec_stats: Optional[TaskExecWorkerStats],
         task_exec_driver_stats: Optional[TaskExecDriverStats],
     ) -> None:
         """Callback when a reduce task finishes (with or without exception)."""
-        for input_bundle in input_bundles:
-            input_bundle.destroy_if_owned()
+        input_bundle.destroy_if_owned()
         if partition_id not in self._shuffle_reduce_tasks:
             return
         self._shuffle_reduce_tasks.pop(partition_id)
-        self._metrics.on_task_finished(
+        self._reduce_metrics.on_task_finished(
             task_index=partition_id,
             exception=exc,
             task_exec_stats=task_exec_stats,
@@ -440,27 +272,6 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
             logger.error(
                 f"Reduce of partition {partition_id} failed: {exc}", exc_info=exc
             )
-
-    def input_done(self, input_index: int) -> None:
-        """Called by the executor when an upstream sequence finishes.
-
-        For multi-input mode we may still have partitions whose pending
-        side-set is incomplete (e.g. an outer join where the right side
-        had no rows for partition 7).  Marking the sequence as done lets
-        ``_maybe_submit_multi_input_task`` treat absent sides as empty
-        and submit the remaining tasks.
-        """
-        super().input_done(input_index)
-        if not self._multi_input:
-            return
-        self._inputs_done_per_seq[input_index] = True
-        if not all(self._inputs_done_per_seq.values()):
-            return
-        # Every upstream has signalled done.  Flush any partition still
-        # waiting on shards — those gaps are now permanent empties.
-        pending = list(self._pending_partition_shards.keys())
-        for pid in pending:
-            self._maybe_submit_multi_input_task(pid)
 
     # -----------------------------------------------------------------------
     # Completion
@@ -493,6 +304,9 @@ class ShuffleReduceOp(PhysicalOperator, SubProgressBarMixin):
 
     def get_stats(self) -> Dict[str, List[BlockStats]]:
         return {self._name: self._output_blocks_stats}
+
+    def _extra_metrics(self) -> Dict[str, Any]:
+        return {self._name: self._reduce_metrics.as_dict()}
 
     # -----------------------------------------------------------------------
     # Resource accounting
