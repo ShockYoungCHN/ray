@@ -224,14 +224,13 @@ class BlockExecStats:
     wall_time_s: Optional[float] = None
     # Time spent inside UDF while generating block.
     udf_time_s: Optional[float] = 0
+    # Per-stage wall-clock timings and byte counters captured by shuffle tasks
+    # when RAY_DATA_SHUFFLE_PROFILE is enabled. None when profiling is off.
+    shuffle_stage_timings_s: Optional[Dict[str, float]] = None
     # Time spent serializing this block into a Ray object.
     block_ser_time_s: Optional[float] = None
     # Total CPU time consumed by the worker process during the task, across all threads.
     cpu_time_s: Optional[float] = None
-    # Optional per-stage timings/counters captured when shuffle profiling is
-    # enabled (RAY_DATA_SHUFFLE_PROFILE=1).  None when profiling is off — this
-    # keeps the field invisible to ds.stats() rendering on the default path.
-    shuffle_stage_timings_s: Optional[Dict[str, float]] = None
 
     @staticmethod
     def builder() -> "_BlockExecStatsBuilder":

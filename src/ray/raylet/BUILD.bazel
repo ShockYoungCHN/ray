@@ -377,6 +377,7 @@ ray_cc_binary(
         "//src/ray/core_worker_rpc_client:core_worker_client_pool",
         "//src/ray/gcs_rpc_client:gcs_client",
         "//src/ray/object_manager:ownership_object_directory",
+        "//src/ray/object_manager:pull_manager",
         "//src/ray/object_manager_rpc_client:object_manager_client",
         "//src/ray/raylet/scheduling:cluster_lease_manager",
         "//src/ray/raylet_rpc_client:raylet_client_lib",

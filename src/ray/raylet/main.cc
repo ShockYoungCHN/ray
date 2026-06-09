@@ -41,6 +41,7 @@
 #include "ray/core_worker_rpc_client/core_worker_client_pool.h"
 #include "ray/gcs_rpc_client/gcs_client.h"
 #include "ray/object_manager/ownership_object_directory.h"
+#include "ray/object_manager/pull_manager.h"
 #include "ray/object_manager_rpc_client/object_manager_client.h"
 #include "ray/raylet/local_object_manager.h"
 #include "ray/raylet/local_object_manager_interface.h"
@@ -1116,6 +1117,9 @@ int main(int argc, char *argv[]) {
     // tooling rather than the dashboard event pipeline.
     if (!log_dir.empty()) {
       ray::raylet::InitSpillEventLogger(log_dir);
+      // Sibling logger for bundle-pull telemetry. Same rationale: high
+      // volume + structured + analyzed offline.  See pull_manager.cc.
+      ray::InitPullEventLogger(log_dir);
     }
 
     ray::rpc::GcsNodeInfo self_node_info;

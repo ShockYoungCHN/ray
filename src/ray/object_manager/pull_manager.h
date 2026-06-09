@@ -15,6 +15,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_set>
@@ -24,6 +25,7 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "ray/common/id.h"
 #include "ray/common/ray_object.h"
 #include "ray/object_manager/common.h"
@@ -221,13 +223,34 @@ class PullManager {
   /// A helper structure for tracking information about each ongoing bundle pull request.
   struct BundlePullRequest {
     BundlePullRequest(std::vector<ObjectID> requested_objects, TaskMetricsKey task_key)
-        : objects_(std::move(requested_objects)), task_key_(std::move(task_key)) {}
+        : objects_(std::move(requested_objects)),
+          task_key_(std::move(task_key)),
+          subscribe_start_time(absl::Now()) {}
     // All the objects that this bundle is trying to pull.
     std::vector<ObjectID> objects_;
     // All the objects that are pullable.
     absl::flat_hash_set<ObjectID> pullable_objects_;
     // The name of the task, if a task arg request, otherwise the empty string.
     TaskMetricsKey task_key_;
+
+    // Wall-clock at bundle construction; used as T0 for bundle-locate latency.
+    absl::Time subscribe_start_time;
+    // First time the bundle transitioned to fully pullable (T1). Set exactly
+    // once; later toggles (spill/restore churn) do not overwrite, so the
+    // value always reflects the *initial* time-to-pullable.
+    std::optional<absl::Time> pullable_time;
+    // First time the bundle was moved from `inactive_requests` into
+    // `active_requests` by ActivateNextBundlePullRequest (T2 — passed plasma
+    // quota check, pull RPCs actually fired). Set exactly once.
+    std::optional<absl::Time> active_time;
+    // First time every object in the bundle was reported as locally sealed
+    // (T3 — bundle is fully fetched and the consumer can mmap all objects).
+    // Set exactly once.
+    std::optional<absl::Time> complete_time;
+    // Objects that have already been reported as locally sealed at least
+    // once. De-dupes the OnLocationChange path (which may fire multiple
+    // times per object) for the complete-time accounting.
+    absl::flat_hash_set<ObjectID> local_objects_;
 
     void MarkObjectAsPullable(const ObjectID &object) {
       pullable_objects_.emplace(object);
@@ -237,9 +260,24 @@ class PullManager {
       pullable_objects_.erase(object);
     }
 
+    // Idempotent: only the first transition counts. Returns true iff this
+    // call was the one that flipped the bundle to fully-local (caller emits
+    // the bundle_complete event).
+    bool MarkObjectAsLocal(const ObjectID &object) {
+      const bool was_complete = IsComplete();
+      local_objects_.emplace(object);
+      return !was_complete && IsComplete();
+    }
+
     // A bundle is pullable if we know the sizes of all objects
     // and none of them is pending creation due to object reconstruction.
     bool IsPullable() const { return pullable_objects_.size() == objects_.size(); }
+
+    // A bundle is complete when every object has been confirmed sealed in
+    // the local plasma store at least once.
+    bool IsComplete() const {
+      return !objects_.empty() && local_objects_.size() == objects_.size();
+    }
   };
 
   /// A helper structure for tracking all the bundle pull requests for a particular bundle
@@ -532,4 +570,13 @@ class PullManager {
   friend class PullManagerTestWithCapacity;
   friend class PullManagerWithAdmissionControlTest;
 };
+
+// Initialize the dedicated pull-events log file. Path resolution:
+//   1. RAY_PULL_EVENTS_LOG_PATH env var, if set.
+//   2. Fallback: /tmp/raylet_pull_events.out.
+// Idempotent — second and later calls are no-ops. Mirrors
+// InitSpillEventLogger so per-node analysis tooling can ingest both files
+// in the same way.
+void InitPullEventLogger(const std::string &fallback_log_dir);
+
 }  // namespace ray

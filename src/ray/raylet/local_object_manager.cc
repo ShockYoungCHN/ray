@@ -296,7 +296,7 @@ bool LocalObjectManager::TryToSpillObjects(SpillTrigger trigger) {
   auto start_time = absl::GetCurrentTimeNanos();
   SpillObjectsInternal(
       objects_to_spill,
-      [this, bytes_to_spill, objects_to_spill, start_time](const Status &status) {
+      [this, bytes_to_spill, objects_to_spill, start_time, trigger](const Status &status) {
         // NOTE: this is the throughput/log callback; the per-object metric emission
         // happens inside SpillObjectsInternal → OnObjectSpilled which already has
         // access to the trigger.
@@ -335,6 +335,13 @@ bool LocalObjectManager::TryToSpillObjects(SpillTrigger trigger) {
             }
           }
           last_spill_finish_ns_ = now;
+
+
+          EmitSpillEvent("fn=SpillObjectsInternal spill bytes={}, duration={}, objCnt={}, type={}",
+                         bytes_to_spill,
+                         (now - start_time) / 1e6,
+                         objects_to_spill.size(),
+                         SpillTriggerToString(trigger));
         }
       },
       trigger);
@@ -524,20 +531,20 @@ void LocalObjectManager::OnObjectSpilled(const std::vector<ObjectID> &object_ids
     // already freed during the spill — fall back to kUnknown.
     // todo: how about secondary copy?
     auto freed_it = local_objects_.find(object_id);
-    ObjectCreatorType creator_type = ObjectCreatorType::kUnknown;
+    // ObjectCreatorType creator_type = ObjectCreatorType::kUnknown;
     if (freed_it != local_objects_.end()) {
       freed_it->second.spill_completion_ns_ = completion_ns;
       freed_it->second.last_spill_trigger_ = trigger;
-      creator_type = freed_it->second.creator_type_;
+      // creator_type = freed_it->second.creator_type_;
     }
     // Aggregated post-run by scanning `raylet_spill_events.out` across nodes —
     // the OTel-Histogram→Prometheus path was unreliable, this file is the
     // authoritative source for spill analytics.
-    EmitSpillEvent("phase=spilled object_id={} size={} trigger={} creator={}",
-                   object_id.Hex(),
-                   object_size,
-                   trigger_label,
-                   ObjectCreatorTypeToString(creator_type));
+    // EmitSpillEvent("phase=spilled object_id={} size={} trigger={} creator={}",
+    //                object_id.Hex(),
+    //                object_size,
+    //                trigger_label,
+    //                ObjectCreatorTypeToString(creator_type));
 
     // Asynchronously Update the spilled URL.
     if (freed_it == local_objects_.end() || freed_it->second.is_freed_) {

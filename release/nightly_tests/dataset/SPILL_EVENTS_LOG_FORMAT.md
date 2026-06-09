@@ -17,7 +17,10 @@ The benchmark drivers in this directory propagate `RAY_SPILL_EVENTS_LOG_PATH`
 to every Ray worker via `runtime_env` so all nodes converge on the same path.
 **The file is append-only across raylet restarts** (`spdlog::basic_logger_st(..., truncate=false)`),
 so a single file can span multiple Ray sessions — timestamps are absolute and
-disambiguate runs.
+disambiguate runs. `benchmark_ooc_shuffle.py` truncates the file on every node
+before its workload starts (fan-out via NodeAffinity Ray task), so each run's
+analysis sees only that run's events; pass `--no-truncate-spill-log` to keep
+the append-across-sessions behavior.
 
 `aggregate_observ_spill.py` fans out a Ray task to every node, reads the local
 file, and aggregates centrally. To gather logs externally use SSH or
@@ -82,6 +85,7 @@ them.
 | `TryToSpillObjects` | `trigger=<…>` `pinned=<int>` `pending=<int>` | `LocalObjectManager::TryToSpillObjects` entry (`local_object_manager.cc:246`). `pinned` = current pinned object count, `pending` = currently in-flight spill count. |
 | `OnObjectSpilled` | `n_ids=<int>` `reply_urls=<int>` `trigger=<…>` | Spill IO worker has reported back to LOM (`local_object_manager.cc:487`). `n_ids` = batch size, `reply_urls` = URL count returned. |
 | `ProcessSpilledObjectsDeleteQueue` | `queue_size=<int>` `max_batch=<int>` | Periodic deletion sweep entry (`local_object_manager.cc:635`). |
+| `SpillObjectsInternal` | `bytes=<int>` `duration=<float_ms>` `objCnt=<int>` `type=<EvictionOnCreate\|ThresholdMonitor\|ExplicitApi>` | Emitted from `LocalObjectManager::SpillObjectsInternal` after the per-batch spill submission. `bytes` is the total bytes selected for this batch, `duration` is the wall-clock spent inside `SpillObjectsInternal` so far in milliseconds (`(now - start_time) / 1e6`), `objCnt` is the number of objects in the batch, and `type` is the originating spill trigger. **Format quirks** — this is the only line where (a) the literal word `spill` appears between `fn=...` and the first kv (no `=`, so the canonical `KV_RE` silently drops it), and (b) numeric values carry trailing commas (`bytes=12345,`). The aggregator's `_parse_kvs` now strips trailing commas; any new parser must do the same before casting. |
 
 Use these as "session boundaries" — anything between two
 `fn=SpillObjectUptoMaxThroughput` lines belongs to one logical spill

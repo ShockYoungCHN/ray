@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import time
+from typing import List
 from datetime import datetime
 
 import ray
@@ -45,6 +46,41 @@ STRATEGY_MAP = {
 
 KEY_COLUMNS = ["column00"]  # l_orderkey
 APPROX_BYTES_PER_ROW = 145
+
+
+def _truncate_event_logs_on_all_nodes(paths: List[str]) -> None:
+    """Truncate each path in ``paths`` on every alive node so each benchmark
+    run starts with clean event log files instead of appending to whatever
+    previous runs in this raylet session left behind.
+
+    Safe to call while the raylet has the files open: spdlog opens them with
+    O_APPEND, so subsequent writes seek to end-of-file (now offset 0) and
+    just continue from there. Used for both raylet_spill_events.out and
+    raylet_pull_events.out — same semantics, same truncation policy.
+    """
+    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+    @ray.remote(num_cpus=0)
+    def _truncate(target_paths: List[str]) -> List[str]:
+        ip = ray.util.get_node_ip_address()
+        out = []
+        for path in target_paths:
+            try:
+                with open(path, "w"):
+                    pass
+                out.append(f"{ip}: truncated {path}")
+            except OSError as e:
+                out.append(f"{ip}: FAILED to truncate {path}: {e}")
+        return out
+
+    nodes = [n for n in ray.nodes() if n.get("Alive")]
+    futures = []
+    for n in nodes:
+        sched = NodeAffinitySchedulingStrategy(node_id=n["NodeID"], soft=False)
+        futures.append(_truncate.options(scheduling_strategy=sched).remote(paths))
+    for lines in ray.get(futures):
+        for line in lines:
+            print(f"  [event-log] {line}", flush=True)
 
 
 def pick_sf(data_size_gb):
@@ -138,6 +174,14 @@ def main():
         help="If set, dump ray.timeline() (Chrome trace) to this path after the"
         " workload, for task:store_outputs / task:execute phase analysis.",
     )
+    parser.add_argument(
+        "--no-truncate-spill-log", action="store_true",
+        help="By default each run truncates BOTH raylet_spill_events.out and"
+        " raylet_pull_events.out on every node so post-run analysis sees only"
+        " this run's events. Pass this flag to keep spdlog's default"
+        " append-across-sessions behavior for both files. (Flag name kept for"
+        " backward compatibility; it now covers all raylet event logs.)",
+    )
     args = parser.parse_args()
 
     # Define unique experiment output directory
@@ -145,21 +189,26 @@ def main():
     experiment_dir = os.path.join(default_output_dir(), ts_str)
     os.makedirs(experiment_dir, exist_ok=True)
 
-    # Fixed log path for all nodes (mandatory for C++)
-    # Two options usually:
-    # 1. /home/ray/default/raylet_spill_events.out
-    # 2. /tmp/raylet_spill_events.out
+    # Fixed event log paths for all nodes (raylet picks them up via env vars
+    # set in main.cc; defaults to /tmp/raylet_*_events.out if unset).
     spill_log_path = "/tmp/raylet_spill_events.out"
+    pull_log_path = "/tmp/raylet_pull_events.out"
 
     forwarded_env_vars = {
         k: os.environ[k] for k in _WORKER_ENV_VARS_TO_FORWARD if k in os.environ
     }
-    # Mandate the spill log path for all workers and nodes
+    # Mandate the event log paths for all workers and nodes.
     forwarded_env_vars["RAY_SPILL_EVENTS_LOG_PATH"] = spill_log_path
-    
+    forwarded_env_vars["RAY_PULL_EVENTS_LOG_PATH"] = pull_log_path
+
     runtime_env = {"env_vars": forwarded_env_vars}
     print(f"Forwarding env vars to workers: {forwarded_env_vars}")
     ray.init(address="auto", runtime_env=runtime_env)
+
+    if not args.no_truncate_spill_log:
+        event_log_paths = [spill_log_path, pull_log_path]
+        print(f"Truncating event logs {event_log_paths} on all alive nodes ...", flush=True)
+        _truncate_event_logs_on_all_nodes(event_log_paths)
 
     cluster = ray.cluster_resources()
     total_cpu = cluster.get("CPU", 0)

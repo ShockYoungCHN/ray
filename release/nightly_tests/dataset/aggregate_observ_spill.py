@@ -42,7 +42,11 @@ DEFAULT_LOG_DIR = "/home/ray/default/benchmark_logs"
 
 
 def _parse_kvs(s: str) -> Dict[str, str]:
-    return dict(KV_RE.findall(s))
+    # `fn=SpillObjectsInternal spill bytes=<int>, duration=<ms>, objCnt=<int>, type=<trigger>`
+    # is the only line where values carry trailing commas (the rest of the log
+    # is space-separated bare tokens). Strip them so callers can `float(...)`
+    # the numeric fields uniformly.
+    return {k: v.rstrip(",") for k, v in KV_RE.findall(s)}
 
 
 @ray.remote(num_cpus=0)

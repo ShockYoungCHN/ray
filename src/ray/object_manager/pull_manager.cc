@@ -15,14 +15,128 @@
 #include "ray/object_manager/pull_manager.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <filesystem>
 #include <string>
+#include <system_error>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "ray/common/ray_config.h"
+#include "ray/util/logging.h"
+#include "spdlog/sinks/basic_file_sink.h"
+#include "spdlog/spdlog.h"
 
 namespace ray {
+
+namespace {
+
+// Lazily-initialized dedicated logger for pull telemetry. Mirrors the spill
+// event logger pattern in local_object_manager.cc — function-local static so
+// tests that don't call InitPullEventLogger silently get a no-op.
+std::shared_ptr<spdlog::logger> &MutablePullEventLogger() {
+  static std::shared_ptr<spdlog::logger> logger;
+  return logger;
+}
+
+// Emit a structured event to the dedicated pull-events file. No-op when the
+// logger hasn't been initialized. One line per call; format is
+// `<unix_seconds>.<microseconds> key=val key=val ...` (set by the spdlog
+// pattern in InitPullEventLogger), parallel to the spill-events format.
+template <typename... Args>
+void EmitPullEvent(fmt::format_string<Args...> fmt, Args &&...args) {
+  auto &lg = MutablePullEventLogger();
+  if (lg) {
+    lg->info(fmt, std::forward<Args>(args)...);
+  }
+}
+
+// Single place that decides T1 has fired and writes the event line. Safe to
+// call from both the warm-construct path in Pull() and OnLocationChange's
+// MarkBundleAsPullable site — emits exactly once per bundle since the caller
+// only sets `pullable_time` once.
+void RecordBundleLocateLatency(uint64_t request_id,
+                               size_t bundle_size,
+                               absl::Duration latency,
+                               bool was_warm_on_construct,
+                               const std::string &task_name) {
+  EmitPullEvent(
+      "phase=bundle_locate req_id={} bundle_size={} latency_ms={} warm={} task={}",
+      request_id,
+      bundle_size,
+      absl::ToDoubleMilliseconds(latency),
+      was_warm_on_construct ? 1 : 0,
+      task_name.empty() ? "-" : task_name);
+}
+
+// T1 -> T2 latency: time the bundle spent waiting in `inactive_requests` for
+// plasma quota to free up before being activated. Large values point at
+// plasma-quota backpressure (bundle is pullable but we can't afford the
+// memory yet).
+void RecordBundleActiveLatency(uint64_t request_id,
+                               size_t bundle_size,
+                               absl::Duration wait,
+                               const std::string &task_name) {
+  EmitPullEvent(
+      "phase=bundle_active req_id={} bundle_size={} wait_ms={} task={}",
+      request_id,
+      bundle_size,
+      absl::ToDoubleMilliseconds(wait),
+      task_name.empty() ? "-" : task_name);
+}
+
+// T1 -> T3 latency: total transfer time from "all locations resolved" until
+// every object is sealed in local plasma. Combined with bundle_locate
+// (T0 -> T1) this gives the full raylet-side fetch wall time.
+// `transfer_ms` here is from pullable -> complete, i.e. excluding location
+// discovery; `total_ms` includes location discovery.
+void RecordBundleCompleteLatency(uint64_t request_id,
+                                 size_t bundle_size,
+                                 absl::Duration transfer,
+                                 absl::Duration total,
+                                 const std::string &task_name) {
+  EmitPullEvent(
+      "phase=bundle_complete req_id={} bundle_size={} transfer_ms={} "
+      "total_ms={} task={}",
+      request_id,
+      bundle_size,
+      absl::ToDoubleMilliseconds(transfer),
+      absl::ToDoubleMilliseconds(total),
+      task_name.empty() ? "-" : task_name);
+}
+
+}  // namespace
+
+void InitPullEventLogger(const std::string &fallback_log_dir) {
+  if (MutablePullEventLogger()) {
+    return;
+  }
+
+  std::string path;
+  const char *env_path = std::getenv("RAY_PULL_EVENTS_LOG_PATH");
+  if (env_path != nullptr && *env_path != '\0') {
+    path = env_path;
+  } else {
+    path = "/tmp/raylet_pull_events.out";
+  }
+
+  std::error_code mkdir_ec;
+  std::filesystem::path fs_path(path);
+  if (fs_path.has_parent_path()) {
+    std::filesystem::create_directories(fs_path.parent_path(), mkdir_ec);
+  }
+
+  RAY_LOG(INFO) << "Initializing pull event logger at " << path;
+
+  auto lg = spdlog::basic_logger_st("raylet_pull_events", path, /*truncate=*/false);
+  lg->set_pattern("%E.%f %v");
+  lg->set_level(spdlog::level::info);
+  lg->flush_on(spdlog::level::info);
+  MutablePullEventLogger() = lg;
+}
 
 PullManager::PullManager(
     NodeID self_node_id,
@@ -86,8 +200,44 @@ uint64_t PullManager::Pull(const std::vector<rpc::ObjectReference> &object_ref_b
       if (it->second.IsPullable()) {
         bundle_pull_request.MarkObjectAsPullable(obj_id);
       }
+      // If the object is already sealed in our local plasma at construction
+      // time (warm path), record it on the bundle so the bundle_complete
+      // emit below can fire with zero latency instead of waiting for an
+      // OnLocationChange that may never come for already-local objects.
+      if (object_is_local_(obj_id)) {
+        bundle_pull_request.MarkObjectAsLocal(obj_id);
+      }
     }
     it->second.bundle_request_ids.insert(req_id);
+  }
+
+  // T1 fast path: if the bundle is already pullable at construction time
+  // (every object's location/size was already known from prior pulls),
+  // `AddBundlePullRequest` short-circuits straight into `inactive_requests`
+  // without ever routing through `OnLocationChange -> MarkBundleAsPullable`.
+  // We have to record the (zero-latency) event here, otherwise warm bundles
+  // are silently dropped from telemetry. Skip empty bundles (no objects =>
+  // trivially pullable but meaningless to measure).
+  const bool warm_on_construct =
+      !bundle_pull_request.objects_.empty() && bundle_pull_request.IsPullable();
+  if (warm_on_construct) {
+    bundle_pull_request.pullable_time = bundle_pull_request.subscribe_start_time;
+    RecordBundleLocateLatency(req_id,
+                              bundle_pull_request.objects_.size(),
+                              absl::ZeroDuration(),
+                              /*was_warm_on_construct=*/true,
+                              bundle_pull_request.task_key_.first);
+    // If every object was also already local at construction, the bundle is
+    // already complete; emit a zero-latency bundle_complete event so warm
+    // bundles aren't silently absent from the complete-latency distribution.
+    if (bundle_pull_request.IsComplete()) {
+      bundle_pull_request.complete_time = bundle_pull_request.subscribe_start_time;
+      RecordBundleCompleteLatency(req_id,
+                                  bundle_pull_request.objects_.size(),
+                                  absl::ZeroDuration(),
+                                  absl::ZeroDuration(),
+                                  bundle_pull_request.task_key_.first);
+    }
   }
 
   if (prio == BundlePriority::GET_REQUEST) {
@@ -172,6 +322,26 @@ bool PullManager::ActivateNextBundlePullRequest(BundlePullRequestQueue &bundles,
   }
 
   bundles.ActivateBundlePullRequest(next_request_id);
+
+  // T2: bundle just passed the plasma quota check and is now being pulled.
+  // Record the activation wait (T1 -> T2) exactly once per bundle. Pullable
+  // bundles that get deactivated and re-activated will not be re-counted
+  // here — the `!active_time.has_value()` guard locks the value to the
+  // first activation. Use the non-const accessor since we just looked the
+  // bundle up via const ref above; the mutation is bookkeeping only.
+  auto &mutable_request = map_find_or_die(bundles.requests, next_request_id);
+  if (!mutable_request.active_time.has_value()) {
+    const absl::Time now = absl::Now();
+    mutable_request.active_time = now;
+    const absl::Duration wait =
+        mutable_request.pullable_time.has_value()
+            ? (now - *mutable_request.pullable_time)
+            : absl::ZeroDuration();
+    RecordBundleActiveLatency(next_request_id,
+                              mutable_request.objects_.size(),
+                              wait,
+                              mutable_request.task_key_.first);
+  }
 
   num_active_bundles_ += 1;
   return true;
@@ -412,6 +582,20 @@ void PullManager::OnLocationChange(const ObjectID &object_id,
         bundle_it->second.MarkObjectAsPullable(object_id);
         if (bundle_it->second.IsPullable()) {
           bundles.MarkBundleAsPullable(bundle_request_id);
+          // T1 slow path: record exactly the first time this bundle reaches
+          // fully-pullable. Later spill/restore churn (false->true->false->true)
+          // re-enters this branch — guarded by the `!pullable_time` check so
+          // we never overwrite the initial transition.
+          if (!bundle_it->second.pullable_time.has_value()) {
+            const absl::Time now = absl::Now();
+            bundle_it->second.pullable_time = now;
+            RecordBundleLocateLatency(
+                bundle_request_id,
+                bundle_it->second.objects_.size(),
+                now - bundle_it->second.subscribe_start_time,
+                /*was_warm_on_construct=*/false,
+                bundle_it->second.task_key_.first);
+          }
         }
       } else {
         bundle_it->second.MarkObjectAsUnpullable(object_id);
@@ -432,6 +616,41 @@ void PullManager::OnLocationChange(const ObjectID &object_id,
     UpdatePullsBasedOnAvailableMemory(num_bytes_available_);
     RAY_LOG(DEBUG) << "Updated location of " << object_id
                    << ", num bytes being pulled is now " << num_bytes_being_pulled_;
+  }
+
+  // T3 hook: an OnLocationChange may fire because the object just got sealed
+  // in our local plasma (object_directory broadcasts our own holdership too).
+  // Independently of the pullable-transition branch above, walk every bundle
+  // that has this object and mark it locally available. The first time a
+  // bundle hits fully-local, emit phase=bundle_complete with the transfer
+  // and end-to-end durations relative to T1 (pullable) and T0 (subscribe).
+  if (object_is_local_(object_id)) {
+    for (auto &bundle_request_id : it->second.bundle_request_ids) {
+      BundlePullRequestQueue &bundles = GetBundlePullRequestQueue(bundle_request_id);
+      auto bundle_it = bundles.requests.find(bundle_request_id);
+      if (bundle_it == bundles.requests.end()) {
+        // Bundle was cancelled between the OnLocationChange enqueue and now.
+        continue;
+      }
+      const bool became_complete = bundle_it->second.MarkObjectAsLocal(object_id);
+      if (became_complete && !bundle_it->second.complete_time.has_value()) {
+        const absl::Time now = absl::Now();
+        bundle_it->second.complete_time = now;
+        // Transfer phase = pullable -> complete. If the bundle was warm on
+        // construct (pullable_time == subscribe_start_time), transfer ≈ total.
+        const absl::Duration transfer =
+            bundle_it->second.pullable_time.has_value()
+                ? (now - *bundle_it->second.pullable_time)
+                : absl::ZeroDuration();
+        const absl::Duration total =
+            now - bundle_it->second.subscribe_start_time;
+        RecordBundleCompleteLatency(bundle_request_id,
+                                    bundle_it->second.objects_.size(),
+                                    transfer,
+                                    total,
+                                    bundle_it->second.task_key_.first);
+      }
+    }
   }
 
   RAY_LOG(DEBUG) << object_id << " OnLocationChange " << spilled_url << " num clients "
