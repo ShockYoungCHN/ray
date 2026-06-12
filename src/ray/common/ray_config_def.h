@@ -375,6 +375,12 @@ RAY_CONFIG(int, object_manager_timer_freq_ms, 100)
 /// ObjectManager.
 RAY_CONFIG(int, object_manager_pull_timeout_ms, 10000)
 
+/// When true, raylet initializes the pull-event logger that writes structured
+/// bundle-pull telemetry (one line per event) to <log_dir>/raylet_pull_events.out.
+/// When false (default), the logger is left uninitialized and EmitPullEvent is
+/// a no-op (dump to nowhere) — all call sites pay only a single nullptr check.
+RAY_CONFIG(bool, pull_manager_event_log_enabled, false)
+
 /// Timeout, in milliseconds, to wait until the Push request fails.
 /// Special value:
 /// Negative: waiting infinitely.

@@ -1119,7 +1119,9 @@ int main(int argc, char *argv[]) {
       ray::raylet::InitSpillEventLogger(log_dir);
       // Sibling logger for bundle-pull telemetry. Same rationale: high
       // volume + structured + analyzed offline.  See pull_manager.cc.
-      ray::InitPullEventLogger(log_dir);
+      if (RayConfig::instance().pull_manager_event_log_enabled()) {
+        ray::InitPullEventLogger(log_dir);
+      }
     }
 
     ray::rpc::GcsNodeInfo self_node_info;
