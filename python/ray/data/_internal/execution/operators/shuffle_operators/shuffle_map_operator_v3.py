@@ -184,9 +184,9 @@ class ShuffleMapOpV3(
             refs.destroy_if_owned()
             return
         node_id = self._pick_target_node(refs)
-        self._submit_map_task(refs, target_node_id=node_id)
+        self._submit_shuffle_map_task(refs, target_node_id=node_id)
 
-    def _submit_map_task(
+    def _submit_shuffle_map_task(
         self,
         input_bundle: RefBundle,
         *,

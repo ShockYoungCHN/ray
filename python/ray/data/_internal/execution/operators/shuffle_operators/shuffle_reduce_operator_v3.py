@@ -130,7 +130,6 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
         # -- Sub-progress bar --
         self._reduce_bar: Optional["BaseProgressBar"] = None
 
-    # ─────────────────────────── PhysicalOperator API ───────────────────────
     def _add_input_inner(self, refs: RefBundle, input_index: int) -> None:
         """Each upstream bundle is one mapper's ShuffleHandle ref. Just
         accumulate; the reducer dispatch happens once map closes."""
