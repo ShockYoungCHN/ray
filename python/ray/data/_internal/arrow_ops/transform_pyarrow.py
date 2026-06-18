@@ -136,6 +136,7 @@ def _hash_partition(
     return partitions
 
 
+# todo: this operator could be rewritten in rust, and default hash function should be deterministic
 def hash_partition(
     table: "pyarrow.Table",
     *,

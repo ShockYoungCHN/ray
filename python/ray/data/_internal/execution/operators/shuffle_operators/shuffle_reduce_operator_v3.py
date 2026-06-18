@@ -1,0 +1,355 @@
+"""ShuffleReduceOpV3 — reduce phase of the v3 file-transport hash shuffle.
+
+Consumes the per-mapper ``ShuffleHandle`` bundles emitted by
+``ShuffleMapOpV3`` and, once the map phase is closed, dispatches one
+``v3_reduce_task`` per partition. Each reduce task is a Ray streaming
+generator that yields ``(block, pickled metadata)`` pairs matching the v2
+``_shuffle_reduce_task`` protocol; we wrap each generator in a
+``DataOpTask`` so the executor sees ordinary streaming output bundles.
+
+Key state-machine difference vs. v2:
+
+  * v2 ``ShuffleReduceOp`` receives one bundle PER PARTITION (each
+    containing M shard refs) and launches a reduce task immediately on
+    arrival.
+  * v3 ``ShuffleReduceOpV3`` receives one bundle PER MAPPER (each
+    containing a single ``ShuffleHandle`` ref). It must wait until ALL
+    mapper handles are in (``all_inputs_done``) before launching the N
+    reducers, because every reducer needs the full handle list to pull
+    its partition's bytes from every source node's ``ShuffleManager``.
+
+This mirrors v2's effective behavior — v2's ShuffleMapOp also gates
+``_maybe_emit_partition_bundles`` on ``_inputs_complete``, so reduce can't
+start before map finishes there either; we just push the gathering
+responsibility one operator downstream.
+"""
+
+import functools
+import logging
+import typing
+from collections import deque
+from typing import Any, Dict, List, Optional
+
+import ray
+from ray.data._internal.execution.interfaces import (
+    ExecutionResources,
+    PhysicalOperator,
+    RefBundle,
+)
+from ray.data._internal.execution.interfaces.physical_operator import (
+    DataOpTask,
+    OpTask,
+    TaskExecDriverStats,
+    estimate_total_num_of_blocks,
+)
+from ray.data._internal.execution.operators.hash_shuffle_v3 import (
+    ReduceFn,
+    v3_reduce_task,
+)
+from ray.data._internal.execution.operators.shuffle_operators.shuffle_map_operator_v3 import (  # noqa: E501
+    ShuffleMapOpV3,
+)
+from ray.data._internal.execution.operators.sub_progress import (
+    SubProgressBarMixin,
+)
+from ray.data.block import BlockStats, TaskExecWorkerStats, to_stats
+from ray.data.context import DataContext
+from ray.types import ObjectRef
+
+if typing.TYPE_CHECKING:
+    from ray.data._internal.progress.base_progress import BaseProgressBar
+
+logger = logging.getLogger(__name__)
+
+
+class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
+    """V3 reduce operator. See module docstring."""
+
+    _DEFAULT_REDUCE_NUM_CPUS = 1.0
+    _DEFAULT_MAX_BYTES_PER_FETCH = 256 * 1024 * 1024  # 256 MiB
+
+    def __init__(
+        self,
+        input_op: ShuffleMapOpV3,
+        data_context: DataContext,
+        *,
+        num_partitions: int,
+        reduce_fn: ReduceFn,
+        streaming_reduce: bool = True,
+        disallow_block_splitting: bool = False,
+        max_bytes_per_fetch: int = _DEFAULT_MAX_BYTES_PER_FETCH,
+        reduce_prefetch_dir: Optional[str] = None,
+        reduce_cpus: Optional[float] = None,
+        name: str = "ShuffleReduceV3",
+    ):
+        super().__init__(
+            name=name,
+            input_dependencies=[input_op],
+            data_context=data_context,
+        )
+
+        self._num_partitions: int = num_partitions
+        self._reduce_fn: ReduceFn = reduce_fn
+        # Disallow-block-split forces blocking mode because we must hand the
+        # entire partition to ``reduce_fn`` before emitting any output (e.g.
+        # global sort can't stream-flush).
+        self._disallow_block_splitting: bool = disallow_block_splitting
+        self._streaming_reduce: bool = (
+            streaming_reduce and not disallow_block_splitting
+        )
+        self._max_bytes_per_fetch: int = max_bytes_per_fetch
+        self._reduce_prefetch_dir: Optional[str] = reduce_prefetch_dir
+        self._reduce_num_cpus: float = (
+            reduce_cpus
+            if reduce_cpus is not None
+            else self._DEFAULT_REDUCE_NUM_CPUS
+        )
+
+        # -- Handle accumulation --
+        # Refs we've received from upstream (the ShuffleMapOpV3). One ref
+        # per mapper. We must wait for the upstream to close before
+        # dispatching reducers, because each reducer needs ALL of them.
+        self._handle_refs: List[ObjectRef] = []
+        # Keep the input bundles alive so the handle refs aren't dropped
+        # mid-flight; destroyed on shutdown / completion.
+        self._handle_input_bundles: List[RefBundle] = []
+
+        # -- Reduce task tracking --
+        self._shuffle_reduce_tasks: Dict[int, DataOpTask] = {}
+        self._num_reduce_tasks_submitted: int = 0
+        self._reducers_dispatched: bool = False
+
+        # -- Output queue --
+        # Streaming generator yields (block, pickled metadata) pairs; the
+        # DataOpTask harness assembles each into a RefBundle and our
+        # callback pushes it here.
+        self._output_queue: deque = deque()
+
+        # -- Stats --
+        self._output_blocks_stats: List[BlockStats] = []
+
+        # -- Sub-progress bar --
+        self._reduce_bar: Optional["BaseProgressBar"] = None
+
+    # ─────────────────────────── PhysicalOperator API ───────────────────────
+    def _add_input_inner(self, refs: RefBundle, input_index: int) -> None:
+        """Each upstream bundle is one mapper's ShuffleHandle ref. Just
+        accumulate; the reducer dispatch happens once map closes."""
+        assert input_index == 0
+        if not refs.block_refs:
+            refs.destroy_if_owned()
+            return
+        # Expect exactly one block per mapper bundle (the handle dict).
+        for ref in refs.block_refs:
+            self._handle_refs.append(ref)
+        self._handle_input_bundles.append(refs)
+
+    def all_inputs_done(self) -> None:
+        """Upstream map has finished — dispatch one reduce task per
+        partition. Each task gets the FULL handle list and a specific
+        ``partition_id``; the v3 reduce code uses the handles' index dict
+        to find which (offset, length) ranges to fetch for that partition.
+        """
+        super().all_inputs_done()
+        self._dispatch_all_reducers()
+
+    def _dispatch_all_reducers(self) -> None:
+        if self._reducers_dispatched:
+            return
+        self._reducers_dispatched = True
+
+        if not self._handle_refs:
+            # No mapper produced any handle — nothing to reduce.
+            return
+
+        target_max_block_size = (
+            None
+            if self._disallow_block_splitting
+            else self.data_context.target_max_block_size
+        )
+
+        for partition_id in range(self._num_partitions):
+            self._dispatch_one_reducer(partition_id, target_max_block_size)
+
+    def _dispatch_one_reducer(
+        self, partition_id: int, target_max_block_size: Optional[int]
+    ) -> None:
+        # Memory hint: 2× expected partition size if we had it; for MVP we
+        # leave it unset and let Ray's defaults apply. ``v3_reduce_task``
+        # already streams the fetch + decode, so per-task heap pressure is
+        # bounded by target_max_block_size in streaming mode.
+        reduce_resources: Dict[str, Any] = {"num_cpus": self._reduce_num_cpus}
+        reduce_options: Dict[str, Any] = {
+            **reduce_resources,
+            "scheduling_strategy": "SPREAD",
+            "num_returns": "streaming",
+        }
+
+        block_gen = v3_reduce_task.options(**reduce_options).remote(
+            self._handle_refs,
+            partition_id,
+            self._reduce_fn,
+            self._reduce_prefetch_dir,
+            self._max_bytes_per_fetch,
+            target_max_block_size,
+            self._streaming_reduce,
+        )
+
+        data_task = DataOpTask(
+            task_index=partition_id,
+            streaming_gen=block_gen,
+            output_ready_callback=functools.partial(
+                self._handle_reduce_output_ready, partition_id
+            ),
+            task_done_callback=functools.partial(
+                self._handle_reduce_done, partition_id
+            ),
+            task_resource_bundle=ExecutionResources.from_resource_dict(
+                reduce_resources
+            ),
+            operator_name=self.name,
+        )
+
+        # ShuffleMapOpV3 emits one bundle per mapper, NOT per partition, so
+        # we always start with no prior task for this partition_id.
+        assert partition_id not in self._shuffle_reduce_tasks, (
+            f"partition_id {partition_id} already has an in-flight reducer "
+            f"— ShuffleReduceOpV3 should dispatch each partition exactly once"
+        )
+        self._shuffle_reduce_tasks[partition_id] = data_task
+        self._num_reduce_tasks_submitted += 1
+
+        # For metrics, treat the handle list as this reducer's "input."
+        # We don't have a partition-specific RefBundle (handles cover every
+        # partition), so we just pass a synthetic empty bundle.
+        self._metrics.on_task_submitted(
+            partition_id,
+            RefBundle((), schema=None, owns_blocks=False),
+            task_id=data_task.get_task_id(),
+        )
+
+    def _handle_reduce_output_ready(
+        self, partition_id: int, bundle: RefBundle
+    ) -> None:
+        """Callback for each yielded (block, metadata) pair from a reducer."""
+        self._output_queue.append(bundle)
+        self._metrics.on_output_queued(bundle)
+        self._metrics.on_task_output_generated(
+            task_index=partition_id, output=bundle
+        )
+        _, num_outputs, num_rows = estimate_total_num_of_blocks(
+            self._num_reduce_tasks_submitted,
+            self.upstream_op_num_outputs(),
+            self._metrics,
+            total_num_tasks=self._num_partitions,
+        )
+        self._estimated_num_output_bundles = num_outputs
+        self._estimated_output_num_rows = num_rows
+        if self._reduce_bar is not None:
+            self._reduce_bar.update(
+                increment=bundle.num_rows() or 0,
+                total=self.num_output_rows_total(),
+            )
+
+    def _handle_reduce_done(
+        self,
+        partition_id: int,
+        exc: Optional[Exception],
+        task_exec_stats: Optional[TaskExecWorkerStats],
+        task_exec_driver_stats: Optional[TaskExecDriverStats],
+    ) -> None:
+        """Callback when a reduce streaming generator finishes."""
+        self._shuffle_reduce_tasks.pop(partition_id, None)
+        self._metrics.on_task_finished(
+            task_index=partition_id,
+            exception=exc,
+            task_exec_stats=task_exec_stats,
+            task_exec_driver_stats=task_exec_driver_stats,
+        )
+        if exc:
+            logger.error(
+                "Reduce of partition %d failed: %s",
+                partition_id,
+                exc,
+                exc_info=exc,
+            )
+
+    def has_next(self) -> bool:
+        return len(self._output_queue) > 0
+
+    def _get_next_inner(self) -> RefBundle:
+        bundle: RefBundle = self._output_queue.popleft()
+        self._metrics.on_output_dequeued(bundle)
+        self._output_blocks_stats.extend(to_stats(bundle.metadata))
+        return bundle
+
+    def get_active_tasks(self) -> List[OpTask]:
+        return list(self._shuffle_reduce_tasks.values())
+
+    def has_execution_finished(self) -> bool:
+        if self._shuffle_reduce_tasks or self._output_queue:
+            return False
+        # We also need the reducers to have been DISPATCHED — otherwise we
+        # might "finish" before all_inputs_done has fired (e.g. an empty
+        # upstream).
+        if not self._reducers_dispatched and not self._inputs_complete:
+            return False
+        return super().has_execution_finished()
+
+    def has_completed(self) -> bool:
+        return (
+            not self._shuffle_reduce_tasks
+            and not self._output_queue
+            and self._reducers_dispatched
+            and super().has_completed()
+        )
+
+    def _do_shutdown(self, force: bool = False) -> None:
+        super()._do_shutdown(force)
+        self._shuffle_reduce_tasks.clear()
+        self._output_queue.clear()
+        for bundle in self._handle_input_bundles:
+            bundle.destroy_if_owned()
+        self._handle_input_bundles.clear()
+        self._handle_refs.clear()
+
+    # ───────────────────────────── Stats / progress ─────────────────────────
+    def get_stats(self) -> Dict[str, List[BlockStats]]:
+        return {self._name: self._output_blocks_stats}
+
+    def num_output_rows_total(self) -> Optional[int]:
+        upstream = self.input_dependencies[0]
+        assert isinstance(upstream, ShuffleMapOpV3)
+        return upstream.num_output_rows_total()
+
+    def current_logical_usage(self) -> ExecutionResources:
+        usage = ExecutionResources.zero()
+        for task in self._shuffle_reduce_tasks.values():
+            bundle = task.get_requested_resource_bundle()
+            if bundle is None:
+                continue
+            usage = usage.add(
+                ExecutionResources(cpu=bundle.cpu, memory=bundle.memory)
+            )
+        return usage
+
+    def incremental_resource_usage(self) -> ExecutionResources:
+        # MVP: leave memory hint at 0 (target_max_block_size bounds peak
+        # reducer heap in streaming mode). A future iteration can derive
+        # per-partition byte estimates from the upstream handles.
+        return ExecutionResources(cpu=self._reduce_num_cpus, memory=0)
+
+    def min_scheduling_resources(self) -> ExecutionResources:
+        return self.incremental_resource_usage()
+
+    def progress_str(self) -> str:
+        submitted = self._num_reduce_tasks_submitted
+        done = submitted - len(self._shuffle_reduce_tasks)
+        return f"reduce: {done}/{submitted}"
+
+    def get_sub_progress_bar_names(self) -> Optional[List[str]]:
+        return ["Reduce"]
+
+    def set_sub_progress_bar(self, name: str, pg: "BaseProgressBar") -> None:
+        if name == "Reduce":
+            self._reduce_bar = pg
