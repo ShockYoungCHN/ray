@@ -87,7 +87,18 @@ class ShuffleMapOpV3(
     """V3 map operator. See module docstring."""
 
     _DEFAULT_MAP_NUM_CPUS = 1.0
-    _DEFAULT_POOL_BUDGET_BYTES = 16 * 1024 * 1024  # 16 MiB
+    # Floor for the per-task partition pool budget. Tiny inputs (or inputs
+    # with missing metadata, ``estimated_bytes == 0``) still get a usable
+    # working set; for normal sizes the dynamic ``_POOL_GROWTH × input``
+    # formula always exceeds this.
+    _MIN_POOL_BYTES = 4 * 1024 * 1024  # 4 MiB
+    # Multiplier on the per-task input size when sizing the partition pool.
+    # 2× gives headroom over the naive "output ≈ input" identity (chunked
+    # output, compression overhead pre-encode, partition skew). Higher
+    # numbers don't help — once pool > sum(output_bytes), the extra capacity
+    # is never filled. Lower numbers force mid-task spills proportional to
+    # ``input / pool``, increasing IPC fragmentation on the reducer side.
+    _POOL_GROWTH = 2
 
     def __init__(
         self,
@@ -97,7 +108,7 @@ class ShuffleMapOpV3(
         num_partitions: int,
         partition_fn: PartitionFn,
         compression: ShuffleCompression = None,
-        pool_budget_bytes: int = _DEFAULT_POOL_BUDGET_BYTES,
+        pool_budget_bytes: Optional[int] = None,
         fsync_on_close: bool = True,
         map_cpus: float = _DEFAULT_MAP_NUM_CPUS,
         base_dir: Optional[str] = None,
@@ -112,7 +123,12 @@ class ShuffleMapOpV3(
         self._num_partitions: int = num_partitions
         self._partition_fn: PartitionFn = partition_fn
         self._compression: ShuffleCompression = compression
-        self._pool_budget_bytes: int = pool_budget_bytes
+        # Fixed override of the per-task partition pool budget. ``None`` ⇒
+        # dynamic ``max(_MIN_POOL_BYTES, _POOL_GROWTH × estimated_bytes)``
+        # per task; an explicit int ⇒ use that value for every task
+        # regardless of input size (useful in tests and for capping under
+        # memory pressure).
+        self._pool_budget_override: Optional[int] = pool_budget_bytes
         self._fsync_on_close: bool = fsync_on_close
 
         # -- Map task config --
@@ -203,12 +219,26 @@ class ShuffleMapOpV3(
             (m.size_bytes or 0) for m in input_bundle.metadata
         )
 
-        # memory usage is input block in memory + transient partition spike
-        # (capped further by pool_budget_bytes inside v3_map_task).
-        # 2x memory usage is a safe upper bound
+        # Per-task pool budget: explicit override wins, otherwise dynamic
+        # ``max(_MIN_POOL_BYTES, _POOL_GROWTH × estimated_bytes)``. A
+        # 2× growth factor sized to the known input avoids the fixed-pool
+        # pathology where small inputs over-allocate and large inputs spill
+        # ``input / pool`` times mid-task; see class-level constants.
+        if self._pool_budget_override is not None:
+            pool_budget_bytes = self._pool_budget_override
+        else:
+            pool_budget_bytes = max(
+                self._MIN_POOL_BYTES,
+                self._POOL_GROWTH * estimated_bytes,
+            )
+
+        # Memory ask = input block resident in worker heap + transient
+        # partition output held in the pool. ``v3_map_task`` enforces the
+        # pool cap internally, so this is a tight upper bound (not a 2×
+        # guess like before).
         resources: Dict[str, Any] = {"num_cpus": self._map_num_cpus}
         if estimated_bytes > 0:
-            resources["memory"] = estimated_bytes * 2
+            resources["memory"] = estimated_bytes + pool_budget_bytes
 
         ray_options: Dict[str, Any] = dict(resources)
         if target_node_id is not None:
@@ -228,7 +258,7 @@ class ShuffleMapOpV3(
             map_id=map_id,
             shuffle_id=self._shuffle_id,
             token=self._token,
-            pool_budget_bytes=self._pool_budget_bytes,
+            pool_budget_bytes=pool_budget_bytes,
             compression=self._compression,
             fsync_on_close=self._fsync_on_close,
         )
