@@ -26,7 +26,6 @@ through v3" path; planner glue and join/multi-seq are follow-up work.
 import functools
 import logging
 import secrets
-import shutil
 import tempfile
 import typing
 from typing import Any, Dict, List, Optional
@@ -54,7 +53,6 @@ from ray.data._internal.execution.operators.base_physical_operator import (
 from ray.data._internal.execution.operators.hash_shuffle_v3 import (
     PartitionFn,
     ShuffleCompression,
-    ShuffleManager,
     v3_map_task,
 )
 from ray.data._internal.execution.operators.sub_progress import (
@@ -121,9 +119,14 @@ class ShuffleMapOpV3(
         self._map_num_cpus: float = map_cpus
 
         # -- On-disk staging --
-        # One ``base_dir`` shared by all mappers + the per-node ShuffleManager;
-        # we tear it down in ``_do_shutdown``. Caller can override (e.g. to
-        # point at a fast local SSD / tmpfs) — otherwise a per-op tempdir.
+        # ``base_dir`` is just a directory-name template — each node mkdirs
+        # the same path on its OWN local FS. Driver doesn't own anything on
+        # remote disks. We DON'T rmtree on shutdown: the lifecycle of
+        # mapper files is bound to the ShuffleManager actor (one per node),
+        # which is itself Ray-ref-counted via the ``manager`` ActorHandle
+        # embedded in each emitted ShuffleHandle dict. When all reducer
+        # bundles drop their handle refs, the actor dies; OS reclaims the
+        # /tmp dir at job teardown / reboot.
         self._owns_base_dir = base_dir is None
         self._base_dir: str = base_dir or tempfile.mkdtemp(
             prefix="ray_shuffle_v3_"
@@ -132,12 +135,10 @@ class ShuffleMapOpV3(
         # other token. Cheap defense against accidental cross-shuffle reads
         # by misrouted reducers in a shared cluster.
         self._token: str = secrets.token_hex(16)
-
-        # -- Per-node ShuffleManager registry --
-        # node_id → ShuffleManager actor handle (lazily populated)
-        self._managers: Dict[str, "ray.actor.ActorHandle"] = {}
-        # node_id → (host, port) cached endpoint
-        self._endpoints: Dict[str, "typing.Tuple[str, int]"] = {}
+        # Stable per-op id used as the named-actor suffix for the
+        # ShuffleManager on each node. Mappers do ``get_if_exists=True`` so
+        # the FIRST mapper on a node spawns; the rest share the same actor.
+        self._shuffle_id: str = secrets.token_hex(8)
 
         # -- Map task tracking --
         self._next_map_idx: int = 0
@@ -157,7 +158,7 @@ class ShuffleMapOpV3(
         # -- Sub-progress bar --
         self._map_bar: Optional["BaseProgressBar"] = None
 
-    # ──────────────────────────── Queue plumbing ────────────────────────────
+    # Queue plumbing
     @property
     def _input_queues(self) -> List[BaseBundleQueue]:
         return []
@@ -166,55 +167,35 @@ class ShuffleMapOpV3(
     def _output_queues(self) -> List[BaseBundleQueue]:
         return [self._output_queue]
 
-    # ──────────────────────── ShuffleManager bootstrap ──────────────────────
-    def _ensure_manager(self, node_id: str) -> "ray.actor.ActorHandle":
-        """Spawn a ``ShuffleManager`` actor pinned to ``node_id`` if missing.
-
-        Per-node managers are mandatory: each map task writes its
-        ``map_{i}.shf`` to LOCAL disk on whatever node Ray schedules it on,
-        and the handle's endpoint must point at that node's manager so the
-        reducer can fetch over the side-channel.
+    def _pick_target_node(self, refs: RefBundle) -> Optional[str]:
+        """Choose a target node hint for the map task, preferring input-block
+        locality. Returns None when there's no locality info — caller then
+        skips NodeAffinity and lets Ray schedule on any available node
+        (which then spawns its own local ShuffleManager via get_if_exists).
         """
-        if node_id in self._managers:
-            return self._managers[node_id]
-        actor = ShuffleManager.options(
-            scheduling_strategy=NodeAffinitySchedulingStrategy(
-                node_id, soft=False
-            ),
-            num_cpus=0,
-        ).remote(self._base_dir, self._token)
-        self._managers[node_id] = actor
-        self._endpoints[node_id] = ray.get(actor.endpoint.remote())
-        return actor
-
-    def _pick_target_node(self, refs: RefBundle) -> str:
-        """Choose a node to run the map task on, preferring input-block
-        locality. Falls back to this driver's node if upstream metadata has
-        no location preference."""
         prefer_locs = refs.get_preferred_object_locations()
         if prefer_locs:
             return max(prefer_locs, key=lambda n: prefer_locs[n])
-        # No upstream locality info — schedule on the driver's node so the
-        # ShuffleManager (which we spawn there) has local access.
-        return ray.get_runtime_context().get_node_id()
+        return None
 
-    # ─────────────────────────── PhysicalOperator API ───────────────────────
     def _add_input_inner(self, refs: RefBundle, input_index: int) -> None:
         assert input_index == 0
         if not refs.block_refs:
             refs.destroy_if_owned()
             return
         node_id = self._pick_target_node(refs)
-        self._ensure_manager(node_id)
         self._submit_map_task(refs, target_node_id=node_id)
 
     def _submit_map_task(
         self,
         input_bundle: RefBundle,
         *,
-        target_node_id: str,
+        target_node_id: Optional[str],
     ) -> None:
-        """Submit one ``v3_map_task`` for ``input_bundle`` on ``target_node_id``."""
+        """Submit one v3_map_task. Endpoint resolution happens INSIDE the
+        task on whatever node Ray ends up running it on — driver no longer
+        pre-resolves. ``target_node_id`` is just a locality hint.
+        """
         map_id = self._next_map_idx
         self._next_map_idx += 1
 
@@ -222,20 +203,22 @@ class ShuffleMapOpV3(
             (m.size_bytes or 0) for m in input_bundle.metadata
         )
 
-        # 2× input-size memory hint mirrors v2's heuristic: input block in
-        # memory + transient partition spike (capped further by
-        # pool_budget_bytes inside v3_map_task).
+        # memory usage is input block in memory + transient partition spike
+        # (capped further by pool_budget_bytes inside v3_map_task).
+        # 2x memory usage is a safe upper bound
         resources: Dict[str, Any] = {"num_cpus": self._map_num_cpus}
         if estimated_bytes > 0:
             resources["memory"] = estimated_bytes * 2
 
-        endpoint = self._endpoints[target_node_id]
-        ray_options: Dict[str, Any] = {
-            **resources,
-            "scheduling_strategy": NodeAffinitySchedulingStrategy(
-                target_node_id, soft=False
-            ),
-        }
+        ray_options: Dict[str, Any] = dict(resources)
+        if target_node_id is not None:
+            # soft=True lets Ray reschedule on retry (worker death) without
+            # the original node being available — the retried task spawns a
+            # fresh local manager on its new node and a fresh handle (with
+            # the new manager) replaces the old ObjectRef value transparently.
+            ray_options["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
+                target_node_id, soft=True
+            )
 
         handle_ref = v3_map_task.options(**ray_options).remote(
             *input_bundle.block_refs,
@@ -243,7 +226,7 @@ class ShuffleMapOpV3(
             num_partitions=self._num_partitions,
             out_dir=self._base_dir,
             map_id=map_id,
-            endpoint=endpoint,
+            shuffle_id=self._shuffle_id,
             token=self._token,
             pool_budget_bytes=self._pool_budget_bytes,
             compression=self._compression,
@@ -307,10 +290,25 @@ class ShuffleMapOpV3(
         handle = ray.get(handle_ref)
         total_bytes = handle.get("total_bytes", 0)
 
+        # OpRuntimeMetrics.on_task_output_generated asserts every output block
+        # carries exec_stats with wall_time_s AND block_ser_time_s set. The
+        # handle isn't a real computed block, so we attach a minimal,
+        # already-populated stats object (builder sets wall_time_s; we set the
+        # serialization time to 0.0 so the assertion holds).
+        from ray.data.block import BlockExecStats
+
+        # BlockExecStats is a frozen dataclass — pass block_ser_time_s through
+        # build(**kwargs) (builder() populates wall_time_s itself).
+        exec_stats = BlockExecStats.builder().build(block_ser_time_s=0.0)
+
         out_meta = BlockMetadata(
-            num_rows=None,  # handle isn't itself a Block
+            # The handle isn't itself a Block; it contributes 0 rows to the
+            # row-count metric (the real rows surface at the reduce output).
+            # Must be an int, not None: OpRuntimeMetrics.on_task_output_generated
+            # does ``rows += output.num_rows()`` and would TypeError on None.
+            num_rows=0,
             size_bytes=total_bytes,
-            exec_stats=None,
+            exec_stats=exec_stats,
             input_files=_make_mapper_sentinel(map_id),
         )
         out_bundle = RefBundle(
@@ -332,11 +330,15 @@ class ShuffleMapOpV3(
         # No exec_stats here (we'd need v3_map_task to surface them); MVP
         # leaves block stats minimal.
 
-        self._metrics.on_task_finished(
-            map_id, None, task_exec_stats=None, task_exec_driver_stats=None
-        )
+        # Order matters: on_task_output_generated looks up the task in
+        # _running_tasks, but on_task_finished POPS it from that dict. So emit
+        # the output-generated event FIRST, then mark the task finished
+        # (submitted -> output_generated -> finished).
         self._metrics.on_task_output_generated(
             task_index=map_id, output=out_bundle
+        )
+        self._metrics.on_task_finished(
+            map_id, None, task_exec_stats=None, task_exec_driver_stats=None
         )
 
         if self._map_bar is not None:
@@ -369,23 +371,11 @@ class ShuffleMapOpV3(
         super()._do_shutdown(force)
         self._shuffle_map_tasks.clear()
         self._output_queue.clear()
-        # Tear down per-node ShuffleManager actors. Map files live under
-        # base_dir on whatever nodes they were written to; the directory is
-        # cleaned up below (single-node MVP — multi-node will need per-node
-        # cleanup tasks).
-        for node_id, actor in list(self._managers.items()):
-            try:
-                ray.kill(actor)
-            except Exception:
-                logger.exception(
-                    "Failed to kill ShuffleManager on node %s", node_id
-                )
-        self._managers.clear()
-        self._endpoints.clear()
-        if self._owns_base_dir:
-            shutil.rmtree(self._base_dir, ignore_errors=True)
+        # ShuffleManager actors are kept alive by the ActorHandle inside
+        # each emitted ShuffleHandle; Ray ref-counting tears them down once
+        # all reducer bundles release. No cleanup needed here.
 
-    # ───────────────────────────── Stats / progress ─────────────────────────
+    # Stats / progress
     def get_stats(self) -> Dict[str, List[BlockStats]]:
         return {self._name: self._map_blocks_stats}
 
@@ -423,7 +413,7 @@ class ShuffleMapOpV3(
         if name == "Map":
             self._map_bar = pg
 
-    # ─────────────────────── V3-specific accessors ──────────────────────────
+    # V3-specific accessors for data stored on disk
     @property
     def num_partitions(self) -> int:
         return self._num_partitions
@@ -436,7 +426,6 @@ class ShuffleMapOpV3(
     def token(self) -> str:
         return self._token
 
-    def get_endpoints(self) -> Dict[str, "typing.Tuple[str, int]"]:
-        """Snapshot of node_id → (host, port). Used by the reducer op to
-        sanity-check that all handles' endpoints map to known managers."""
-        return dict(self._endpoints)
+    @property
+    def shuffle_id(self) -> str:
+        return self._shuffle_id

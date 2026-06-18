@@ -63,7 +63,6 @@ logger = logging.getLogger(__name__)
 
 
 class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
-    """V3 reduce operator. See module docstring."""
 
     _DEFAULT_REDUCE_NUM_CPUS = 1.0
     _DEFAULT_MAX_BYTES_PER_FETCH = 256 * 1024 * 1024  # 256 MiB
@@ -159,7 +158,7 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
         self._reducers_dispatched = True
 
         if not self._handle_refs:
-            # No mapper produced any handle — nothing to reduce.
+            # No mapper produced any handle, thus nothing to reduce.
             return
 
         target_max_block_size = (
@@ -308,12 +307,17 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
         super()._do_shutdown(force)
         self._shuffle_reduce_tasks.clear()
         self._output_queue.clear()
+        # Destroying the input bundles drops our hold on each ShuffleHandle
+        # ObjectRef. Each handle dict carries the source node's
+        # ShuffleManager ActorHandle, so as the ObjectRefs are freed Ray
+        # ref-counting transitively releases the manager actors — index
+        # lifetime drives file lifetime, no explicit release RPC needed.
         for bundle in self._handle_input_bundles:
             bundle.destroy_if_owned()
         self._handle_input_bundles.clear()
         self._handle_refs.clear()
 
-    # ───────────────────────────── Stats / progress ─────────────────────────
+    # Stats / progress
     def get_stats(self) -> Dict[str, List[BlockStats]]:
         return {self._name: self._output_blocks_stats}
 

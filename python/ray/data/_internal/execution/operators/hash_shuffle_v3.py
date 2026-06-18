@@ -49,6 +49,7 @@ import ray
 from ray._raylet import (
     StreamingGeneratorStats,  # pyrefly: ignore[missing-module-attribute]
 )
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from ray.data._internal.output_buffer import (
     BlockOutputBuffer,
     OutputBlockSizeOption,
@@ -69,8 +70,6 @@ MapBlockTransformer = Callable[[pa.Table], pa.Table]
 # recommended default for cross-node clusters: ~2-5x smaller for tabular data
 # with sub-µs/MB decompression. ZSTD trades CPU for higher ratio on slow links.
 ShuffleCompression = Optional[Literal["lz4", "zstd"]]
-
-_MAGIC_ERR = 0xFFFFFFFF  # legacy sentinel, unused by the v1 wire format below
 
 # =============================================================================
 # Wire protocol.
@@ -785,47 +784,6 @@ def open_shuffle_connection(
         raise
 
 
-# ── single-source convenience wrappers (kept for tests / simple callers) ──
-def _fetch_ranges(
-    endpoint: Tuple[str, int],
-    token: str,
-    path: str,
-    ranges: List[Tuple[int, int]],
-) -> List[bytes]:
-    """Single-source FETCH over a one-shot connection. Returns the per-range
-    bytes in request order. Use :class:`_ShuffleConnection` directly if you
-    have multiple sources or want to amortize handshake across fetches.
-    """
-    with open_shuffle_connection(endpoint, token) as conn:
-        return conn.fetch([(path, ranges)])[0]
-
-
-def _fetch_ranges_to_file(
-    endpoint: Tuple[str, int],
-    token: str,
-    src_path: str,
-    ranges: List[Tuple[int, int]],
-    out_file: str,
-    chunk_size: int = 64 * 1024,
-) -> None:
-    """Single-source streaming FETCH over a one-shot connection. The file
-    layout matches :func:`_write_prefetch_file` so the reducer decode path
-    treats the output exactly like a manually-staged prefetch file.
-    """
-    try:
-        with open_shuffle_connection(endpoint, token) as conn:
-            conn.fetch_to_files([(src_path, ranges)], [out_file], chunk_size)
-    except Exception:
-        # If fetch_to_files raised AFTER opening the file, it already cleaned
-        # up. If we raised before that (handshake failed), the file was never
-        # opened. Either way, idempotent cleanup is safe.
-        try:
-            os.unlink(out_file)
-        except OSError:
-            pass
-        raise
-
-
 # map / reduce task body
 ShuffleHandle = dict  # {path, index:{pid:[(off,len)]}, endpoint:(host,port), token}
 
@@ -837,7 +795,7 @@ def v3_map_task(
     num_partitions: int,
     out_dir: str,
     map_id: int,
-    endpoint: Tuple[str, int],
+    shuffle_id: str,
     token: str,
     transformer: MapBlockTransformer = None,
     pool_budget_bytes: int = 16 * 1024 * 1024,
@@ -898,6 +856,24 @@ def v3_map_task(
     to one partition-contiguous file — §5.9), which gets low peak AND ~M chunks at
     once. Not in this PoC.
     """
+    # Lookup-or-create the local node's ShuffleManager. ``get_if_exists=True``
+    # makes this idempotent: concurrent mappers on the same node share one
+    # actor; cross-node task retry just spawns a fresh manager on the new
+    # node. The returned ActorHandle goes into the ShuffleHandle so Ray
+    # ref-counting keeps the manager alive until all reducers have dropped
+    # their handle refs (binds file lifetime to index lifetime).
+    node_id = ray.get_runtime_context().get_node_id()
+    manager = ShuffleManager.options(
+        name=f"shuffle_mgr:{shuffle_id}:{node_id}",
+        namespace="ray_data_shuffle_v3",
+        get_if_exists=True,
+        max_restarts=-1,
+        scheduling_strategy=NodeAffinitySchedulingStrategy(
+            node_id, soft=False
+        ),
+        num_cpus=0,
+    ).remote(out_dir, token)
+
     os.makedirs(out_dir, exist_ok=True)
     final_path = os.path.join(out_dir, f"map_{map_id}.shf")
     # Write to a temp sibling first; only ``rename`` once we've verified the
@@ -1031,7 +1007,13 @@ def v3_map_task(
     return {
         "path": os.path.realpath(final_path),
         "index": index,
-        "endpoint": endpoint,
+        # ActorHandle to this node's ShuffleManager. Reducer calls
+        # ``ray.get(manager.endpoint.remote())`` at fetch time to get the
+        # CURRENT (host, port) — survives actor restart on a new port.
+        # Embedding the handle also makes Ray ref-count the actor for us:
+        # when the last ShuffleHandle ref is dropped, the actor dies, which
+        # is the natural end-of-shuffle signal.
+        "manager": manager,
         "token": token,
         "num_partitions": num_partitions,
         "peak_inflight_bytes": peak_inflight,  # debug: output held at once
@@ -1090,21 +1072,34 @@ _PrefetchMember = Tuple[int, str, List[Tuple[int, int]]]
 
 def _prefetch_node_into(
     out_file_obj,
-    endpoint: Tuple[str, int],
+    manager: "ray.actor.ActorHandle",
     token: str,
     members: List[_PrefetchMember],
     max_bytes_per_fetch: int,
 ) -> None:
-    """Open ONE keep-alive connection to ``endpoint`` and stream every
-    member's shards into ``out_file_obj`` via 1+ multi-source FETCH frames,
-    each bounded by ``max_bytes_per_fetch``.
+    """Open ONE keep-alive connection to ``manager``'s endpoint and stream
+    every member's shards into ``out_file_obj`` via 1+ multi-source FETCH
+    frames, each bounded by ``max_bytes_per_fetch``.
 
-    Wraps connection setup + chunked FETCH + error normalization so the
-    Phase 1 caller stays flat (one ``for endpoint, members`` loop body
-    instead of six levels of nesting).
+    Endpoint is resolved at call-time via ``manager.endpoint.remote()`` —
+    survives ShuffleManager restart on a new port. If the first connect
+    fails with a transient error (typical sign of mid-restart), re-resolve
+    once and retry; persistent failure surfaces as ShuffleFetchError so the
+    operator layer can decide what to do.
     """
+    def _resolve() -> Tuple[str, int]:
+        return ray.get(manager.endpoint.remote())
+
+    endpoint = _resolve()
     try:
-        with open_shuffle_connection(endpoint, token) as conn:
+        try:
+            conn_cm = open_shuffle_connection(endpoint, token)
+        except (ConnectionRefusedError, ConnectionResetError, OSError):
+            # Manager process may have just restarted on a new port —
+            # re-resolve once and try again.
+            endpoint = _resolve()
+            conn_cm = open_shuffle_connection(endpoint, token)
+        with conn_cm as conn:
             for batch in _chunk_members_by_bytes(members, max_bytes_per_fetch):
                 sources = [
                     (src_path, src_ranges)
@@ -1190,16 +1185,18 @@ def v3_reduce_task(
     """
     start_time_s = time.perf_counter()
 
-    # Collect (endpoint, token, src_path, ranges) per source for this partition.
-    jobs: List[Tuple[Tuple[str, int], str, str, List[Tuple[int, int]]]] = []
+    # Collect (manager, token, src_path, ranges) per source for this partition.
+    jobs: List[
+        Tuple["ray.actor.ActorHandle", str, str, List[Tuple[int, int]]]
+    ] = []
     for h in handles:
         if not isinstance(h, dict):
             h = ray.get(h)
         ranges = h["index"].get(partition_id) or []
         if ranges:
-            jobs.append((h["endpoint"], h["token"], h["path"], ranges))
+            jobs.append((h["manager"], h["token"], h["path"], ranges))
 
-    # ─── streaming yield helper (matches v2 protocol) ────────────────────
+    # streaming yield helper
     def _yield_with_stats(block: Block):
         """Yield (block, pickled metadata) — the executor's DataOpTask
         wrapper sends a StreamingGeneratorStats back between the two yields,
@@ -1240,22 +1237,29 @@ def v3_reduce_task(
     staging_dir: str = prefetch_dir
     prefetch_file = os.path.join(staging_dir, "prefetch.bin")
 
-    # Group by (endpoint, token): one TCP connection per ShuffleManager.
+    # Group by manager actor: one TCP connection per ShuffleManager.
+    # Key on the actor's id (binary) so multiple deserialized ActorHandle
+    # instances pointing at the same actor collapse to one entry.
     groups: Dict[
-        Tuple[Tuple[str, int], str],
-        List[Tuple[int, str, List[Tuple[int, int]]]],
+        bytes,
+        Tuple[
+            "ray.actor.ActorHandle",
+            str,
+            List[Tuple[int, str, List[Tuple[int, int]]]],
+        ],
     ] = {}
-    for idx, (endpoint, token, src_path, src_ranges) in enumerate(jobs):
-        groups.setdefault((endpoint, token), []).append(
-            (idx, src_path, src_ranges)
-        )
+    for idx, (manager, token, src_path, src_ranges) in enumerate(jobs):
+        key = manager._actor_id.binary()
+        if key not in groups:
+            groups[key] = (manager, token, [])
+        groups[key][2].append((idx, src_path, src_ranges))
 
     try:
         # Phase 1: prefetch all shards into one prefetch.bin
         with open(prefetch_file, "wb") as out_f:
-            for (endpoint, token), members in groups.items():
+            for manager, token, members in groups.values():
                 _prefetch_node_into(
-                    out_f, endpoint, token, members, max_bytes_per_fetch
+                    out_f, manager, token, members, max_bytes_per_fetch
                 )
 
         # Phase 2: walk prefetch.bin, drive reduce_fn streamingly
@@ -1341,74 +1345,3 @@ def concat_reduce(partition_id: int, tables: List[pa.Table]) -> Iterable[pa.Tabl
     if not tables:
         return
     yield pa.concat_tables(tables) if len(tables) > 1 else tables[0]
-
-
-def run_file_shuffle(
-    input_blocks: List["ray.ObjectRef"],
-    *,
-    partition_fn: PartitionFn,
-    num_partitions: int,
-    out_dir: str,
-    manager: "ray.actor.ActorHandle",
-    token: str,
-    reduce_fn: ReduceFn = concat_reduce,
-    transformer: MapBlockTransformer = None,
-    auto_ft: bool = True,
-    pool_budget_bytes: int = 16 * 1024 * 1024,
-    compression: ShuffleCompression = None,
-    reduce_prefetch_dir: Optional[str] = None,
-    max_bytes_per_fetch: int = _DEFAULT_MAX_BYTES_PER_FETCH,
-    target_max_block_size: Optional[int] = None,
-    streaming_reduce: bool = True,
-) -> List["ray.ObjectRef"]:
-    """Single-node driver. ``manager`` is the per-node ShuffleManager actor whose
-    socket endpoint reducers fetch from.
-
-    ``auto_ft``: when True, map tasks are submitted with ``max_retries`` so the
-    handle (a reconstruction-ELIGIBLE task return = Bundle 2, §4.10) is re-run by
-    Ray lineage on loss, regenerating its file; reduce fetch failures raise
-    ``ShuffleFetchError`` (typed → retryable). When False, no retries (Bundle-1-
-    style: rely on an external/executor trigger).
-    ``compression``: per-RecordBatch IPC compression on map writes
-    (``None`` / ``"lz4"`` / ``"zstd"``). Reader auto-detects from stream
-    metadata, so no reducer-side coordination needed. Default ``None``
-    preserves zero-copy mmap on the same-node fast path; ``"lz4"`` is the
-    recommended cross-node default once the operator wiring is in place.
-    ``reduce_prefetch_dir``: optional staging directory for file-backed
-    prefetch on the reducer side. If unset, each reduce task creates a
-    per-task temp dir. Set this to a fast local SSD / tmpfs path to keep
-    prefetch I/O off the shuffle file volume.
-    ``max_bytes_per_fetch``: cap on total requested bytes per FETCH frame.
-    Large per-partition slices are split into multiple FETCHes on the same
-    per-node keep-alive connection. Bounds the ShuffleManager's response-
-    buffer footprint per reducer.
-    """
-    endpoint = ray.get(manager.endpoint.remote())
-    map_opts = {"max_retries": 3} if auto_ft else {"max_retries": 0}
-    reduce_opts = {"max_retries": 3} if auto_ft else {"max_retries": 0}
-    handles = [
-        v3_map_task.options(**map_opts).remote(
-            blk, partition_fn=partition_fn, num_partitions=num_partitions,
-            out_dir=out_dir, map_id=i, endpoint=endpoint, token=token,
-            transformer=transformer, pool_budget_bytes=pool_budget_bytes,
-            compression=compression,
-        )
-        for i, blk in enumerate(input_blocks)
-    ]
-    # Reducer is a streaming generator now: use num_returns="streaming" so
-    # callers get an ObjectRefGenerator yielding (block_ref, metadata_ref)
-    # pairs, matching v2's ``_shuffle_reduce_task`` protocol.
-    return [
-        v3_reduce_task.options(
-            **reduce_opts, num_returns="streaming"
-        ).remote(
-            handles,
-            pid,
-            reduce_fn,
-            reduce_prefetch_dir,
-            max_bytes_per_fetch,
-            target_max_block_size,
-            streaming_reduce,
-        )
-        for pid in range(num_partitions)
-    ]

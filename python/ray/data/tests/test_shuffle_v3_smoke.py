@@ -39,6 +39,7 @@ from ray.data._internal.execution.operators.shuffle_operators.shuffle_map_operat
 from ray.data._internal.execution.operators.shuffle_operators.shuffle_reduce_operator_v3 import (  # noqa: E501
     ShuffleReduceOpV3,
 )
+from ray.data._internal.stats import Timer
 from ray.data.block import BlockAccessor
 from ray.data.context import DataContext
 
@@ -83,27 +84,45 @@ def _build_input_bundles(num_blocks: int, rows_per_block: int) -> list:
 def _drain_op(op, *, timeout_s: float = 30.0) -> list:
     """Pump the operator until execution finishes; collect output bundles.
 
-    PhysicalOperator's normal driver is the streaming executor; here we
-    drive it manually by polling ``has_next`` and ``has_execution_finished``
-    and processing each active task's ready callbacks. This is enough for
-    a smoke test but does NOT exercise backpressure or input-queue
-    ordering — those are the executor's job.
+    Mirrors the dispatch in
+    ``streaming_executor_state.process_completed_tasks``: ``ray.wait`` on
+    every active task's waitable, then call ``on_data_ready`` on
+    ``DataOpTask`` (streaming gen) and ``on_task_finished`` on
+    ``MetadataOpTask`` (single ref). No backpressure or input-queue
+    ordering — that's the executor's job.
     """
+    from ray.data._internal.execution.interfaces.physical_operator import (
+        DataOpTask,
+        MetadataOpTask,
+    )
+
     bundles = []
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        # Drain any output the op already has.
         while op.has_next():
             bundles.append(op.get_next())
-        # Let any active task's callbacks fire on ready refs.
-        for task in op.get_active_tasks():
-            ready = task.on_data_ready(max_blocks_to_read=None)
-            if ready is None:
-                continue
+        active_tasks = op.get_active_tasks()
+        if not active_tasks:
+            if op.has_execution_finished():
+                break
+            time.sleep(0.05)
+            continue
+        ref_to_task = {t.get_waitable(): t for t in active_tasks}
+        ready, _ = ray.wait(
+            list(ref_to_task),
+            num_returns=len(ref_to_task),
+            fetch_local=False,
+            timeout=0.1,
+        )
+        for ref in ready:
+            task = ref_to_task[ref]
+            if isinstance(task, DataOpTask):
+                task.on_data_ready(None)
+            else:
+                assert isinstance(task, MetadataOpTask)
+                task.on_task_finished()
         if op.has_execution_finished():
             break
-        time.sleep(0.05)
-    # Final drain after finish.
     while op.has_next():
         bundles.append(op.get_next())
     return bundles
@@ -167,8 +186,8 @@ def test_v3_repartition_smoke(ray_init_shutdown, num_blocks, rows, num_parts):
     try:
         # Drive map by piping every upstream bundle in.
         while upstream.has_next():
-            map_op._add_input(upstream.get_next(), input_index=0)
-        map_op.mark_input_completed(input_index=0)
+            map_op.add_input(upstream.get_next(), input_index=0)
+        map_op.all_inputs_done()
 
         # Drain map → feed reduce.
         map_output = _drain_op(map_op)
@@ -177,8 +196,8 @@ def test_v3_repartition_smoke(ray_init_shutdown, num_blocks, rows, num_parts):
             f"got {len(map_output)}"
         )
         for bundle in map_output:
-            reduce_op._add_input(bundle, input_index=0)
-        reduce_op.mark_input_completed(input_index=0)
+            reduce_op.add_input(bundle, input_index=0)
+        reduce_op.all_inputs_done()
 
         # Drain reduce.
         reduce_output = _drain_op(reduce_op, timeout_s=60.0)
@@ -202,9 +221,9 @@ def test_v3_repartition_smoke(ray_init_shutdown, num_blocks, rows, num_parts):
             partition_ids_seen.add(id(bundle))
         assert len(partition_ids_seen) >= 1
     finally:
-        reduce_op.shutdown(force=True)
-        map_op.shutdown(force=True)
-        upstream.shutdown(force=True)
+        reduce_op.shutdown(Timer(), force=True)
+        map_op.shutdown(Timer(), force=True)
+        upstream.shutdown(Timer(), force=True)
 
 
 def test_v3_base_dir_cleaned_up(ray_init_shutdown, tmp_path):
@@ -234,12 +253,12 @@ def test_v3_base_dir_cleaned_up(ray_init_shutdown, tmp_path):
 
     try:
         while upstream.has_next():
-            map_op._add_input(upstream.get_next(), input_index=0)
-        map_op.mark_input_completed(input_index=0)
+            map_op.add_input(upstream.get_next(), input_index=0)
+        map_op.all_inputs_done()
         _drain_op(map_op)
     finally:
-        map_op.shutdown(force=True)
-        upstream.shutdown(force=True)
+        map_op.shutdown(Timer(), force=True)
+        upstream.shutdown(Timer(), force=True)
 
     # Caller-owned base_dir survives the operator teardown.
     assert os.path.isdir(base_dir)

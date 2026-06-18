@@ -67,6 +67,68 @@ def _plan_hash_shuffle_repartition(
     )
 
 
+def _plan_hash_shuffle_repartition_v3(
+    data_context: DataContext,
+    logical_op: Repartition,
+    input_physical_op: PhysicalOperator,
+) -> PhysicalOperator:
+    """Plan ``Repartition through the v3 file-transport hash shuffle.
+
+    Returns the ``ShuffleReduceOpV3`` (the downstream root) which wraps the
+    ``ShuffleMapOpV3`` as its single input dependency. ``concat_reduce`` is
+    used as the reduce_fn — appropriate for repartition (no sort/aggregate
+    semantics). ``logical_op.sort=True`` is rejected: a sort-aware reduce
+    path is future work.
+    """
+    from ray.data._internal.arrow_ops.transform_pyarrow import hash_partition
+    from ray.data._internal.execution.operators.hash_shuffle_v3 import (
+        concat_reduce,
+    )
+    from ray.data._internal.execution.operators.shuffle_operators.shuffle_map_operator_v3 import (  # noqa: E501
+        ShuffleMapOpV3,
+    )
+    from ray.data._internal.execution.operators.shuffle_operators.shuffle_reduce_operator_v3 import (  # noqa: E501
+        ShuffleReduceOpV3,
+    )
+    from ray.data._internal.planner.exchange.sort_task_spec import SortKey
+
+    if logical_op.sort:
+        raise NotImplementedError(
+            "use_hash_shuffle_v3=True does not yet support sorted "
+            "repartition (logical_op.sort=True). Disable the flag or use "
+            "ds.sort() separately."
+        )
+
+    num_partitions = logical_op.num_outputs
+    if num_partitions is None or num_partitions <= 0:
+        num_partitions = data_context.default_hash_shuffle_parallelism
+
+    # When the user supplies hash keys, partition on those; otherwise hash
+    # on the full row (consistent with v2's HashShuffleOperator behavior
+    # for keyed repartition, and a stable fallback for keyless).
+    key_cols = tuple(SortKey(logical_op.keys).get_columns()) if logical_op.keys else ()
+
+    def _partition_fn(table):
+        cols = list(key_cols) if key_cols else list(table.column_names)
+        return hash_partition(
+            table, hash_cols=cols, num_partitions=num_partitions
+        )
+
+    map_op = ShuffleMapOpV3(
+        input_physical_op,
+        data_context,
+        num_partitions=num_partitions,
+        partition_fn=_partition_fn,
+    )
+    reduce_op = ShuffleReduceOpV3(
+        map_op,
+        data_context,
+        num_partitions=num_partitions,
+        reduce_fn=concat_reduce,
+    )
+    return reduce_op
+
+
 def _plan_hash_shuffle_aggregate(
     data_context: DataContext,
     logical_op: Aggregate,
@@ -122,6 +184,14 @@ def plan_all_to_all_op(
         )
 
     elif isinstance(op, Repartition):
+        # v3 file-transport hash shuffle takes precedence over v2/GPU paths
+        # when the user opts in via DataContext.use_hash_shuffle_v3. Handles
+        # both keyed and keyless repartition (keyless = hash on all columns).
+        if data_context.use_hash_shuffle_v3:
+            return _plan_hash_shuffle_repartition_v3(
+                data_context, op, input_physical_dag
+            )
+
         if op.keys:
             if data_context.shuffle_strategy == ShuffleStrategy.GPU_SHUFFLE:
                 return _plan_gpu_shuffle_repartition(
