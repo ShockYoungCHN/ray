@@ -116,15 +116,22 @@ def _plan_hash_shuffle_repartition_v3(
     logical_op: Repartition,
     input_physical_op: PhysicalOperator,
 ) -> PhysicalOperator:
-    """Plan ``Repartition through the v3 file-transport hash shuffle.
+    """Plan ``Repartition`` through the v3 file-transport hash shuffle.
 
     Returns the ``ShuffleReduceOpV3`` (the downstream root) which wraps the
-    ``ShuffleMapOpV3`` as its single input dependency. ``concat_reduce`` is
-    used as the reduce_fn — appropriate for repartition (no sort/aggregate
-    semantics). ``logical_op.sort=True`` is rejected: a sort-aware reduce
-    path is future work.
+    ``ShuffleMapOpV3`` as its single input dependency.
+
+    ``logical_op.sort=True`` produces a **per-partition local sort** by the
+    hash keys (mirrors v2's ``Repartition(sort=True)`` semantics). The
+    reduce_fn must see all of a partition's shards before it can sort, so
+    we set ``streaming_reduce=False`` and ``disallow_block_splitting=True``
+    on the reduce op for this case — same as v2. ``sort=True`` without
+    keys is rejected (nothing to sort by).
     """
     from ray.data._internal.arrow_ops.transform_pyarrow import hash_partition
+    from ray.data._internal.execution.operators.hash_shuffle_v2 import (
+        _sort_reduce,
+    )
     from ray.data._internal.execution.operators.hash_shuffle_v3 import (
         concat_reduce,
     )
@@ -136,11 +143,10 @@ def _plan_hash_shuffle_repartition_v3(
     )
     from ray.data._internal.planner.exchange.sort_task_spec import SortKey
 
-    if logical_op.sort:
-        raise NotImplementedError(
-            "use_hash_shuffle_v3=True does not yet support sorted "
-            "repartition (logical_op.sort=True). Disable the flag or use "
-            "ds.sort() separately."
+    if logical_op.sort and not logical_op.keys:
+        raise ValueError(
+            "Repartition(sort=True) requires `keys` — there's nothing to "
+            "sort by without them."
         )
 
     num_partitions = logical_op.num_outputs
@@ -158,6 +164,15 @@ def _plan_hash_shuffle_repartition_v3(
             table, hash_cols=cols, num_partitions=num_partitions
         )
 
+    if logical_op.sort:
+        reduce_fn = _sort_reduce(list(key_cols))
+        streaming_reduce = False
+        disallow_block_splitting = True
+    else:
+        reduce_fn = concat_reduce
+        streaming_reduce = True
+        disallow_block_splitting = False
+
     map_op = ShuffleMapOpV3(
         input_physical_op,
         data_context,
@@ -168,7 +183,9 @@ def _plan_hash_shuffle_repartition_v3(
         map_op,
         data_context,
         num_partitions=num_partitions,
-        reduce_fn=concat_reduce,
+        reduce_fn=reduce_fn,
+        streaming_reduce=streaming_reduce,
+        disallow_block_splitting=disallow_block_splitting,
     )
     return reduce_op
 

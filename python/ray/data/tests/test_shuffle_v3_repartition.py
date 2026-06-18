@@ -110,11 +110,36 @@ def test_v3_flag_off_keeps_v2_path(ray_cluster):
     assert {r["id"] for r in rows} == set(range(200))
 
 
-def test_v3_sort_rejected(ray_cluster):
-    """``repartition(..., sort=True)`` is not yet supported in v3 — must
-    surface a clear NotImplementedError, NOT silently produce wrong data
-    or hang the executor."""
-    with _v3_flag(True), pytest.raises(NotImplementedError, match="sort"):
+def test_v3_repartition_sorted(ray_cluster):
+    """``repartition(N, keys=[...], sort=True)`` — each output partition's
+    rows must be non-decreasing by the sort key (per-partition local
+    sort, mirroring v2's contract). Global ordering across partitions is
+    NOT guaranteed by hash shuffle."""
+    num_rows, num_parts = 300, 4
+    with _v3_flag(True):
+        ds = (
+            ray.data.range(num_rows)
+            .repartition(num_parts, keys=["id"], sort=True)
+            .materialize()
+        )
+        # Walk each output block; rows within a block must be sorted.
+        # Cross-block ordering is not promised — hash shuffle scatters by
+        # hash, not by range.
+        rows = ds.take_all()
+    assert len(rows) == num_rows
+    assert {r["id"] for r in rows} == set(range(num_rows))
+
+    # Per-block monotonicity check — iterate via block-level API so
+    # we can verify each block independently.
+    for block_ref in ds.get_internal_block_refs():
+        block = ray.get(block_ref)
+        ids = block["id"].to_pylist()
+        assert ids == sorted(ids), f"block not sorted: {ids[:20]}..."
+
+
+def test_v3_sort_without_keys_rejected(ray_cluster):
+    """``sort=True`` with no keys has no meaning — must error clearly."""
+    with _v3_flag(True), pytest.raises(ValueError, match="keys"):
         ray.data.range(50).repartition(4, sort=True).materialize()
 
 
