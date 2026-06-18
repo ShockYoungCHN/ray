@@ -97,6 +97,21 @@ DEFAULT_MAX_HASH_SHUFFLE_AGGREGATORS = env_integer(
     "RAY_DATA_MAX_HASH_SHUFFLE_AGGREGATORS", 128
 )
 
+# Codec for hash-shuffle intermediate shards in the v2 stateless-task path
+# ("none", "lz4", or "zstd").  Smaller shards lower cross-node bytes and
+# Plasma footprint at the cost of map-side CPU; zstd is the most space-
+# efficient at modest CPU, lz4 is the cheapest with meaningful savings.
+DEFAULT_HASH_SHUFFLE_COMPRESSION = os.environ.get(
+    "RAY_DATA_HASH_SHUFFLE_COMPRESSION", "zstd"
+)
+
+# Number of per-partition shard refs each v2 reduce task ray.get()'s in
+# one round.  Bigger batches = fewer ray.get round-trips, more
+# transiently-pinned object store bytes; smaller = lower peak memory.
+DEFAULT_HASH_SHUFFLE_REDUCE_BATCH_SIZE = env_integer(
+    "RAY_DATA_HASH_SHUFFLE_REDUCE_BATCH_SIZE", 16
+)
+
 DEFAULT_SCHEDULING_STRATEGY = "SPREAD"
 
 # This default enables locality-based scheduling in Ray for tasks where arg data
@@ -710,6 +725,13 @@ class DataContext:
     # Default hash-shuffle parallelism level (will be used when not
     # provided explicitly)
     default_hash_shuffle_parallelism: int = DEFAULT_MIN_PARALLELISM
+
+    # Codec for hash-shuffle intermediate shards in the v2 stateless-task
+    # path ("none", "lz4", or "zstd").
+    hash_shuffle_compression: str = DEFAULT_HASH_SHUFFLE_COMPRESSION
+
+    # Shard refs each v2 reduce task ray.get()'s per round.
+    hash_shuffle_reduce_batch_size: int = DEFAULT_HASH_SHUFFLE_REDUCE_BATCH_SIZE
 
     # Max number of aggregators (actors) that could be provisioned
     # to perform aggregations on partitions produced during hash-shuffling
