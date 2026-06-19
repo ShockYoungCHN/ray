@@ -179,6 +179,31 @@ def _read_ipc(buf: Union[bytes, "pa.Buffer", memoryview]) -> pa.Table:
 
 
 # wire framing
+def _tune_shuffle_socket(sock: socket.socket) -> None:
+    """Configure a shuffle TCP socket for our usage pattern.
+
+    * ``TCP_NODELAY`` disables Nagle. Our wire protocol sends many small
+      frames in sequence (magic + token, opcode + header, per-range hdrs),
+      Nagle's default coalesce would inject ~40ms latency between them.
+    * ``SO_KEEPALIVE`` lets the kernel detect dead peers via TCP-level
+      probes on long-idle connections — important when intermediate
+      NAT / firewall middleboxes silently drop idle flows.
+
+    Applied to both the reducer's client socket and each connection the
+    ShuffleManager server accepts.  Silently ignores failures: not every
+    socket family supports both options (Unix domain etc.); for our
+    AF_INET / AF_INET6 use they always succeed.
+    """
+    for level, opt in (
+        (socket.IPPROTO_TCP, socket.TCP_NODELAY),
+        (socket.SOL_SOCKET, socket.SO_KEEPALIVE),
+    ):
+        try:
+            sock.setsockopt(level, opt, 1)
+        except OSError:
+            pass
+
+
 def _recvall(sock: socket.socket, n: int) -> bytes:
     out = bytearray()
     while len(out) < n:
@@ -329,6 +354,7 @@ class _FetchHandler(socketserver.StreamRequestHandler):
     def handle(self):
         srv = self.server
         sock = self.connection
+        _tune_shuffle_socket(sock)
         try:
             if not self._handshake(sock, srv):
                 return
@@ -787,6 +813,7 @@ def open_shuffle_connection(
     server isn't reachable, ``RuntimeError`` on protocol errors.
     """
     sock = socket.create_connection(endpoint)
+    _tune_shuffle_socket(sock)
     try:
         token_bytes = token.encode("utf-8")
         sock.sendall(_PROTO_MAGIC)
