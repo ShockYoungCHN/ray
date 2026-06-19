@@ -137,13 +137,17 @@ class ShuffleMapOpV3(
         # -- On-disk staging --
         # ``base_dir`` is just a directory-name template — each node mkdirs
         # the same path on its OWN local FS. Driver doesn't own anything on
-        # remote disks. We DON'T rmtree on shutdown: the lifecycle of
-        # mapper files is bound to the ShuffleManager actor (one per node),
-        # which is itself Ray-ref-counted via the ``manager`` ActorHandle
-        # embedded in each emitted ShuffleHandle dict. When all reducer
-        # bundles drop their handle refs, the actor dies; OS reclaims the
-        # /tmp dir at job teardown / reboot.
-        self._owns_base_dir = base_dir is None
+        # remote disks. Cleanup is performed by the ``ShuffleManager`` actor
+        # itself: an ``atexit`` hook in the actor process ``rmtree``s
+        # ``base_dir`` on graceful actor termination (ref-count → 0).
+        # SIGKILL paths (OOM, ``ray.kill``, crash) skip atexit, leaving the
+        # files on disk for a ``max_restarts`` respawn — that's the right
+        # property for fault tolerance.
+        #
+        # Caller-supplied ``base_dir`` is treated as scratch space: it WILL
+        # be removed when the shuffle's actors are released. Callers that
+        # want their directory preserved should not pass a path they expect
+        # to keep.
         self._base_dir: str = base_dir or tempfile.mkdtemp(
             prefix="ray_shuffle_v3_"
         )

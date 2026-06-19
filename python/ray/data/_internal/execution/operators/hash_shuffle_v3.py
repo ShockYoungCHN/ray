@@ -23,8 +23,10 @@ per node). No planner/ShuffleStrategy wiring yet (driven by a harness).
 
 # todo: for single node, don't even persist to disk, just read directly into heap
 # todo: while doing join, maybe pre-check same-key skew in mapphase would be smart
+import atexit
 import os
 import pickle
+import shutil
 import socket
 import socketserver
 import struct
@@ -496,6 +498,30 @@ class ShuffleManager:
         self._host, self._port = self._server.server_address
         t = threading.Thread(target=self._server.serve_forever, daemon=True)
         t.start()
+
+        # File cleanup is tied to graceful actor termination: when every
+        # ShuffleHandle holding this actor's ``ActorHandle`` is dropped
+        # (reducer bundles destroyed, plasma evicts the dict), Ray's actor
+        # ref count drops to 0 and the actor is terminated via the graceful
+        # path -- Python interpreter shutdown runs ``atexit`` hooks. SIGKILL
+        # paths (OOM, ``ray.kill``, hard crash) SKIP ``atexit``, leaving the
+        # files on disk for a ``max_restarts`` respawn to pick up; that's
+        # the property we want.  See ``ray._private.worker.kill`` docs.
+        self._cleaned = False
+        atexit.register(self._cleanup_on_exit)
+
+    def _cleanup_on_exit(self) -> None:
+        """Stop the socket server + rmtree ``base_dir``.  Idempotent.
+        Best-effort throughout: a cleanup failure must never propagate, or
+        it would mask the real shutdown reason."""
+        if self._cleaned:
+            return
+        self._cleaned = True
+        try:
+            self._server.shutdown()
+        except Exception:
+            pass
+        shutil.rmtree(self.base_dir, ignore_errors=True)
 
     def endpoint(self) -> Tuple[str, int]:
         return (self._host, self._port)

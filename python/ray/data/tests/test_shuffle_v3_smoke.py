@@ -226,39 +226,37 @@ def test_v3_repartition_smoke(ray_init_shutdown, num_blocks, rows, num_parts):
         upstream.shutdown(Timer(), force=True)
 
 
-def test_v3_base_dir_cleaned_up(ray_init_shutdown, tmp_path):
-    """Map op tears down ``base_dir`` and kills its ShuffleManager actor
-    after ``_do_shutdown`` — verify both."""
-    ctx = DataContext.get_current()
-    input_bundles = _build_input_bundles(num_blocks=2, rows_per_block=100)
-    from ray.data._internal.execution.operators.input_data_buffer import (
-        InputDataBuffer,
+def test_v3_base_dir_cleaned_up_on_actor_release(ray_init_shutdown, tmp_path):
+    """When the last ``ActorHandle`` to a ``ShuffleManager`` is dropped,
+    Ray gracefully terminates the actor process, the ``atexit`` hook fires,
+    and ``base_dir`` is removed.  This is the property that lets v3 NOT
+    leak files in /tmp across many shuffles."""
+    import gc
+    import time as _time
+
+    from ray.data._internal.execution.operators.hash_shuffle_v3 import (
+        ShuffleManager,
     )
 
-    upstream = InputDataBuffer(ctx, input_bundles)
-    upstream.start(ExecutionOptions())
+    base_dir = str(tmp_path / "shuffle_v3_atexit")
+    actor = ShuffleManager.remote(base_dir, token="test-token")
+    # Make sure the actor's __init__ has run (and that mkdirs has happened).
+    ray.get(actor.endpoint.remote())
+    assert os.path.isdir(base_dir), "actor should have created base_dir"
 
-    # Caller-provided base_dir → owns_base_dir=False, op must NOT delete.
-    base_dir = str(tmp_path / "shuffle_v3_caller_owned")
-    os.makedirs(base_dir, exist_ok=True)
-    map_op = ShuffleMapOpV3(
-        upstream,
-        ctx,
-        num_partitions=2,
-        partition_fn=_make_partition_fn(["id"], 2),
-        base_dir=base_dir,
-        name="ShuffleMapV3-cleanup",
+    # Drop the only handle.  Ray will detect ref-count → 0, send the
+    # graceful termination, the actor's atexit will rmtree base_dir.
+    del actor
+    gc.collect()
+
+    # Poll for cleanup; Ray actor GC is async so we tolerate a short wait.
+    deadline = _time.monotonic() + 15.0
+    while _time.monotonic() < deadline:
+        if not os.path.exists(base_dir):
+            break
+        _time.sleep(0.2)
+
+    assert not os.path.exists(base_dir), (
+        f"base_dir {base_dir} still present 15s after ActorHandle release "
+        "— atexit cleanup did not fire (or actor is still alive)"
     )
-    map_op.start(ExecutionOptions())
-
-    try:
-        while upstream.has_next():
-            map_op.add_input(upstream.get_next(), input_index=0)
-        map_op.all_inputs_done()
-        _drain_op(map_op)
-    finally:
-        map_op.shutdown(Timer(), force=True)
-        upstream.shutdown(Timer(), force=True)
-
-    # Caller-owned base_dir survives the operator teardown.
-    assert os.path.isdir(base_dir)
