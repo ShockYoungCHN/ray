@@ -1,0 +1,70 @@
+
+===== round 1/2 | batch | small-64KiB =====
+
+$ docker run --rm --shm-size=4gb -v /home/ubuntu/ray-batch-rpc/benchmark:/bench:ro 959243851260.dkr.ecr.us-west-2.amazonaws.com/yuanzhuo-temp:batch-rpc_fix python /bench/pull_benchmark.py --local --emit --obj-size-mb 0.0625 --sizes 1,4,16,64,256 --trials 7 --warmup 2 --no-spill
+  parsed 5 rows
+
+===== round 1/2 | batch | large-2MiB =====
+
+$ docker run --rm --shm-size=4gb -v /home/ubuntu/ray-batch-rpc/benchmark:/bench:ro 959243851260.dkr.ecr.us-west-2.amazonaws.com/yuanzhuo-temp:batch-rpc_fix python /bench/pull_benchmark.py --local --emit --obj-size-mb 2.0 --sizes 1,2,4,8,16,32 --trials 7 --warmup 2
+  parsed 12 rows
+
+===== round 1/2 | nobatch | small-64KiB =====
+
+$ docker run --rm --shm-size=4gb -v /home/ubuntu/ray-batch-rpc/benchmark:/bench:ro 959243851260.dkr.ecr.us-west-2.amazonaws.com/yuanzhuo-temp:nobatch-rpc_fix python /bench/pull_benchmark.py --local --emit --obj-size-mb 0.0625 --sizes 1,4,16,64,256 --trials 7 --warmup 2 --no-spill
+  parsed 5 rows
+
+===== round 1/2 | nobatch | large-2MiB =====
+
+$ docker run --rm --shm-size=4gb -v /home/ubuntu/ray-batch-rpc/benchmark:/bench:ro 959243851260.dkr.ecr.us-west-2.amazonaws.com/yuanzhuo-temp:nobatch-rpc_fix python /bench/pull_benchmark.py --local --emit --obj-size-mb 2.0 --sizes 1,2,4,8,16,32 --trials 7 --warmup 2
+  parsed 12 rows
+
+===== round 2/2 | batch | small-64KiB =====
+
+$ docker run --rm --shm-size=4gb -v /home/ubuntu/ray-batch-rpc/benchmark:/bench:ro 959243851260.dkr.ecr.us-west-2.amazonaws.com/yuanzhuo-temp:batch-rpc_fix python /bench/pull_benchmark.py --local --emit --obj-size-mb 0.0625 --sizes 1,4,16,64,256 --trials 7 --warmup 2 --no-spill
+  parsed 5 rows
+
+===== round 2/2 | batch | large-2MiB =====
+
+$ docker run --rm --shm-size=4gb -v /home/ubuntu/ray-batch-rpc/benchmark:/bench:ro 959243851260.dkr.ecr.us-west-2.amazonaws.com/yuanzhuo-temp:batch-rpc_fix python /bench/pull_benchmark.py --local --emit --obj-size-mb 2.0 --sizes 1,2,4,8,16,32 --trials 7 --warmup 2
+  parsed 12 rows
+
+===== round 2/2 | nobatch | small-64KiB =====
+
+$ docker run --rm --shm-size=4gb -v /home/ubuntu/ray-batch-rpc/benchmark:/bench:ro 959243851260.dkr.ecr.us-west-2.amazonaws.com/yuanzhuo-temp:nobatch-rpc_fix python /bench/pull_benchmark.py --local --emit --obj-size-mb 0.0625 --sizes 1,4,16,64,256 --trials 7 --warmup 2 --no-spill
+  parsed 5 rows
+
+===== round 2/2 | nobatch | large-2MiB =====
+
+$ docker run --rm --shm-size=4gb -v /home/ubuntu/ray-batch-rpc/benchmark:/bench:ro 959243851260.dkr.ecr.us-west-2.amazonaws.com/yuanzhuo-temp:nobatch-rpc_fix python /bench/pull_benchmark.py --local --emit --obj-size-mb 2.0 --sizes 1,2,4,8,16,32 --trials 7 --warmup 2
+  parsed 12 rows
+
+raw results -> /home/ubuntu/ray-batch-rpc/benchmark/samehost_results.json
+
+=== small-64KiB / in_memory: transfer time (ms, median over rounds) ===
+ objs      batch    nobatch   speedup  per-obj batch  per-obj nobatch
+    1       3.50       3.73     1.06x          3.505            3.726
+    4       6.65       8.52     1.28x          1.664            2.129
+   16       8.16       8.69     1.07x          0.510            0.543
+   64      16.91      16.83     0.99x          0.264            0.263
+  256      56.29      55.15     0.98x          0.220            0.215
+
+=== large-2MiB / in_memory: transfer time (ms, median over rounds) ===
+ objs      batch    nobatch   speedup  per-obj batch  per-obj nobatch
+    1       6.61       6.23     0.94x          6.609            6.230
+    2       6.58       7.63     1.16x          3.288            3.817
+    4       6.88       7.94     1.15x          1.720            1.986
+    8       9.54       8.50     0.89x          1.193            1.062
+   16      11.79      11.90     1.01x          0.737            0.743
+   32      19.10      20.10     1.05x          0.597            0.628
+
+=== large-2MiB / spilled: transfer time (ms, median over rounds) ===
+ objs      batch    nobatch   speedup  per-obj batch  per-obj nobatch
+    1       5.78       6.24     1.08x          5.780            6.236
+    2       6.48       5.95     0.92x          3.239            2.976
+    4       7.65       7.03     0.92x          1.913            1.757
+    8       9.21       9.95     1.08x          1.152            1.244
+   16      14.83      15.18     1.02x          0.927            0.949
+   32      25.59      25.05     0.98x          0.800            0.783
+
+Read the per-obj columns: if batching works, batch's per-object time stays ~flat as N grows while nobatch's climbs (one RPC per object).

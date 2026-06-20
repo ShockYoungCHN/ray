@@ -1,0 +1,26 @@
+producer node A : 303afd43e2f9  172.17.0.2  store=6000 MiB
+consumer node B : 308b3eec18a2  172.17.0.2
+object size     : 2.00 MiB   sweep=[32, 128, 256]   trials=5 warmup=2
+
+=== Phase 1: in-memory pull (A plasma -> B) ===
+(empty-task baseline on consumer: 3.76 ms, subtracted)
+ objs      MB     median       min       max   transfer      MB/s   per-obj
+   32    64.0     31.17m    25.76m    39.13m     27.40m    2335.5    0.86ms
+  128   256.0     91.84m    79.67m   107.61m     88.07m    2906.7    0.69ms
+  256   512.0    166.56m   151.19m   185.35m    162.79m    3145.1    0.64ms
+BENCHROW batch {"phase": "in_memory", "n": 32, "total_mb": 64.0, "median_s": 0.031167422886937857, "min_s": 0.02576286206021905, "max_s": 0.03912736615166068, "transfer_s": 0.0274027232080698, "mb_per_s": 2335.534301246115, "per_obj_ms": 0.8563351002521813}
+BENCHROW batch {"phase": "in_memory", "n": 128, "total_mb": 256.0, "median_s": 0.09183829324319959, "min_s": 0.079670000821352, "max_s": 0.10760618513450027, "transfer_s": 0.08807359356433153, "mb_per_s": 2906.6600968542302, "per_obj_ms": 0.6880749497213401}
+BENCHROW batch {"phase": "in_memory", "n": 256, "total_mb": 512.0, "median_s": 0.16655607474967837, "min_s": 0.1511929500848055, "max_s": 0.18534940294921398, "transfer_s": 0.16279137507081032, "mb_per_s": 3145.1297697884324, "per_obj_ms": 0.6359038088703528}
+producer node A : 08302c7ddda6  172.17.0.2  store=6000 MiB
+consumer node B : 153e5b483e14  172.17.0.2
+object size     : 2.00 MiB   sweep=[32, 128, 256]   trials=5 warmup=2
+
+=== Phase 1: in-memory pull (A plasma -> B) ===
+(empty-task baseline on consumer: 3.47 ms, subtracted)
+ objs      MB     median       min       max   transfer      MB/s   per-obj
+   32    64.0     24.93m    22.66m    37.56m     21.46m    2982.9    0.67ms
+  128   256.0     98.00m    93.44m   103.45m     94.53m    2708.0    0.74ms
+  256   512.0    164.76m   153.98m   188.77m    161.29m    3174.3    0.63ms
+BENCHROW nobatch {"phase": "in_memory", "n": 32, "total_mb": 64.0, "median_s": 0.0249257730320096, "min_s": 0.02265659999102354, "max_s": 0.03756163828074932, "transfer_s": 0.021455775015056133, "mb_per_s": 2982.8798985396406, "per_obj_ms": 0.6704929692205042}
+BENCHROW nobatch {"phase": "in_memory", "n": 128, "total_mb": 256.0, "median_s": 0.09800433414056897, "min_s": 0.09343700017780066, "max_s": 0.1034540650434792, "transfer_s": 0.0945343361236155, "mb_per_s": 2708.0107662177675, "per_obj_ms": 0.7385495009657461}
+BENCHROW nobatch {"phase": "in_memory", "n": 256, "total_mb": 512.0, "median_s": 0.1647645179182291, "min_s": 0.15397884277626872, "max_s": 0.18877281714230776, "transfer_s": 0.16129451990127563, "mb_per_s": 3174.3173935071227, "per_obj_ms": 0.630056718364358}

@@ -1,0 +1,98 @@
+===== [batch] setup: 959243851260.dkr.ecr.us-west-2.amazonaws.com/yuanzhuo-temp:batch-rpc_fix =====
+Warning: Permanently added '44.250.132.231' (ECDSA) to the list of known hosts.
+Warning: Permanently added '44.250.132.231' (ECDSA) to the list of known hosts.
+  head @ 10.0.209.111 ready
+Warning: Permanently added '184.34.85.35' (ECDSA) to the list of known hosts.
+  worker @ 10.0.213.222 ready
+  waiting for 2 nodes...
+Warning: Permanently added '44.250.132.231' (ECDSA) to the list of known hosts.
+    -> 2/2
+===== [batch] benchmark =====
+Warning: Permanently added '44.250.132.231' (ECDSA) to the list of known hosts.
+producer node A : bbe0d079b6e9  10.0.209.111  store=9122 MiB
+consumer node B : 0b2d0cfe1f1c  10.0.213.222
+object size     : 0.06 MiB   sweep=[1, 4, 16, 64, 256]   trials=5 warmup=2
+
+=== Phase 1: in-memory pull (A plasma -> B) ===
+(empty-task baseline on consumer: 1.43 ms, subtracted)
+ objs      MB     median       min       max   transfer      MB/s   per-obj
+    1     0.1      3.39m     3.13m     3.58m      1.96m      31.8    1.96ms
+    4     0.2      4.58m     4.40m     4.65m      3.15m      79.4    0.79ms
+   16     1.0      8.58m     8.13m     8.84m      7.14m     140.0    0.45ms
+   64     4.0     23.23m    22.42m    23.80m     21.80m     183.5    0.34ms
+  256    16.0     81.93m    81.19m    84.51m     80.50m     198.8    0.31ms
+BENCHROW batch {"phase": "in_memory", "n": 1, "total_mb": 0.0625, "median_s": 0.0033942760001082206, "min_s": 0.003134624000040276, "max_s": 0.003582432000030167, "transfer_s": 0.0019640020000224467, "mb_per_s": 31.822778184179896, "per_obj_ms": 1.9640020000224467}
+BENCHROW batch {"phase": "in_memory", "n": 4, "total_mb": 0.25, "median_s": 0.004578150000043024, "min_s": 0.0044028519998846605, "max_s": 0.004654739999978119, "transfer_s": 0.0031478759999572503, "mb_per_s": 79.4186302139586, "per_obj_ms": 0.7869689999893126}
+BENCHROW batch {"phase": "in_memory", "n": 16, "total_mb": 1.0, "median_s": 0.008575181999958659, "min_s": 0.008134865000101854, "max_s": 0.008835788999931538, "transfer_s": 0.007144907999872885, "mb_per_s": 139.95981474048244, "per_obj_ms": 0.4465567499920553}
+BENCHROW batch {"phase": "in_memory", "n": 64, "total_mb": 4.0, "median_s": 0.023234016000060365, "min_s": 0.02241823300005308, "max_s": 0.023799315999895043, "transfer_s": 0.02180374199997459, "mb_per_s": 183.45474827232232, "per_obj_ms": 0.340683468749603}
+BENCHROW batch {"phase": "in_memory", "n": 256, "total_mb": 16.0, "median_s": 0.08193063499993514, "min_s": 0.08118675500008976, "max_s": 0.08451380799988328, "transfer_s": 0.08050036099984936, "mb_per_s": 198.7568726558871, "per_obj_ms": 0.3144545351556616}
+Warning: Permanently added '44.250.132.231' (ECDSA) to the list of known hosts.
+producer node A : bbe0d079b6e9  10.0.209.111  store=9122 MiB
+consumer node B : 0b2d0cfe1f1c  10.0.213.222
+object size     : 2.00 MiB   sweep=[1, 2, 4, 8, 16, 32]   trials=5 warmup=2
+
+=== Phase 1: in-memory pull (A plasma -> B) ===
+(empty-task baseline on consumer: 1.52 ms, subtracted)
+ objs      MB     median       min       max   transfer      MB/s   per-obj
+    1     2.0      6.40m     6.07m     6.52m      4.88m     409.5    4.88ms
+    2     4.0      9.36m     9.32m     9.61m      7.84m     510.1    3.92ms
+    4     8.0     14.10m    13.46m    14.45m     12.58m     635.7    3.15ms
+    8    16.0     21.42m    21.29m    21.62m     19.90m     804.0    2.49ms
+   16    32.0     33.84m    33.62m    34.17m     32.32m     990.1    2.02ms
+   32    64.0     63.27m    62.84m    63.95m     61.75m    1036.4    1.93ms
+BENCHROW batch {"phase": "in_memory", "n": 1, "total_mb": 2.0, "median_s": 0.006402444999821455, "min_s": 0.006071855999834952, "max_s": 0.006522915999994439, "transfer_s": 0.004883932999746321, "mb_per_s": 409.5060272333554, "per_obj_ms": 4.883932999746321}
+BENCHROW batch {"phase": "in_memory", "n": 2, "total_mb": 4.0, "median_s": 0.009359885000094437, "min_s": 0.009324965000132579, "max_s": 0.009614544999976715, "transfer_s": 0.007841373000019303, "mb_per_s": 510.1147464851058, "per_obj_ms": 3.9206865000096514}
+BENCHROW batch {"phase": "in_memory", "n": 4, "total_mb": 8.0, "median_s": 0.01410343800012015, "min_s": 0.013461396000138848, "max_s": 0.014447807999886209, "transfer_s": 0.012584926000045016, "mb_per_s": 635.6811315355676, "per_obj_ms": 3.146231500011254}
+BENCHROW batch {"phase": "in_memory", "n": 8, "total_mb": 16.0, "median_s": 0.021419332999812468, "min_s": 0.02129430400009369, "max_s": 0.021616837999999916, "transfer_s": 0.019900820999737334, "mb_per_s": 803.9869310020516, "per_obj_ms": 2.4876026249671668}
+BENCHROW batch {"phase": "in_memory", "n": 16, "total_mb": 32.0, "median_s": 0.03383925699995416, "min_s": 0.03362326000001303, "max_s": 0.03416677000018353, "transfer_s": 0.032320744999879025, "mb_per_s": 990.0761879133595, "per_obj_ms": 2.020046562492439}
+BENCHROW batch {"phase": "in_memory", "n": 32, "total_mb": 64.0, "median_s": 0.06327182800009723, "min_s": 0.06283605299995543, "max_s": 0.06394885600002453, "transfer_s": 0.061753316000022096, "mb_per_s": 1036.381592852068, "per_obj_ms": 1.9297911250006905}
+===== [batch] done =====
+===== [nobatch] setup: 959243851260.dkr.ecr.us-west-2.amazonaws.com/yuanzhuo-temp:nobatch-rpc_fix =====
+Warning: Permanently added '44.250.132.231' (ECDSA) to the list of known hosts.
+Warning: Permanently added '44.250.132.231' (ECDSA) to the list of known hosts.
+  head @ 10.0.209.111 ready
+Warning: Permanently added '184.34.85.35' (ECDSA) to the list of known hosts.
+  worker @ 10.0.213.222 ready
+  waiting for 2 nodes...
+Warning: Permanently added '44.250.132.231' (ECDSA) to the list of known hosts.
+    -> 2/2
+===== [nobatch] benchmark =====
+Warning: Permanently added '44.250.132.231' (ECDSA) to the list of known hosts.
+producer node A : f72741cf18b3  10.0.209.111  store=9122 MiB
+consumer node B : 42a613355f41  10.0.213.222
+object size     : 0.06 MiB   sweep=[1, 4, 16, 64, 256]   trials=5 warmup=2
+
+=== Phase 1: in-memory pull (A plasma -> B) ===
+(empty-task baseline on consumer: 1.38 ms, subtracted)
+ objs      MB     median       min       max   transfer      MB/s   per-obj
+    1     0.1      3.40m     3.15m     3.62m      2.03m      30.9    2.03ms
+    4     0.2      4.51m     4.41m     4.73m      3.13m      79.8    0.78ms
+   16     1.0      8.70m     8.26m     8.93m      7.33m     136.5    0.46ms
+   64     4.0     23.07m    22.58m    23.99m     21.70m     184.4    0.34ms
+  256    16.0     83.36m    81.00m    91.75m     81.99m     195.2    0.32ms
+BENCHROW nobatch {"phase": "in_memory", "n": 1, "total_mb": 0.0625, "median_s": 0.003401933000077406, "min_s": 0.003153381999936755, "max_s": 0.0036223189999873284, "transfer_s": 0.0020251030000508763, "mb_per_s": 30.86262772729576, "per_obj_ms": 2.0251030000508763}
+BENCHROW nobatch {"phase": "in_memory", "n": 4, "total_mb": 0.25, "median_s": 0.0045079120000082185, "min_s": 0.004409953999811478, "max_s": 0.004731551000077161, "transfer_s": 0.0031310819999816886, "mb_per_s": 79.84460323985832, "per_obj_ms": 0.7827704999954221}
+BENCHROW nobatch {"phase": "in_memory", "n": 16, "total_mb": 1.0, "median_s": 0.008702062000111255, "min_s": 0.008260666999831301, "max_s": 0.008933641000112402, "transfer_s": 0.007325232000084725, "mb_per_s": 136.51444759543915, "per_obj_ms": 0.4578270000052953}
+BENCHROW nobatch {"phase": "in_memory", "n": 64, "total_mb": 4.0, "median_s": 0.023074441999824558, "min_s": 0.022580132000030062, "max_s": 0.023992818000124316, "transfer_s": 0.021697611999798028, "mb_per_s": 184.35208446151742, "per_obj_ms": 0.3390251874968442}
+BENCHROW nobatch {"phase": "in_memory", "n": 256, "total_mb": 16.0, "median_s": 0.08336461999988387, "min_s": 0.08100292300014189, "max_s": 0.09174733200006813, "transfer_s": 0.08198778999985734, "mb_per_s": 195.1510096811713, "per_obj_ms": 0.32026480468694274}
+Warning: Permanently added '44.250.132.231' (ECDSA) to the list of known hosts.
+producer node A : f72741cf18b3  10.0.209.111  store=9122 MiB
+consumer node B : 42a613355f41  10.0.213.222
+object size     : 2.00 MiB   sweep=[1, 2, 4, 8, 16, 32]   trials=5 warmup=2
+
+=== Phase 1: in-memory pull (A plasma -> B) ===
+(empty-task baseline on consumer: 1.41 ms, subtracted)
+ objs      MB     median       min       max   transfer      MB/s   per-obj
+    1     2.0      5.85m     5.81m     6.38m      4.44m     450.4    4.44ms
+    2     4.0      8.91m     8.52m     9.30m      7.50m     533.2    3.75ms
+    4     8.0     12.23m    11.45m    12.78m     10.82m     739.3    2.71ms
+    8    16.0     21.17m    20.82m    21.67m     19.76m     809.5    2.47ms
+   16    32.0     33.92m    33.83m    34.04m     32.52m     984.0    2.03ms
+   32    64.0     62.62m    62.38m    63.90m     61.22m    1045.4    1.91ms
+BENCHROW nobatch {"phase": "in_memory", "n": 1, "total_mb": 2.0, "median_s": 0.0058453419999295875, "min_s": 0.005813175999946907, "max_s": 0.006383041999924899, "transfer_s": 0.00444032900009006, "mb_per_s": 450.41707494184226, "per_obj_ms": 4.44032900009006}
+BENCHROW nobatch {"phase": "in_memory", "n": 2, "total_mb": 4.0, "median_s": 0.008906444000103875, "min_s": 0.008521540999936406, "max_s": 0.009302037999987078, "transfer_s": 0.007501431000264347, "mb_per_s": 533.2315927266467, "per_obj_ms": 3.7507155001321735}
+BENCHROW nobatch {"phase": "in_memory", "n": 4, "total_mb": 8.0, "median_s": 0.012225540999907025, "min_s": 0.011453369999799179, "max_s": 0.012780088999988948, "transfer_s": 0.010820528000067497, "mb_per_s": 739.3354557143697, "per_obj_ms": 2.7051320000168744}
+BENCHROW nobatch {"phase": "in_memory", "n": 8, "total_mb": 16.0, "median_s": 0.021169216000089364, "min_s": 0.020816517999946882, "max_s": 0.021667092999905435, "transfer_s": 0.019764203000249836, "mb_per_s": 809.5444071181493, "per_obj_ms": 2.4705253750312295}
+BENCHROW nobatch {"phase": "in_memory", "n": 16, "total_mb": 32.0, "median_s": 0.03392470800008596, "min_s": 0.033831315000043105, "max_s": 0.034044262999941566, "transfer_s": 0.03251969500024643, "mb_per_s": 984.0190690520778, "per_obj_ms": 2.032480937515402}
+BENCHROW nobatch {"phase": "in_memory", "n": 32, "total_mb": 64.0, "median_s": 0.06262267900001461, "min_s": 0.062379626000165445, "max_s": 0.06389742400006071, "transfer_s": 0.061217666000175086, "mb_per_s": 1045.449854292337, "per_obj_ms": 1.9130520625054714}
+===== [nobatch] done =====
