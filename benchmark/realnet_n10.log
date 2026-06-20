@@ -1,0 +1,32 @@
+Warning: Permanently added '44.234.254.41' (ECDSA) to the list of known hosts.
+Warning: Permanently added '44.234.254.41' (ECDSA) to the list of known hosts.
+Warning: Permanently added '184.32.54.14' (ECDSA) to the list of known hosts.
+Warning: Permanently added '44.234.254.41' (ECDSA) to the list of known hosts.
+Warning: Permanently added '184.32.54.14' (ECDSA) to the list of known hosts.
+===== MODE nobatch =====
+Warning: Permanently added '44.234.254.41' (ECDSA) to the list of known hosts.
+  head ready
+Warning: Permanently added '184.32.54.14' (ECDSA) to the list of known hosts.
+  worker ready
+Warning: Permanently added '44.234.254.41' (ECDSA) to the list of known hosts.
+  nodes=2
+Warning: Permanently added '44.234.254.41' (ECDSA) to the list of known hosts.
+BENCHROW nobatch {"pullers": 16, "per_puller": 64, "obj_size_kb": 128.0, "total_obj": 1024, "total_mb": 128.0, "wall_s": 0.2830470060000039, "server_cpu_s": 0.6500000000000012, "sender_cpu_s": 1.0999999999999996, "raylet_cpu_s": 1.7500000000000009}
+Warning: Permanently added '44.234.254.41' (ECDSA) to the list of known hosts.
+BENCHROW nobatch {"pullers": 16, "per_puller": 64, "obj_size_kb": 512.0, "total_obj": 1024, "total_mb": 512.0, "wall_s": 0.44843099999999936, "server_cpu_s": 1.0399999999999991, "sender_cpu_s": 2.0650000000000013, "raylet_cpu_s": 3.1050000000000004}
+Warning: Permanently added '44.234.254.41' (ECDSA) to the list of known hosts.
+BENCHROW nobatch {"pullers": 16, "per_puller": 64, "obj_size_kb": 1024.0, "total_obj": 1024, "total_mb": 1024.0, "wall_s": 0.8800935505000211, "server_cpu_s": 1.67499999999999, "sender_cpu_s": 3.5350000000000037, "raylet_cpu_s": 5.209999999999994}
+===== MODE batch =====
+Warning: Permanently added '44.234.254.41' (ECDSA) to the list of known hosts.
+  head ready
+Warning: Permanently added '184.32.54.14' (ECDSA) to the list of known hosts.
+  worker ready
+Warning: Permanently added '44.234.254.41' (ECDSA) to the list of known hosts.
+  nodes=2
+Warning: Permanently added '44.234.254.41' (ECDSA) to the list of known hosts.
+BENCHROW batch {"pullers": 16, "per_puller": 64, "obj_size_kb": 128.0, "total_obj": 1024, "total_mb": 128.0, "wall_s": 0.2837567864999926, "server_cpu_s": 0.4950000000000001, "sender_cpu_s": 1.0299999999999998, "raylet_cpu_s": 1.525}
+Warning: Permanently added '44.234.254.41' (ECDSA) to the list of known hosts.
+BENCHROW batch {"pullers": 16, "per_puller": 64, "obj_size_kb": 512.0, "total_obj": 1024, "total_mb": 512.0, "wall_s": 0.4485104755000009, "server_cpu_s": 0.8550000000000004, "sender_cpu_s": 2.004999999999999, "raylet_cpu_s": 2.8599999999999994}
+Warning: Permanently added '44.234.254.41' (ECDSA) to the list of known hosts.
+BENCHROW batch {"pullers": 16, "per_puller": 64, "obj_size_kb": 1024.0, "total_obj": 1024, "total_mb": 1024.0, "wall_s": 0.8815857714999709, "server_cpu_s": 1.4550000000000018, "sender_cpu_s": 3.5749999999999957, "raylet_cpu_s": 5.029999999999998}
+===== DONE =====
