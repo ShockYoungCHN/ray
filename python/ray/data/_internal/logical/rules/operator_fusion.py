@@ -291,12 +291,21 @@ class FuseOperators(Rule):
                 isinstance(up_logical_op, AbstractMap)
                 and isinstance(down_logical_op, RandomShuffle)
             )
-            # Do not fuse Repartition operator if shuffle is disabled
-            # (i.e. using split shuffle).
+            # Repartition fuses with upstream Map in two cases:
+            # - Repartition(shuffle=True): the classic full reshuffle.
+            # - down_op.absorbs_upstream_map_transformer(): a real sink
+            #   like ShuffleMapOpV3 (keyed hash shuffle keeps
+            #   shuffle=False on the logical op but still produces a
+            #   genuine shuffle physical op).
+            # Split repartition (shuffle=False, no absorber capability)
+            # stays excluded.
             or (
                 isinstance(up_logical_op, AbstractMap)
                 and isinstance(down_logical_op, Repartition)
-                and down_logical_op.shuffle
+                and (
+                    down_logical_op.shuffle
+                    or down_op.absorbs_upstream_map_transformer()
+                )
             )
         ):
             return False

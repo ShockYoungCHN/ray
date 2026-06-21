@@ -34,6 +34,7 @@ import tempfile
 import threading
 import time
 from typing import (
+    Any,
     Callable,
     Dict,
     Generator,
@@ -851,6 +852,7 @@ def v3_map_task(
     shuffle_id: str,
     token: str,
     transformer: MapBlockTransformer = None,
+    upstream_map_transformer: Optional[Any] = None,
     pool_budget_bytes: int = 16 * 1024 * 1024,
     compression: ShuffleCompression = None,
     fsync_on_close: bool = True,
@@ -981,7 +983,22 @@ def v3_map_task(
             def pool_size() -> int:
                 return sum(staging_bytes.values())
 
-            for blk in blocks:
+            # When OperatorFusionRule absorbs an upstream MapTransformer
+            # into this op, apply it inline before partitioning. Ray
+            # serializes the transformer via cloudpickle (handles nested
+            # closures that stdlib pickle would reject). The generator
+            # chain stays lazy: one input block flows through the full
+            # read/map chain into _partition_units, then the next.
+            if upstream_map_transformer is not None:
+                from ray.data._internal.execution.interfaces import TaskContext
+
+                block_iter = upstream_map_transformer.apply_transform(
+                    iter(blocks), TaskContext(task_idx=map_id)
+                )
+            else:
+                block_iter = blocks
+
+            for blk in block_iter:
                 if transformer is not None:
                     blk = transformer(blk)
                 for pid, shard in _partition_units(blk):
