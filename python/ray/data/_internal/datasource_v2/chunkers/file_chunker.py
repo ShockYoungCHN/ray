@@ -150,11 +150,23 @@ class ParquetFileChunkMetadata(ChunkMetadata):
     estimate (see :func:`estimate_chunk_in_memory_size`), carried through the
     manifest so :class:`FooterDerivedInMemorySizeEstimator` can size partitions
     without a global encoding-ratio guess.
+
+    ``num_rows`` is the chunk's exact pre-filter row count (sum of the row
+    groups' ``num_rows`` from the footer), used by
+    :class:`LimitAwareFilePartitioner` to stop emitting partitions once the
+    scanner's pushed limit is satisfied.
+
+    max_emit_rows is the maximum number of rows this chunk should emit at
+    read time. Defaults to num_rows (emit every row). LimitAwareFilePartitioner
+    overwrites it on the boundary chunk with the residual row count so the
+    reader can trim to exactly the pushed limit without a downstream Limit op.
     """
 
     row_group_start: int  # inclusive
     row_group_end: int  # exclusive
     in_memory_size: int  # footer-derived Arrow in-memory estimate (bytes)
+    num_rows: int  # footer-derived pre-filter row count
+    max_emit_rows: int  # rows to emit (defaults to num_rows; boundary trims)
 
 
 class ByteEstimateParquetFileChunkMetadata(ChunkMetadata):
@@ -190,6 +202,15 @@ class FileChunker(abc.ABC):
     # pool so the per-file reads parallelize even for a single input
     # directory. When False, the indexer chunks inline (no thread hand-off).
     reads_file_metadata: bool = False
+
+    # Whether emitted chunk metadata carries the keys ``LimitAwareFilePartitioner``
+    # needs to enforce row-precise per-task emit (``num_rows`` and
+    # ``max_emit_rows``). Only ``ParquetFileChunker`` stamps them today;
+    # other chunkers fall back to relying on the downstream ``LimitOperator``
+    # for global precision. When False, ``LimitPushdownRule`` does NOT delete
+    # the ``Limit`` node (would otherwise over-emit because the boundary
+    # chunk isn't capped at the chunk level).
+    supports_row_count_limit: bool = False
 
     @abc.abstractmethod
     def generate_chunk_metadatas(
@@ -275,6 +296,12 @@ class LineDelimitedFileChunker(FileChunker):
 
 @DeveloperAPI
 class ParquetFileChunker(FileChunker):
+    # The only chunker that emits ``num_rows`` + ``max_emit_rows`` on each
+    # chunk, enabling row-precise per-task emit and safe ``Limit`` op
+    # deletion (see ``LimitAwareFilePartitioner`` and
+    # ``_can_drop_limit_after_pushdown``).
+    supports_row_count_limit: bool = True
+
     """File chunker for Parquet files.
 
     Reads each file's footer at listing time and chunks on **true row-group
@@ -389,6 +416,11 @@ class ParquetFileChunker(FileChunker):
                     row_group_start=start,
                     row_group_end=end,
                     in_memory_size=in_memory,
+                    num_rows=rows,
+                    # Default = emit every row in the chunk. The
+                    # LimitAwareFilePartitioner overwrites this on the
+                    # boundary chunk with the residual row count.
+                    max_emit_rows=rows,
                 ),
                 on_disk_size,
             )

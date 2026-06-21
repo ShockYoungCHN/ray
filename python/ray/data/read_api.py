@@ -404,9 +404,9 @@ def _resolve_read_remote_args(
         ray_remote_args = {}
     if not datasource.supports_distributed_reads:
         label_selector = ray_remote_args.get("label_selector", {})
-        label_selector[
-            ray._raylet.RAY_NODE_ID_KEY
-        ] = ray.get_runtime_context().get_node_id()
+        label_selector[ray._raylet.RAY_NODE_ID_KEY] = (
+            ray.get_runtime_context().get_node_id()
+        )
         ray_remote_args["label_selector"] = label_selector
         ray_remote_args.pop("scheduling_strategy", None)
     if (
@@ -553,8 +553,11 @@ def _read_datasource_v2(
             num_buckets=num_buckets,
         )
     else:
-        # "file_affinity" (default): keep each file's chunks in that file's own
-        # size-bounded partitions (locality + sub-file parallelism).
+        # "file_affinity" (default): keep each file's chunks in that file's
+        # own size-bounded partitions (locality + sub-file parallelism).
+        # Bytes-based cap on this path; LimitPushdownRule swaps in a row
+        # cap (via _rebuild_partitioner_with_row_cap) when a limit is
+        # pushed down.
         partitioner = FileAffinityPartitioner(
             in_memory_size_estimator=estimator,
             max_bucket_size=max_bucket_size,

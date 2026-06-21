@@ -252,15 +252,31 @@ class FileReader(Reader[FileManifest]):
         }
         scanner_kwargs.update(self._arrow_scanner_kwargs())
 
+        # Per-task emit budget derived from the manifest's chunk metadata.
+        # ``LimitAwareFilePartitioner`` stamps ``max_emit_rows`` on the
+        # boundary chunk that crosses the pushed scanner limit; the other
+        # chunks in this task have their full ``num_rows``. The effective
+        # task cap is the min of the global per-task ``self._limit`` and
+        # this per-task local budget — which is what makes per-task emit
+        # row-precise (the precondition for safely deleting the downstream
+        # ``Limit`` op and enabling Read+ShuffleMap fusion).
+        manifest_budget = _compute_manifest_emit_budget(input_split)
+        if self._limit is not None and manifest_budget is not None:
+            effective_limit: Optional[int] = min(self._limit, manifest_budget)
+        elif manifest_budget is not None:
+            effective_limit = manifest_budget
+        else:
+            effective_limit = self._limit
+
         rows_read = 0
         for table, fragment_path, fragment_row_offset in self._read_fragment_batches(
             dataset, scanner_kwargs, input_split
         ):
-            if self._limit is not None:
-                if rows_read >= self._limit:
+            if effective_limit is not None:
+                if rows_read >= effective_limit:
                     break
-                if len(table) > self._limit - rows_read:
-                    table = table.slice(0, self._limit - rows_read)
+                if len(table) > effective_limit - rows_read:
+                    table = table.slice(0, effective_limit - rows_read)
 
             # Build the list of (name, value) pairs to synthesize from
             # the fragment path: hive partitions + optional ``path``.
@@ -511,3 +527,25 @@ class FileReader(Reader[FileManifest]):
         scanner = fragment.scanner(**scanner_kwargs, schema=fragment_schema)
         for tagged in scanner.scan_batches():
             yield pa.Table.from_batches(batches=[tagged.record_batch])
+
+
+def _compute_manifest_emit_budget(manifest: FileManifest) -> Optional[int]:
+    """Sum per-chunk max_emit_rows into a per-task emit cap.
+
+    Chunkers that support row-precise pushdown (supports_row_count_limit=True)
+    stamp max_emit_rows on every chunk: full num_rows by default,
+    overwritten to the residual on the boundary chunk by
+    LimitAwareFilePartitioner. Their sum is the exact number of rows this
+    task should emit, so per-task emit is row-precise and the downstream
+    Limit op can be dropped.
+
+    Returns None when any chunk lacks max_emit_rows (whole-file chunks,
+    line-delimited chunks, etc.). The caller falls back to the scanner's
+    global per-task limit in that case.
+    """
+    total = 0
+    for chunk_md in manifest.file_chunk_metadatas:
+        if chunk_md is None or "max_emit_rows" not in chunk_md:
+            return None
+        total += int(chunk_md["max_emit_rows"])
+    return total

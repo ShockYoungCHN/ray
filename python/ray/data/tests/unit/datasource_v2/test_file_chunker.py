@@ -1,4 +1,5 @@
 """Unit tests for ``FileChunker`` implementations in DataSourceV2."""
+
 from pathlib import Path
 from typing import cast
 
@@ -44,6 +45,8 @@ class TestCreateChunkMetadata:
                 row_group_start=0,
                 row_group_end=1,
                 in_memory_size=0,
+                num_rows=10,
+                max_emit_rows=10,
                 extra_field="boom",
             )
 
@@ -53,11 +56,15 @@ class TestCreateChunkMetadata:
             row_group_start=2,
             row_group_end=5,
             in_memory_size=123,
+            num_rows=100,
+            max_emit_rows=100,
         )
         assert md == {
             "row_group_start": 2,
             "row_group_end": 5,
             "in_memory_size": 123,
+            "num_rows": 100,
+            "max_emit_rows": 100,
         }
 
 
@@ -239,6 +246,8 @@ def test_chunk_metadata_subclasses_are_typeddicts():
         row_group_start=0,
         row_group_end=1,
         in_memory_size=0,
+        num_rows=0,
+        max_emit_rows=0,
     )
     lmd: ChunkMetadata = create_chunk_metadata(
         LineDelimitedFileChunkMetadata,
@@ -248,7 +257,13 @@ def test_chunk_metadata_subclasses_are_typeddicts():
     bmd: ChunkMetadata = create_chunk_metadata(
         ByteEstimateParquetFileChunkMetadata, chunk_idx=0, total_num_chunks=4
     )
-    assert set(pmd.keys()) == {"row_group_start", "row_group_end", "in_memory_size"}
+    assert set(pmd.keys()) == {
+        "row_group_start",
+        "row_group_end",
+        "in_memory_size",
+        "num_rows",
+        "max_emit_rows",
+    }
     assert set(lmd.keys()) == {"chunk_byte_start_idx", "chunk_byte_end_idx"}
     assert set(bmd.keys()) == {"chunk_idx", "total_num_chunks"}
 

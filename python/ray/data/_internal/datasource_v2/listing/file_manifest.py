@@ -13,6 +13,23 @@ FILE_SIZE_COLUMN_NAME = "__file_size"
 FILE_CHUNK_METADATA_COLUMN_NAME = "__file_chunk_metadata"
 
 
+def chunk_num_rows(chunk_md: Optional[ChunkMetadata]) -> int:
+    """Read ``num_rows`` from chunk metadata; 0 for whole-file or non-row-
+    aware chunks.
+
+    Whole-file chunkers and line-delimited chunkers don't stamp a row
+    count -- this helper returns 0 in those cases so callers can
+    accumulate without checking chunker type first. Row-aware partitioners
+    will then either rely on a byte cap or emit one partition per file.
+    """
+    if chunk_md is None:
+        return 0
+    try:
+        return int(chunk_md.get("num_rows", 0))
+    except (AttributeError, TypeError):
+        return 0
+
+
 class FileManifest:
     """Structured view over file paths, sizes, and per-chunk metadata.
 

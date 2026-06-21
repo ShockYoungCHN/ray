@@ -14,10 +14,15 @@ from __future__ import annotations
 
 import logging
 from functools import partial
-from typing import List
+from typing import TYPE_CHECKING, List
 
 import numpy as np
 import pyarrow as pa
+
+if TYPE_CHECKING:
+    from ray.data._internal.datasource_v2.partitioners.file_partitioner import (
+        FilePartitioner,
+    )
 
 import ray
 from ray.data._internal.datasource_v2.listing.file_manifest import (
@@ -74,6 +79,37 @@ def plan_list_files_op(
     # only those columns. Otherwise size-balanced bucketing would over-size
     # partitions by the columns the read drops.
     _apply_projected_columns_to_chunker(indexer, op.projected_columns)
+
+    # Limit-aware partitioning: when a Limit was pushed down by
+    # LimitPushdownRule (stamped onto ListFiles.pushed_limit alongside the
+    # scanner-level push_limit), wrap the partitioner so listing stops
+    # emitting partitions once the accumulated chunk row count satisfies
+    # the limit.
+    #
+    # When the rule also stamped pushed_max_rows_per_partition -- computed
+    # CPU-aware as limit_rows / (2 * avail_cpus) -- rebuild the inner
+    # partitioner with that row cap so each FileManifest (= one ReadTask)
+    # lands at roughly 1 task per CPU per round (with 2x headroom).
+    #
+    # pushed_limit > 0 guard: ds.limit(0) pushes 0 through;
+    # LimitAwareFilePartitioner requires a positive limit and the pipeline
+    # below is empty anyway, so we skip wrapping.
+    if (
+        op.pushed_limit is not None
+        and op.pushed_limit > 0
+        and partitioner is not None
+    ):
+        from ray.data._internal.datasource_v2.partitioners.limit_aware_partitioner import (
+            LimitAwareFilePartitioner,
+        )
+
+        if op.pushed_max_rows_per_partition is not None:
+            partitioner = _rebuild_partitioner_with_row_cap(
+                partitioner, op.pushed_max_rows_per_partition
+            )
+        partitioner = LimitAwareFilePartitioner(
+            inner=partitioner, limit_rows=op.pushed_limit
+        )
 
     shuffle_config = op.shuffle_config_factory()
 
@@ -134,6 +170,35 @@ def plan_list_files_op(
     )
     map_op.throttling_disabled = lambda: True
     return map_op
+
+
+def _rebuild_partitioner_with_row_cap(
+    partitioner: "FilePartitioner", new_max_rows_per_partition: int
+) -> "FilePartitioner":
+    """Return a partitioner equivalent to partitioner with the given
+    max_rows_per_partition stacked on top of its existing caps.
+
+    Preserves the original byte cap and estimator -- the limit-pushdown
+    path layers a row cap onto whatever the non-limit path was sized with,
+    so wide-row files still flush on the byte cap before a row task balloons
+    in memory. For non-Parquet chunkers (no num_rows on chunks) the row cap
+    never trips and the byte cap continues to drive flushing as before.
+
+    Falls back to partitioner unchanged for types that don't expose a
+    row-count cap. RoundRobinPartitioner is not row-count-aware and is
+    left as-is.
+    """
+    from ray.data._internal.datasource_v2.partitioners.file_affinity_partitioner import (
+        FileAffinityPartitioner,
+    )
+
+    if isinstance(partitioner, FileAffinityPartitioner):
+        return FileAffinityPartitioner(
+            in_memory_size_estimator=partitioner._in_memory_size_estimator,
+            max_bucket_size=partitioner._max_bucket_size,
+            max_rows_per_partition=new_max_rows_per_partition,
+        )
+    return partitioner
 
 
 def _apply_projected_columns_to_chunker(indexer, projected_columns) -> None:
