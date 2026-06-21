@@ -19,6 +19,7 @@ from ray.data._internal.datasource.parquet_datasource import (
     check_for_legacy_tensor_type,
 )
 from ray.data._internal.datasource_v2.chunkers.file_chunker import (
+    ByteEstimateParquetFileChunker,
     FileChunker,
     ParquetFileChunker,
 )
@@ -35,6 +36,8 @@ from ray.data._internal.datasource_v2.readers.file_reader import (
     INCLUDE_PATHS_COLUMN_NAME,
 )
 from ray.data._internal.datasource_v2.readers.in_memory_size_estimator import (
+    FooterDerivedInMemorySizeEstimator,
+    InMemorySizeEstimator,
     ParquetInMemorySizeEstimator,
 )
 from ray.data._internal.datasource_v2.scanners.parquet_scanner import ParquetScanner
@@ -111,14 +114,19 @@ class ParquetDatasourceV2(DataSourceV2[FileManifest]):
         # footers, and the scanner pins it on the pyarrow dataset so files
         # are cast to these types at scan time.
         self._user_schema = schema
-        # Chunker that splits each listed Parquet file into one or more
-        # row-group-aligned read units. Defaults to ``ParquetFileChunker``
-        # (1 GiB target chunk size, or whatever ``DataContext`` configures).
-        # Callers can inject an alternative for tests or shuffle-aware
-        # planning code that wants whole-file reads.
-        self._file_chunker: FileChunker = (
-            file_chunker if file_chunker is not None else ParquetFileChunker()
-        )
+        # Chunker that splits each listed Parquet file into parallel-read
+        # units. An explicitly injected ``file_chunker`` always wins (tests,
+        # shuffle-aware planning that wants whole-file reads). Otherwise the
+        # runtime ``DataContext.parquet_chunker_row_group_aware`` flag selects
+        # the row-group-aware ``ParquetFileChunker`` (default) or the legacy
+        # ``ByteEstimateParquetFileChunker`` — toggleable per read for A/B
+        # experiments, like ``use_datasource_v2``.
+        if file_chunker is not None:
+            self._file_chunker: FileChunker = file_chunker
+        elif DataContext.get_current().parquet_chunker_row_group_aware:
+            self._file_chunker = ParquetFileChunker()
+        else:
+            self._file_chunker = ByteEstimateParquetFileChunker()
 
     @property
     def paths(self) -> List[str]:
@@ -154,7 +162,17 @@ class ParquetDatasourceV2(DataSourceV2[FileManifest]):
             file_chunker=self._file_chunker,
         )
 
-    def get_size_estimator(self) -> ParquetInMemorySizeEstimator:
+    def get_size_estimator(self) -> InMemorySizeEstimator:
+        # When the row-group-aware chunker is in use it stamps a footer-derived,
+        # type-aware in-memory estimate on each chunk; prefer that over the flat
+        # encoding-ratio guess so partition sizing tracks per-file compression /
+        # encoding. Falls back to the constant-ratio estimator otherwise (legacy
+        # byte-estimate chunker, or the flag turned off for A/B).
+        ctx = DataContext.get_current()
+        if ctx.parquet_use_footer_size_estimate and isinstance(
+            self._file_chunker, ParquetFileChunker
+        ):
+            return FooterDerivedInMemorySizeEstimator()
         return ParquetInMemorySizeEstimator()
 
     @override
@@ -304,6 +322,13 @@ class ParquetDatasourceV2(DataSourceV2[FileManifest]):
             include_row_hash=self._include_row_hash,
             shuffle=self._shuffle,
             ignore_prefixes=options.get("ignore_prefixes"),
-            target_block_size=DataContext.get_current().target_max_block_size,
+            # Per-batch decode target. Defaults to ``target_max_block_size`` but
+            # can be set independently via ``parquet_reader_target_batch_size_bytes``
+            # to decode in finer batches (lower transient memory) without
+            # changing the output-block size.
+            target_block_size=(
+                DataContext.get_current().parquet_reader_target_batch_size_bytes
+                or DataContext.get_current().target_max_block_size
+            ),
             parquet_format_kwargs=dict(self._parquet_format_kwargs),
         )
