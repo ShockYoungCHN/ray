@@ -553,8 +553,11 @@ def _read_datasource_v2(
             num_buckets=num_buckets,
         )
     else:
-        # "file_affinity" (default): keep each file's chunks in that file's own
-        # size-bounded partitions (locality + sub-file parallelism).
+        # "file_affinity" (default): keep each file's chunks in that file's
+        # own size-bounded partitions (locality + sub-file parallelism).
+        # Bytes-based cap on this path; LimitPushdownRule swaps in a row
+        # cap (via _rebuild_partitioner_with_row_cap) when a limit is
+        # pushed down.
         partitioner = FileAffinityPartitioner(
             in_memory_size_estimator=estimator,
             max_bucket_size=max_bucket_size,

@@ -1,7 +1,7 @@
 import copy
 import logging
 from dataclasses import is_dataclass, replace
-from typing import List
+from typing import List, Optional
 
 from ray.data._internal.logical.interfaces import LogicalOperator, LogicalPlan, Rule
 from ray.data._internal.logical.operators import (
@@ -43,6 +43,11 @@ class LimitPushdownRule(Rule):
     """
 
     def apply(self, plan: LogicalPlan) -> LogicalPlan:
+        # Snapshot cluster CPU count once per apply() so plan reproducibility
+        # isn't subject to autoscale flicker mid-optimization (and so we
+        # don't re-issue ray.cluster_resources() per Limit node).
+        self._avail_cpus_snapshot = _try_get_avail_cpus()
+
         # The DAG's root is the most downstream operator.
         def transform(node: LogicalOperator) -> LogicalOperator:
             if isinstance(node, Limit):
@@ -67,23 +72,14 @@ class LimitPushdownRule(Rule):
         optimized_dag = plan.dag._apply_transform(transform)
         return LogicalPlan(dag=optimized_dag, context=plan.context)
 
-    def _apply_limit_pushdown(self, op: LogicalOperator) -> LogicalOperator:
-        """Push down Limit operators in the given operator DAG.
-
-        This implementation uses ``LogicalOperator._apply_transform`` to
-        post-order-traverse the DAG and rewrite each ``Limit`` node via
-        :py:meth:`_push_limit_down`.
-        """
-
-        def transform(node: LogicalOperator) -> LogicalOperator:
-            if isinstance(node, Limit):
-                if isinstance(node.input_dependencies[0], Union):
-                    return self._push_limit_into_union(node)
-                return self._push_limit_down(node)
-            return node
-
-        # ``_apply_transform`` returns the (potentially new) root of the DAG.
-        return op._apply_transform(transform)
+    def _get_avail_cpus_cached(self) -> Optional[float]:
+        """Return the apply()-time cluster CPU snapshot; lazy-init for unit
+        tests that invoke helpers directly without going through apply()."""
+        snap = getattr(self, "_avail_cpus_snapshot", None)
+        if snap is None:
+            snap = _try_get_avail_cpus()
+            self._avail_cpus_snapshot = snap
+        return snap
 
     def _push_limit_into_union(self, limit_op: Limit) -> Limit:
         """Push `limit_op` INTO every branch of its upstream Union
@@ -144,50 +140,85 @@ class LimitPushdownRule(Rule):
         return Limit(limit_op.limit, input_dependencies=[new_union])
 
     def _push_limit_down(self, limit_op: Limit) -> LogicalOperator:
-        """Push a single limit down through compatible operators conservatively.
+        """Push a single Limit down through compatible operators conservatively.
 
-        Creates entirely new operators instead of mutating existing ones.
+        Two independent decisions:
+          1. Walk through row-preserving ops above the source, collecting
+             them for re-creation below the new Limit position.
+          2. Ask the source to absorb the limit (per-block / scanner-level).
+
+        Build the chain bottom-up: source -> (optional Limit) -> preserving.
+        The Limit node is elided when the source guarantees row-precise
+        emit (see ``_can_drop_limit_after_pushdown``).
+
+        Returns ``limit_op`` unchanged only when neither decision did
+        anything (no preserving ops AND the source didn't absorb).
+        Creates new operator instances; never mutates existing ones.
         """
-        # Traverse up the DAG until we reach the first operator that meets
-        # one of the stopping conditions
-        current_op = limit_op.input_dependencies[0]
-        num_rows_preserving_ops: List[LogicalOperator] = []
-        while (
-            isinstance(current_op, AbstractOneToOne)
-            and not current_op.can_modify_num_rows
-        ):
-            if isinstance(current_op, AbstractMap):
-                min_rows = current_op.min_rows_per_bundled_input
-                if min_rows is not None and min_rows > limit_op.limit:
-                    # Avoid pushing the limit past batch-based maps that require more
-                    # rows than the limit to produce stable outputs (e.g. schema).
-                    logger.info(
-                        f"Skipping push down of limit {limit_op.limit} through map {current_op} because it requires {min_rows} rows to produce stable outputs"
-                    )
-                    break
-            num_rows_preserving_ops.append(current_op)
-            current_op = current_op.input_dependencies[0]
+        source_op = limit_op.input_dependencies[0]
+        preserving: List[LogicalOperator] = []
+        while self._is_row_preserving(source_op, limit_op.limit):
+            preserving.append(source_op)
+            source_op = source_op.input_dependencies[0]
 
-        # If we couldn't push through any operators, return original
-        if not num_rows_preserving_ops:
-            return limit_op
-        # Apply per-block limit to the deepest operator if it supports it
-        limit_input = self._apply_per_block_limit_if_supported(
-            current_op, limit_op.limit
+        pushed, absorbed, precise = self._apply_pushdown(
+            source_op, limit_op.limit
         )
 
-        # Build the new operator chain: Chain non-preserving number of rows -> Limit -> Operators preserving number of rows
-        new_limit = Limit(limit_op.limit, input_dependencies=[limit_input])
-        result_op = new_limit
+        if not preserving and not absorbed:
+            return limit_op
 
-        # Recreate the intermediate operators and apply per-block limits
-        for op_to_recreate in reversed(num_rows_preserving_ops):
-            recreated_op = self._recreate_operator_with_new_input(
-                op_to_recreate, result_op
-            )
-            result_op = recreated_op
+        head: LogicalOperator = (
+            pushed
+            if precise
+            else Limit(limit_op.limit, input_dependencies=[pushed])
+        )
+        for op in reversed(preserving):
+            head = self._recreate_operator_with_new_input(op, head)
+        return head
 
-        return result_op
+    def _is_row_preserving(
+        self, op: LogicalOperator, limit: int
+    ) -> bool:
+        """True when ``op`` definitely doesn't change row counts and is safe
+        to walk past during pushdown.
+
+        Stops on batch-based maps whose ``min_rows_per_bundled_input``
+        exceeds the limit (those need a batch larger than the limit to
+        produce stable outputs).
+        """
+        if not (
+            isinstance(op, AbstractOneToOne) and not op.can_modify_num_rows
+        ):
+            return False
+        if isinstance(op, AbstractMap):
+            min_rows = op.min_rows_per_bundled_input
+            if min_rows is not None and min_rows > limit:
+                logger.info(
+                    f"Skipping push down of limit {limit} through map "
+                    f"{op} because it requires {min_rows} rows to produce "
+                    f"stable outputs"
+                )
+                return False
+        return True
+
+    def _apply_pushdown(
+        self, op: LogicalOperator, limit: int
+    ) -> "tuple[LogicalOperator, bool, bool]":
+        """Apply per-block / scanner pushdown to ``op``.
+
+        Returns ``(new_op, absorbed, precise)``:
+          - ``absorbed``: the source took the limit (new_op is a new instance).
+          - ``precise``: per-task emit is row-precise so the Limit node can
+            be dropped from the plan (see ``_can_drop_limit_after_pushdown``).
+        """
+        new_op = self._apply_per_block_limit_if_supported(op, limit)
+        if new_op is op:
+            return op, False, False
+        precise = _can_drop_limit_after_pushdown(
+            original=op, pushed=new_op, limit=limit
+        )
+        return new_op, True, precise
 
     def _apply_per_block_limit_if_supported(
         self, op: LogicalOperator, limit: int
@@ -207,9 +238,45 @@ class LimitPushdownRule(Rule):
                     )
 
                     if isinstance(op.scanner, SupportsLimitPushdown):
-                        return replace(
+                        new_op = replace(
                             op,
                             scanner=op.scanner.push_limit(limit),
+                        )
+                        # Mirror the pushed limit onto the upstream
+                        # ListFiles so its physical planner can wrap the
+                        # partitioner with LimitAwareFilePartitioner and
+                        # stop dispatching read tasks whose rows would be
+                        # discarded by the downstream Limit op. Compute a
+                        # per-task row cap so each bucket lands ~1-2 tasks
+                        # per CPU; when the read specifies an explicit
+                        # parallelism, honor it instead of the CPU default.
+                        explicit_partitions = (
+                            new_op.parallelism if new_op.parallelism > 0 else None
+                        )
+                        if (
+                            explicit_partitions is not None
+                            and explicit_partitions > limit
+                        ):
+                            # row_cap floors to 1, so the partitioner
+                            # produces at most `limit` partitions (and
+                            # often fewer once Parquet row-group
+                            # granularity collapses chunks into a single
+                            # task). Surface the mismatch so users don't
+                            # silently get fewer tasks than requested.
+                            logger.info(
+                                f"read parallelism={explicit_partitions} "
+                                f"exceeds limit={limit}; effective read "
+                                f"task count will be at most {limit} "
+                                f"(possibly fewer due to Parquet row-"
+                                f"group granularity)."
+                            )
+                        target_row_cap = _compute_cpu_aware_row_cap(
+                            limit_rows=limit,
+                            num_partitions=explicit_partitions,
+                            avail_cpus=self._get_avail_cpus_cached(),
+                        )
+                        return _stamp_pushed_limit_on_list_files(
+                            new_op, limit, target_row_cap
                         )
                     return op
                 assert len(op.input_dependencies) == 1, len(op.input_dependencies)
@@ -245,3 +312,124 @@ class LimitPushdownRule(Rule):
         new_op = copy.copy(original_op)
         new_op.input_dependencies = [new_input]
         return new_op
+
+
+def _compute_cpu_aware_row_cap(
+    *,
+    limit_rows: int,
+    num_partitions: Optional[int] = None,
+    avail_cpus: Optional[float] = None,
+) -> Optional[int]:
+    """Per-task row cap aligning ReadTask count with parallelism.
+
+    Picks ``num_partitions`` from (in priority order): the explicit
+    argument, then ``2 * avail_cpus`` (the standard "2x CPU" floor for
+    straggler tolerance). Returns None when neither source yields a
+    positive value -- the partitioner keeps its default sizing in that
+    case.
+
+    Callers pass ``avail_cpus`` from a snapshot taken once per apply() so
+    plan reproducibility doesn't depend on autoscale timing.
+    """
+    if num_partitions is None:
+        if avail_cpus is None or avail_cpus <= 0:
+            return None
+        num_partitions = max(int(2 * avail_cpus), 1)
+    if num_partitions <= 0:
+        return None
+    return max(limit_rows // num_partitions, 1)
+
+
+def _try_get_avail_cpus() -> Optional[float]:
+    """Return ``ray.cluster_resources()['CPU']`` if Ray is reachable."""
+    try:
+        import ray
+
+        return ray.cluster_resources().get("CPU")
+    except Exception:
+        return None
+
+
+def _can_drop_limit_after_pushdown(
+    *,
+    original: LogicalOperator,
+    pushed: LogicalOperator,
+    limit: int,
+) -> bool:
+    """Return True iff the per-task emit row count is row-precise after
+    pushdown — so the ``Limit`` node can be deleted from the plan.
+
+    Conditions:
+
+    1. The scanner absorbed the pushdown (``pushed`` is a new instance with
+       the limit set on its scanner).
+    2. The upstream ``ListFiles`` accepted the same pushed limit, which
+       implies ``LimitAwareFilePartitioner`` will wrap the partitioner.
+    3. The ``ListFiles.file_indexer.file_chunker`` advertises
+       ``supports_row_count_limit = True``. Only chunkers that stamp
+       ``num_rows`` + ``max_emit_rows`` on chunk metadata make the
+       boundary trim work. Without this, ``Limit`` deletion would silently
+       allow multi-task over-emission (each task capped at per-task
+       ``scanner.limit`` rather than at a chunk-derived budget).
+
+    Dropping ``Limit`` removes a fusion barrier between ``Read`` and any
+    downstream ``ShuffleMap`` / ``Map`` / ``Write``, enabling the standard
+    ``OperatorFusionRule`` to fuse across what used to be a pipeline cut.
+    """
+    from ray.data._internal.logical.operators.read_operator import ListFiles
+
+    if pushed is original:
+        return False
+    deps = getattr(pushed, "input_dependencies", None)
+    if not deps or not isinstance(deps[0], ListFiles):
+        return False
+    list_files = deps[0]
+    # pushed_limit may be tighter than the current `limit` if the rule
+    # re-entered with a different value (_stamp_pushed_limit_on_list_files
+    # keeps `min(existing, new)`). Tighter pushdown is safe to drop the
+    # Limit op against -- per-task emit caps at pushed_limit <= limit, so
+    # total output stays within the user-requested bound. Looser
+    # (pushed_limit > limit) or absent is not safe; keep the Limit op.
+    if list_files.pushed_limit is None or list_files.pushed_limit > limit:
+        return False
+    indexer = getattr(list_files, "file_indexer", None)
+    chunker = getattr(indexer, "file_chunker", None)
+    if not getattr(chunker, "supports_row_count_limit", False):
+        return False
+    return True
+
+
+def _stamp_pushed_limit_on_list_files(
+    read_op: LogicalOperator,
+    limit: int,
+    max_rows_per_partition: Optional[int] = None,
+) -> LogicalOperator:
+    """Stamp the pushed row limit (and optional per-partition row cap) onto
+    a ReadFiles' upstream ListFiles.
+
+    Re-entrant: keeps the tighter of (existing, new) limit via min(...),
+    and short-circuits when both fields would be unchanged. The fixed-
+    point optimizer can call us multiple times.
+    """
+    from ray.data._internal.logical.operators.read_operator import ListFiles
+
+    deps = read_op.input_dependencies
+    if not deps or not isinstance(deps[0], ListFiles):
+        return read_op
+    list_files = deps[0]
+    existing = list_files.pushed_limit
+    # min(existing, limit) keeps the tighter cap if the rule re-enters
+    # with a smaller limit on a later pass.
+    new_limit = limit if existing is None else min(existing, limit)
+    existing_cap = list_files.pushed_max_rows_per_partition
+    # When the limit tightens we always recompute; when it stays the same
+    # we keep whatever row cap was already set.
+    new_cap = max_rows_per_partition if existing != new_limit else existing_cap
+    if existing == new_limit and existing_cap == new_cap:
+        return read_op
+    new_list_files = replace(
+        list_files,
+        pushed_limit=new_limit,
+        pushed_max_rows_per_partition=new_cap,
+    )
+    return replace(read_op, input_dependencies=[new_list_files])

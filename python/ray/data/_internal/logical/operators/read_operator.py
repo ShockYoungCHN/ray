@@ -459,6 +459,22 @@ class ListFiles(LogicalOperator, SourceOperator):
     # ``ParquetFileChunker.projected_columns``. Sizing-only: it does not affect
     # which files are listed or what the read returns.
     projected_columns: Optional[List[str]] = None
+    # Row count pushed down from a ``Limit`` op above the consuming
+    # ``ReadFiles``. Populated by ``LimitPushdownRule`` alongside the scanner-
+    # level ``push_limit``. ``plan_list_files_op`` reads it to wrap the
+    # partitioner with :class:`LimitAwareFilePartitioner` so listing stops
+    # emitting partitions once the accumulated row count satisfies the limit,
+    # avoiding dispatch of read tasks whose output would be discarded.
+    # ``None`` means "no pushed limit" (full listing).
+    pushed_limit: Optional[int] = None
+    # Optional plan-time per-task row budget, set by LimitPushdownRule to
+    # align ReadTask count with cluster CPU count: limit_rows / (2 *
+    # avail_cpus). When set, plan_list_files_op rebuilds the inner
+    # partitioner with this as its max_rows_per_partition so each task is
+    # sized to land roughly one task per CPU (with the standard 2x
+    # headroom for straggler tolerance). None falls back to the
+    # partitioner's default sizing (one partition per file).
+    pushed_max_rows_per_partition: Optional[int] = None
     _name: str = field(init=False, repr=False)
     _input_dependencies: List[LogicalOperator] = field(
         init=False, repr=False, default_factory=list
