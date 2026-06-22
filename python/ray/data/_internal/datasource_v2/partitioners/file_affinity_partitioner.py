@@ -1,34 +1,33 @@
 """File-affinity partitioner for DataSourceV2.
 
-Groups each file's chunks into bounded partitions, preserving file
-locality: every emitted partition holds chunks of exactly one file, and a
-file is split into multiple partitions of consecutive ("sister") row-group
-chunks when its accumulated size exceeds either of the configured caps.
-This gives read-task locality (one file per task -> one open + one footer
-read + sequential I/O) plus sub-file parallelism for large files.
+Two modes, picked at construction:
 
-Two flush caps may be configured (either or both):
+**Per-file mode (default)**: Groups each file's chunks into bounded
+partitions, preserving file locality -- every emitted partition holds
+chunks of exactly one file; a file is split into multiple partitions
+of consecutive row-group chunks when its accumulated size exceeds
+``max_rows_per_partition`` or ``max_bucket_size``. The number of
+partitions is data-driven: ``sum over files of
+ceil(file_total / cap)``. Floor is ``file_count`` -- this mode never
+merges chunks across files.
 
-- ``max_rows_per_partition``: row count cap, used directly by the limit-
-  pushdown path (``LimitPushdownRule`` derives it from ``limit_rows /
-  (2 * cpus)`` with no bytes intermediate). Row counts come from chunk
-  metadata (``num_rows`` field); chunkers that don't stamp it contribute
-  0 here, so the row cap is a no-op for non-row-aware formats.
+**Adaptive cross-file mode**: opted into by passing both ``total_rows``
+and ``num_partitions``. A single shared bucket accumulates chunks
+across files; flush is gated by an *adaptive target* recomputed at
+each step as ``remaining_rows / remaining_partitions``. Last partition
+swallows any leftover. Result: ~``num_partitions`` evenly-sized
+partitions regardless of file count -- file affinity is sacrificed
+for exact parallelism control. Used by the limit-pushdown path so
+``read_parquet(parallelism=N).limit(M)`` produces ~N read tasks even
+on many-small-file datasets where the per-file mode would floor at
+file count.
 
-- ``max_bucket_size``: in-memory byte cap, used by the default read path
-  (``read_api`` derives it from ``DataContext.target_max_block_size``).
-  Byte estimates come from the ``in_memory_size_estimator`` (footer-
-  derived for Parquet under ``parquet_use_footer_size_estimate``, fallback
-  on-disk * ratio otherwise).
-
-Either cap flushing triggers a partition emit; both can be set
-simultaneously. When neither is set, each file yields exactly one
-partition holding all its chunks (at ``finalize`` time).
-
-Contrast with :class:`RoundRobinPartitioner`, which spreads a file's
-chunks across buckets and so can mix multiple files within a single
-partition.
+Contrast with :class:`RoundRobinPartitioner`, which spreads chunks
+by byte size across a fixed num_buckets target. Adaptive mode here
+uses row counts directly, matching the row-cap semantics of the
+limit-pushdown path.
 """
+
 import collections
 from typing import Dict, List, Optional
 
@@ -44,31 +43,40 @@ from ray.data._internal.datasource_v2.readers.in_memory_size_estimator import (
 )
 
 
-class _FileBucket:
-    """Accumulates one file's chunks until it is flushed as a partition."""
+class _Bucket:
+    """Accumulates chunks (single file or multi-file) until flushed.
+
+    Used for both per-file mode (one bucket per path) and adaptive
+    cross-file mode (one shared bucket). to_manifest() preserves
+    insertion order across files and row-group-start order within a
+    file.
+    """
 
     def __init__(self):
         self.paths: List[str] = []
         self.file_sizes: List[int] = []
         self.chunk_metadatas: List[Optional[dict]] = []
-        self.sort_keys: List[int] = []
+        # (file_seq, row_group_start) — file_seq is the order this file
+        # was first encountered in the bucket, so ordering after sort
+        # keeps inter-file ordering deterministic in cross-file mode
+        # and degenerates to row_group_start in single-file mode.
+        self.sort_keys: List[tuple] = []
         self.in_memory_size: int = 0
         self.num_rows: int = 0
+        # Maps path -> file_seq (insertion index) for sort_key building.
+        self._file_seq: Dict[str, int] = {}
 
-    def add(
-        self, path, file_size, chunk_metadata, in_memory_size, num_rows, sort_key
-    ):
+    def add(self, path, file_size, chunk_metadata, in_memory_size, num_rows, rg_start):
+        if path not in self._file_seq:
+            self._file_seq[path] = len(self._file_seq)
         self.paths.append(path)
         self.file_sizes.append(file_size)
         self.chunk_metadatas.append(chunk_metadata)
-        self.sort_keys.append(sort_key)
+        self.sort_keys.append((self._file_seq[path], rg_start))
         self.in_memory_size += in_memory_size
         self.num_rows += num_rows
 
     def to_manifest(self) -> FileManifest:
-        # Sort by row-group start so each partition is a clean ascending range:
-        # deterministic output (the FilePartitioner contract) and lets the
-        # reader coalesce contiguous row groups into a single scan.
         order = sorted(range(len(self.paths)), key=lambda i: self.sort_keys[i])
         return FileManifest.construct_manifest(
             [self.paths[i] for i in order],
@@ -78,21 +86,12 @@ class _FileBucket:
 
 
 class FileAffinityPartitioner(FilePartitioner):
-    """Partitions chunks per file, bounded by row count and/or in-memory bytes.
+    """Partitions chunks per file (default) or adaptively across files.
 
-    All chunks of a file go to partitions of that file only (never mixed
-    with other files); a file accumulating past either cap is split into
-    multiple partitions of consecutive row-group chunks. ``num_buckets``
-    is intentionally absent: the number of partitions is data-driven
-    (sum over files of ``ceil(file_total / cap)``).
-
-    Groups by path (not arrival position): the indexer may interleave
-    different files' chunks via parallel footer reads, so contiguity in
-    the input stream is not assumed.
-
-    Both caps are optional. When both are set, whichever fills first
-    triggers the flush. When neither is set, each file yields exactly
-    one partition.
+    See module docstring for the two modes. Both caps for the per-file
+    mode (``max_rows_per_partition``, ``max_bucket_size``) are optional;
+    adaptive mode is opted into by passing both ``total_rows`` and
+    ``num_partitions``.
     """
 
     def __init__(
@@ -101,12 +100,31 @@ class FileAffinityPartitioner(FilePartitioner):
         in_memory_size_estimator: Optional[InMemorySizeEstimator] = None,
         max_bucket_size: Optional[int] = None,
         max_rows_per_partition: Optional[int] = None,
+        total_rows: Optional[int] = None,
+        num_partitions: Optional[int] = None,
     ):
         self._in_memory_size_estimator = in_memory_size_estimator
         self._max_bucket_size = max_bucket_size
         self._max_rows_per_partition = max_rows_per_partition
-        # path -> bucket currently accumulating that file's chunks.
-        self._open_buckets: Dict[str, _FileBucket] = {}
+
+        # Adaptive mode requires both. When either is missing, fall back to
+        # per-file mode (existing behavior).
+        self._adaptive = (
+            total_rows is not None
+            and total_rows > 0
+            and num_partitions is not None
+            and num_partitions > 0
+        )
+        self._total_rows: int = int(total_rows) if total_rows else 0
+        self._num_partitions: int = int(num_partitions) if num_partitions else 0
+
+        # Per-file mode state.
+        self._open_buckets: Dict[str, _Bucket] = {}
+        # Adaptive mode state.
+        self._shared_bucket: Optional[_Bucket] = _Bucket() if self._adaptive else None
+        self._emitted_count: int = 0
+        self._emitted_rows: int = 0
+
         self._output_queue: "collections.deque[FileManifest]" = collections.deque()
 
     def add_input(self, input_manifest: FileManifest):
@@ -121,31 +139,59 @@ class FileAffinityPartitioner(FilePartitioner):
             input_manifest.file_chunk_metadatas,
             in_memory_sizes,
         ):
-            bucket = self._open_buckets.get(path)
-            if bucket is None:
-                bucket = _FileBucket()
-                self._open_buckets[path] = bucket
-            sort_key = (
+            rg_start = (
                 int(chunk_metadata["row_group_start"])
                 if chunk_metadata is not None and "row_group_start" in chunk_metadata
                 else 0
             )
-            bucket.add(
-                path,
-                int(file_size),
-                chunk_metadata,
-                int(in_memory_size or 0),
-                chunk_num_rows(chunk_metadata),
-                sort_key,
-            )
-            # Flush when EITHER cap is hit. Subsequent chunks of the same
-            # file start a fresh bucket, so each partition is a consecutive
-            # range of one file's row groups.
-            if self._should_flush(bucket):
-                self._output_queue.append(bucket.to_manifest())
-                del self._open_buckets[path]
+            num_rows = chunk_num_rows(chunk_metadata)
+            size = int(in_memory_size or 0)
 
-    def _should_flush(self, bucket: _FileBucket) -> bool:
+            if self._adaptive:
+                self._add_adaptive(
+                    path, file_size, chunk_metadata, size, num_rows, rg_start
+                )
+            else:
+                self._add_per_file(
+                    path, file_size, chunk_metadata, size, num_rows, rg_start
+                )
+
+    def _add_per_file(self, path, file_size, chunk_metadata, size, num_rows, rg_start):
+        bucket = self._open_buckets.get(path)
+        if bucket is None:
+            bucket = _Bucket()
+            self._open_buckets[path] = bucket
+        bucket.add(path, int(file_size), chunk_metadata, size, num_rows, rg_start)
+        if self._should_flush_per_file(bucket):
+            self._output_queue.append(bucket.to_manifest())
+            del self._open_buckets[path]
+
+    def _add_adaptive(self, path, file_size, chunk_metadata, size, num_rows, rg_start):
+        assert self._shared_bucket is not None
+        self._shared_bucket.add(
+            path, int(file_size), chunk_metadata, size, num_rows, rg_start
+        )
+        # Adaptive target: divide whatever's left to distribute by the
+        # remaining partitions (including the one currently being built).
+        # Last partition (remaining=1) never flushes mid-stream -- it
+        # swallows whatever leftover comes at finalize. Earlier partitions
+        # shrink slightly when prior ones overshot (due to chunk atomicity),
+        # keeping the tail from collapsing.
+        remaining_partitions = self._num_partitions - self._emitted_count
+        if remaining_partitions <= 1:
+            return
+        target = (self._total_rows - self._emitted_rows) / remaining_partitions
+        if self._shared_bucket.num_rows >= target:
+            self._emit_shared()
+
+    def _emit_shared(self):
+        assert self._shared_bucket is not None
+        self._emitted_rows += self._shared_bucket.num_rows
+        self._emitted_count += 1
+        self._output_queue.append(self._shared_bucket.to_manifest())
+        self._shared_bucket = _Bucket()
+
+    def _should_flush_per_file(self, bucket: _Bucket) -> bool:
         if (
             self._max_rows_per_partition is not None
             and bucket.num_rows >= self._max_rows_per_partition
@@ -165,8 +211,14 @@ class FileAffinityPartitioner(FilePartitioner):
         return self._output_queue.popleft()
 
     def finalize(self):
-        # Flush each file's remaining chunks; sort by path for deterministic
-        # output across retries.
+        if self._adaptive:
+            # Emit the last (possibly partially-full) partition.
+            if self._shared_bucket is not None and self._shared_bucket.paths:
+                self._emit_shared()
+            self._shared_bucket = None
+            return
+        # Per-file mode: each remaining file becomes its own partition;
+        # sort by path for deterministic output across retries.
         for path in sorted(self._open_buckets.keys()):
             bucket = self._open_buckets[path]
             if bucket.paths:

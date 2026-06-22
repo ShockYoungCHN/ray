@@ -475,6 +475,15 @@ class ListFiles(LogicalOperator, SourceOperator):
     # headroom for straggler tolerance). None falls back to the
     # partitioner's default sizing (one partition per file).
     pushed_max_rows_per_partition: Optional[int] = None
+    # Target partition count stamped alongside pushed_max_rows_per_partition.
+    # When both this and pushed_limit are set, plan_list_files_op enables
+    # adaptive cross-file mode on FileAffinityPartitioner: a single shared
+    # bucket flushes at an adaptive target (remaining_rows /
+    # remaining_partitions), allowing the partitioner to merge chunks
+    # across files and hit the requested partition count even when the
+    # file-count floor would otherwise dominate (e.g.,
+    # read_parquet(parallelism=500).limit(N) on 3000-file datasets).
+    pushed_num_partitions: Optional[int] = None
     _name: str = field(init=False, repr=False)
     _input_dependencies: List[LogicalOperator] = field(
         init=False, repr=False, default_factory=list

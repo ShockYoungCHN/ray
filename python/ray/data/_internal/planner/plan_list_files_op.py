@@ -10,11 +10,12 @@ downstream ``ReadFiles`` physical op by
 :func:`plan_read_files_op_with_checkpoint_filter`, matching V1's
 dispatch pattern.
 """
+
 from __future__ import annotations
 
 import logging
 from functools import partial
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
 import pyarrow as pa
@@ -94,18 +95,17 @@ def plan_list_files_op(
     # pushed_limit > 0 guard: ds.limit(0) pushes 0 through;
     # LimitAwareFilePartitioner requires a positive limit and the pipeline
     # below is empty anyway, so we skip wrapping.
-    if (
-        op.pushed_limit is not None
-        and op.pushed_limit > 0
-        and partitioner is not None
-    ):
+    if op.pushed_limit is not None and op.pushed_limit > 0 and partitioner is not None:
         from ray.data._internal.datasource_v2.partitioners.limit_aware_partitioner import (
             LimitAwareFilePartitioner,
         )
 
         if op.pushed_max_rows_per_partition is not None:
             partitioner = _rebuild_partitioner_with_row_cap(
-                partitioner, op.pushed_max_rows_per_partition
+                partitioner,
+                new_max_rows_per_partition=op.pushed_max_rows_per_partition,
+                total_rows=op.pushed_limit,
+                num_partitions=op.pushed_num_partitions,
             )
         partitioner = LimitAwareFilePartitioner(
             inner=partitioner, limit_rows=op.pushed_limit
@@ -173,16 +173,30 @@ def plan_list_files_op(
 
 
 def _rebuild_partitioner_with_row_cap(
-    partitioner: "FilePartitioner", new_max_rows_per_partition: int
+    partitioner: "FilePartitioner",
+    *,
+    new_max_rows_per_partition: int,
+    total_rows: Optional[int] = None,
+    num_partitions: Optional[int] = None,
 ) -> "FilePartitioner":
-    """Return a partitioner equivalent to partitioner with the given
-    max_rows_per_partition stacked on top of its existing caps.
+    """Return a partitioner with the given row cap stacked on top of its
+    existing caps.
 
     Preserves the original byte cap and estimator -- the limit-pushdown
     path layers a row cap onto whatever the non-limit path was sized with,
-    so wide-row files still flush on the byte cap before a row task balloons
-    in memory. For non-Parquet chunkers (no num_rows on chunks) the row cap
-    never trips and the byte cap continues to drive flushing as before.
+    so wide-row files still flush on the byte cap before a row task
+    balloons in memory. For non-Parquet chunkers (no num_rows on chunks)
+    the row cap never trips and the byte cap continues to drive flushing
+    as before.
+
+    When ``total_rows`` and ``num_partitions`` are both provided, enables
+    adaptive cross-file mode on FileAffinityPartitioner -- a single shared
+    bucket flushes at an adaptive target (remaining_rows /
+    remaining_partitions) so the partitioner can merge chunks across files
+    and hit ``num_partitions`` even when the file count would otherwise
+    floor it (e.g., 3000-file datasets with parallelism=500). Without
+    these args, the partitioner stays in per-file mode and ``new_max_rows
+    _per_partition`` acts only as an upper cap on file splitting.
 
     Falls back to partitioner unchanged for types that don't expose a
     row-count cap. RoundRobinPartitioner is not row-count-aware and is
@@ -197,6 +211,8 @@ def _rebuild_partitioner_with_row_cap(
             in_memory_size_estimator=partitioner._in_memory_size_estimator,
             max_bucket_size=partitioner._max_bucket_size,
             max_rows_per_partition=new_max_rows_per_partition,
+            total_rows=total_rows,
+            num_partitions=num_partitions,
         )
     return partitioner
 
