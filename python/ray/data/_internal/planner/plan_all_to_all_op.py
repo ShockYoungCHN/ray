@@ -160,9 +160,7 @@ def _plan_hash_shuffle_repartition_v3(
 
     def _partition_fn(table):
         cols = list(key_cols) if key_cols else list(table.column_names)
-        return hash_partition(
-            table, hash_cols=cols, num_partitions=num_partitions
-        )
+        return hash_partition(table, hash_cols=cols, num_partitions=num_partitions)
 
     if logical_op.sort:
         reduce_fn = _sort_reduce(list(key_cols))
@@ -173,11 +171,20 @@ def _plan_hash_shuffle_repartition_v3(
         streaming_reduce = True
         disallow_block_splitting = False
 
+    # Compression: reuse the same DataContext field v2 uses
+    # (hash_shuffle_compression). Both v2 and v3 are hash shuffles; the
+    # compression knob applies identically. v2 accepts "none"|"lz4"|"zstd";
+    # the v3 task body expects Optional[Literal["lz4","zstd"]], so map
+    # "none" -> None at this translation boundary.
+    raw_compression = (data_context.hash_shuffle_compression or "none").lower()
+    map_compression = None if raw_compression == "none" else raw_compression
+
     map_op = ShuffleMapOpV3(
         input_physical_op,
         data_context,
         num_partitions=num_partitions,
         partition_fn=_partition_fn,
+        compression=map_compression,
     )
     reduce_op = ShuffleReduceOpV3(
         map_op,
