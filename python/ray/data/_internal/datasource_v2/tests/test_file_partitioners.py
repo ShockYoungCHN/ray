@@ -218,6 +218,100 @@ def test_file_affinity_sorts_partition_chunks_by_row_group_start():
     assert starts == [0, 1, 2]
 
 
+# ----------------------------- adaptive mode -----------------------------
+
+
+def _adaptive_outputs(rows_per_file, total_rows, num_partitions):
+    """Drive FileAffinityPartitioner in adaptive (cross-file) mode and
+    return the list of (partition_paths, partition_num_rows) tuples."""
+    metas = [
+        {
+            "row_group_start": 0,
+            "row_group_end": 1,
+            "in_memory_size": 1000,
+            "num_rows": r,
+            "max_emit_rows": r,
+        }
+        for r in rows_per_file
+    ]
+    table = _affinity_table(
+        [f"f{i}" for i in range(len(rows_per_file))],
+        [1] * len(rows_per_file),
+        metas,
+    )
+    partitioner = FileAffinityPartitioner(
+        total_rows=total_rows,
+        num_partitions=num_partitions,
+    )
+    outputs = list(partition_files(iter([table]), MagicMock(), partitioner=partitioner))
+    return [
+        (
+            o[PATH_COLUMN_NAME].to_pylist(),
+            sum(m["num_rows"] for m in o[FILE_CHUNK_METADATA_COLUMN_NAME].to_pylist()),
+        )
+        for o in outputs
+    ]
+
+
+def test_adaptive_evenly_distributed_across_files():
+    # 100 files × 50k rows = 5M total, want 10 partitions.
+    # Each partition should hold ~10 files × 50k = 500k rows.
+    result = _adaptive_outputs([50_000] * 100, total_rows=5_000_000, num_partitions=10)
+    assert len(result) == 10
+    rows_per_partition = [r for _, r in result]
+    # Each partition ~500k; chunk-atomicity bounds deviation by 1 chunk
+    # (= 50k rows).
+    assert all(450_000 <= r <= 550_000 for r in rows_per_partition), rows_per_partition
+    # All files accounted for, none duplicated.
+    all_paths = [p for paths, _ in result for p in paths]
+    assert sorted(all_paths) == sorted(f"f{i}" for i in range(100))
+
+
+def test_adaptive_last_partition_swallows_leftover():
+    # 7 files × 50k = 350k rows, want 3 partitions → target = 116666 rows
+    # Each chunk = 50k; per-partition target spans 2-3 chunks.
+    result = _adaptive_outputs([50_000] * 7, total_rows=350_000, num_partitions=3)
+    assert len(result) == 3
+    # Sum is exact regardless of how the chunks land.
+    assert sum(r for _, r in result) == 350_000
+    # Last partition has at most target rows (no orphan tiny tail).
+    rows = [r for _, r in result]
+    assert max(rows) - min(rows) <= 50_000  # bounded by 1 chunk's worth
+
+
+def test_adaptive_p_larger_than_chunk_count_caps_at_chunks():
+    # 5 files × 100k rows, ask for 50 partitions but only 5 chunks exist.
+    # Should emit at most 5 partitions (1 per chunk) -- can't subdivide
+    # row groups.
+    result = _adaptive_outputs([100_000] * 5, total_rows=500_000, num_partitions=50)
+    assert len(result) <= 5
+    assert sum(r for _, r in result) == 500_000
+
+
+def test_adaptive_single_partition_collects_everything():
+    # Degenerate: num_partitions=1 → never flushes mid-stream, finalize
+    # emits the only partition.
+    result = _adaptive_outputs([10_000] * 5, total_rows=50_000, num_partitions=1)
+    assert len(result) == 1
+    assert result[0][1] == 50_000
+    assert set(result[0][0]) == {f"f{i}" for i in range(5)}
+
+
+def test_adaptive_disabled_when_either_arg_missing():
+    # total_rows alone → per-file mode (1 partition per file).
+    table = _affinity_table(["a", "b", "c"], [1, 1, 1], [None, None, None])
+    p1 = FileAffinityPartitioner(total_rows=100)
+    outputs = list(partition_files(iter([table]), MagicMock(), partitioner=p1))
+    paths = [o[PATH_COLUMN_NAME].to_pylist() for o in outputs]
+    assert paths == [["a"], ["b"], ["c"]]
+
+    # num_partitions alone → also per-file mode.
+    p2 = FileAffinityPartitioner(num_partitions=2)
+    outputs = list(partition_files(iter([table]), MagicMock(), partitioner=p2))
+    paths = [o[PATH_COLUMN_NAME].to_pylist() for o in outputs]
+    assert paths == [["a"], ["b"], ["c"]]
+
+
 if __name__ == "__main__":
     import sys
 

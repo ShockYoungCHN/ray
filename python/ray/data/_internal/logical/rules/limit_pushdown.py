@@ -161,25 +161,19 @@ class LimitPushdownRule(Rule):
             preserving.append(source_op)
             source_op = source_op.input_dependencies[0]
 
-        pushed, absorbed, precise = self._apply_pushdown(
-            source_op, limit_op.limit
-        )
+        pushed, absorbed, precise = self._apply_pushdown(source_op, limit_op.limit)
 
         if not preserving and not absorbed:
             return limit_op
 
         head: LogicalOperator = (
-            pushed
-            if precise
-            else Limit(limit_op.limit, input_dependencies=[pushed])
+            pushed if precise else Limit(limit_op.limit, input_dependencies=[pushed])
         )
         for op in reversed(preserving):
             head = self._recreate_operator_with_new_input(op, head)
         return head
 
-    def _is_row_preserving(
-        self, op: LogicalOperator, limit: int
-    ) -> bool:
+    def _is_row_preserving(self, op: LogicalOperator, limit: int) -> bool:
         """True when ``op`` definitely doesn't change row counts and is safe
         to walk past during pushdown.
 
@@ -187,9 +181,7 @@ class LimitPushdownRule(Rule):
         exceeds the limit (those need a batch larger than the limit to
         produce stable outputs).
         """
-        if not (
-            isinstance(op, AbstractOneToOne) and not op.can_modify_num_rows
-        ):
+        if not (isinstance(op, AbstractOneToOne) and not op.can_modify_num_rows):
             return False
         if isinstance(op, AbstractMap):
             min_rows = op.min_rows_per_bundled_input
@@ -270,13 +262,27 @@ class LimitPushdownRule(Rule):
                                 f"(possibly fewer due to Parquet row-"
                                 f"group granularity)."
                             )
-                        target_row_cap = _compute_cpu_aware_row_cap(
-                            limit_rows=limit,
-                            num_partitions=explicit_partitions,
+                        # Resolve the effective num_partitions: explicit
+                        # parallelism takes priority; CPU-default falls back
+                        # to 2 * avail_cpus. row_cap = ceil(limit /
+                        # num_partitions). Both values get stamped so
+                        # plan_list_files_op can wire the partitioner into
+                        # adaptive cross-file mode (otherwise the file-count
+                        # floor would cap the actual task count at the
+                        # number of files touched).
+                        target_num_partitions = _resolve_num_partitions(
+                            explicit_partitions=explicit_partitions,
                             avail_cpus=self._get_avail_cpus_cached(),
                         )
+                        target_row_cap = _compute_cpu_aware_row_cap(
+                            limit_rows=limit,
+                            num_partitions=target_num_partitions,
+                        )
                         return _stamp_pushed_limit_on_list_files(
-                            new_op, limit, target_row_cap
+                            new_op,
+                            limit=limit,
+                            max_rows_per_partition=target_row_cap,
+                            num_partitions=target_num_partitions,
                         )
                     return op
                 assert len(op.input_dependencies) == 1, len(op.input_dependencies)
@@ -314,28 +320,39 @@ class LimitPushdownRule(Rule):
         return new_op
 
 
-def _compute_cpu_aware_row_cap(
+def _resolve_num_partitions(
     *,
-    limit_rows: int,
-    num_partitions: Optional[int] = None,
-    avail_cpus: Optional[float] = None,
+    explicit_partitions: Optional[int],
+    avail_cpus: Optional[float],
 ) -> Optional[int]:
-    """Per-task row cap aligning ReadTask count with parallelism.
+    """Pick the effective per-read num_partitions.
 
-    Picks ``num_partitions`` from (in priority order): the explicit
-    argument, then ``2 * avail_cpus`` (the standard "2x CPU" floor for
+    Explicit (``ReadFiles.parallelism > 0`` from ``read_parquet(parallelism
+    =...)``) wins. Falls back to ``2 * avail_cpus`` (the "2x CPU" floor for
     straggler tolerance). Returns None when neither source yields a
-    positive value -- the partitioner keeps its default sizing in that
-    case.
+    positive value -- the partitioner keeps its default sizing.
 
     Callers pass ``avail_cpus`` from a snapshot taken once per apply() so
     plan reproducibility doesn't depend on autoscale timing.
     """
-    if num_partitions is None:
-        if avail_cpus is None or avail_cpus <= 0:
-            return None
-        num_partitions = max(int(2 * avail_cpus), 1)
-    if num_partitions <= 0:
+    if explicit_partitions is not None and explicit_partitions > 0:
+        return explicit_partitions
+    if avail_cpus is None or avail_cpus <= 0:
+        return None
+    return max(int(2 * avail_cpus), 1)
+
+
+def _compute_cpu_aware_row_cap(
+    *,
+    limit_rows: int,
+    num_partitions: Optional[int],
+) -> Optional[int]:
+    """Per-task row cap: ``limit_rows / num_partitions`` (floored at 1).
+
+    Returns None when num_partitions is unset or non-positive -- the
+    partitioner keeps its default sizing.
+    """
+    if num_partitions is None or num_partitions <= 0:
         return None
     return max(limit_rows // num_partitions, 1)
 
@@ -401,15 +418,17 @@ def _can_drop_limit_after_pushdown(
 
 def _stamp_pushed_limit_on_list_files(
     read_op: LogicalOperator,
+    *,
     limit: int,
     max_rows_per_partition: Optional[int] = None,
+    num_partitions: Optional[int] = None,
 ) -> LogicalOperator:
-    """Stamp the pushed row limit (and optional per-partition row cap) onto
+    """Stamp the pushed row limit + row cap + target partition count onto
     a ReadFiles' upstream ListFiles.
 
     Re-entrant: keeps the tighter of (existing, new) limit via min(...),
-    and short-circuits when both fields would be unchanged. The fixed-
-    point optimizer can call us multiple times.
+    and short-circuits when nothing would change. The fixed-point
+    optimizer can call us multiple times.
     """
     from ray.data._internal.logical.operators.read_operator import ListFiles
 
@@ -422,14 +441,21 @@ def _stamp_pushed_limit_on_list_files(
     # with a smaller limit on a later pass.
     new_limit = limit if existing is None else min(existing, limit)
     existing_cap = list_files.pushed_max_rows_per_partition
+    existing_np = list_files.pushed_num_partitions
     # When the limit tightens we always recompute; when it stays the same
-    # we keep whatever row cap was already set.
-    new_cap = max_rows_per_partition if existing != new_limit else existing_cap
-    if existing == new_limit and existing_cap == new_cap:
+    # we keep whatever was already stamped.
+    if existing != new_limit:
+        new_cap = max_rows_per_partition
+        new_np = num_partitions
+    else:
+        new_cap = existing_cap
+        new_np = existing_np
+    if existing == new_limit and existing_cap == new_cap and existing_np == new_np:
         return read_op
     new_list_files = replace(
         list_files,
         pushed_limit=new_limit,
         pushed_max_rows_per_partition=new_cap,
+        pushed_num_partitions=new_np,
     )
     return replace(read_op, input_dependencies=[new_list_files])
