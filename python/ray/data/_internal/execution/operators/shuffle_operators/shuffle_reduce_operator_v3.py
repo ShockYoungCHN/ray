@@ -83,6 +83,7 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
         reduce_cpus: Optional[float] = None,
         name: str = "ShuffleReduceV3",
         downstream_map_transformer: Optional["MapTransformer"] = None,
+        downstream_map_task_kwargs: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(
             name=name,
@@ -99,6 +100,14 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
         # (e.g., the write-stats blocks Write would have produced).
         self._downstream_map_transformer: Optional["MapTransformer"] = (
             downstream_map_transformer
+        )
+        # map_task_kwargs the absorbed downstream MapOperator would have
+        # received via its scheduler (e.g. Write's ``{"write_uuid": ...}``).
+        # v3_reduce_task threads this into the TaskContext it builds around
+        # the transformer so datasinks that read ``ctx.kwargs[...]`` see
+        # the same values they would in the un-fused path.
+        self._downstream_map_task_kwargs: Dict[str, Any] = (
+            downstream_map_task_kwargs or {}
         )
         # Disallow-block-split forces blocking mode because we must hand the
         # entire partition to ``reduce_fn`` before emitting any output (e.g.
@@ -144,7 +153,9 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
         return True
 
     def fuse_with_downstream_map_transformer(
-        self, downstream_map_transformer
+        self,
+        downstream_map_transformer,
+        downstream_map_task_kwargs: Optional[Dict[str, Any]] = None,
     ) -> "ShuffleReduceOpV3":
         """Return a new ShuffleReduceOpV3 that runs downstream_map_transformer
         on each emitted block. The downstream MapOperator is dropped from
@@ -156,12 +167,20 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
         waves into one op carrying the full transform chain). The caller
         (fusion rule) is responsible for renaming via _name to reflect the
         absorbed downstream op.
+
+        downstream_map_task_kwargs (the absorbed op's get_map_task_kwargs())
+        is merged with any previously-absorbed kwargs and threaded into the
+        TaskContext v3_reduce_task builds around the transformer.
         """
         existing = self._downstream_map_transformer
         if existing is not None:
             combined = existing.fuse(downstream_map_transformer)
         else:
             combined = downstream_map_transformer
+        merged_kwargs = {
+            **self._downstream_map_task_kwargs,
+            **(downstream_map_task_kwargs or {}),
+        }
         return ShuffleReduceOpV3(
             input_op=self.input_dependencies[0],
             data_context=self.data_context,
@@ -174,6 +193,7 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
             reduce_cpus=self._reduce_num_cpus,
             name=self.name,
             downstream_map_transformer=combined,
+            downstream_map_task_kwargs=merged_kwargs,
         )
 
     def _add_input_inner(self, refs: RefBundle, input_index: int) -> None:
@@ -239,6 +259,7 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
             self._streaming_reduce,
             self._downstream_map_transformer,
             self.name,
+            self._downstream_map_task_kwargs,
         )
 
         data_task = DataOpTask(

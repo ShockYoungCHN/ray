@@ -1207,6 +1207,7 @@ def v3_reduce_task(
     streaming: bool = True,
     downstream_map_transformer: Optional[Any] = None,
     reduce_op_name: str = "ShuffleReduceV3",
+    downstream_map_task_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Generator[Union[Block, bytes], None, None]:
     """Fetch one partition's shards, decode mmap'd prefetch file, stream
     ``reduce_fn`` output as (block, pickled metadata) pairs.
@@ -1292,7 +1293,11 @@ def v3_reduce_task(
 
         for out_block in downstream_map_transformer.apply_transform(
             iter([block]),
-            TaskContext(task_idx=partition_id, op_name=reduce_op_name),
+            TaskContext(
+                task_idx=partition_id,
+                op_name=reduce_op_name,
+                kwargs=downstream_map_task_kwargs or {},
+            ),
         ):
             yield from _yield_with_stats(out_block)
 

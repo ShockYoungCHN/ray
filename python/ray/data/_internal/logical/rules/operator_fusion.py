@@ -269,7 +269,8 @@ class FuseOperators(Rule):
         the absorbed Map is visible in stats.
         """
         new_op = emitter_op.fuse_with_downstream_map_transformer(
-            down_map_op.get_map_transformer()
+            down_map_op.get_map_transformer(),
+            down_map_op.get_map_task_kwargs(),
         )
         # Carry the downstream Map's name into the fused op so progress
         # bars / stats reflect what got absorbed.

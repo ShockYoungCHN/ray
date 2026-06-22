@@ -1047,12 +1047,22 @@ class PhysicalOperator(Operator):
         return False
 
     def fuse_with_downstream_map_transformer(
-        self, downstream_map_transformer
+        self,
+        downstream_map_transformer,
+        downstream_map_task_kwargs=None,
     ) -> "PhysicalOperator":
         """Return a new operator that runs downstream_map_transformer on each
         emitted block before yielding. The DAG-level effect is that the
         downstream MapOperator is dropped; the new op's output_dependencies
         point at whatever consumed the downstream Map's output.
+
+        downstream_map_task_kwargs is the absorbed op's
+        get_map_task_kwargs() snapshot (e.g. Write's
+        ``{"write_uuid": ...}``). The absorber must thread it into the
+        TaskContext it builds around the transformer -- without this,
+        datasinks that read ``ctx.kwargs[...]`` (Parquet, Iceberg, ...)
+        will KeyError at runtime.
+
         Required only when absorbs_downstream_map_transformer returns True.
         """
         raise NotImplementedError(
