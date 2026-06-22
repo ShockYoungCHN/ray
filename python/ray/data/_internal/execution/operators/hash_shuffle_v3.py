@@ -843,6 +843,7 @@ def v3_map_task(
     token: str,
     transformer: MapBlockTransformer = None,
     upstream_map_transformer: Optional[Any] = None,
+    map_op_name: str = "ShuffleMapV3",
     pool_budget_bytes: int = 16 * 1024 * 1024,
     compression: ShuffleCompression = None,
     fsync_on_close: bool = True,
@@ -980,7 +981,8 @@ def v3_map_task(
                 from ray.data._internal.execution.interfaces import TaskContext
 
                 block_iter = upstream_map_transformer.apply_transform(
-                    iter(blocks), TaskContext(task_idx=map_id)
+                    iter(blocks),
+                    TaskContext(task_idx=map_id, op_name=map_op_name),
                 )
             else:
                 block_iter = blocks
@@ -1204,6 +1206,7 @@ def v3_reduce_task(
     target_max_block_size: Optional[int] = None,
     streaming: bool = True,
     downstream_map_transformer: Optional[Any] = None,
+    reduce_op_name: str = "ShuffleReduceV3",
 ) -> Generator[Union[Block, bytes], None, None]:
     """Fetch one partition's shards, decode mmap'd prefetch file, stream
     ``reduce_fn`` output as (block, pickled metadata) pairs.
@@ -1240,6 +1243,9 @@ def v3_reduce_task(
             absorbed a downstream MapOperator (typically Write) into this
             reduce op. Each emitted block is run through this transformer
             inline before the streaming-generator protocol yields it.
+        reduce_op_name: the live op name (possibly fused, e.g.
+            "ShuffleReduceV3->Write") used to label the TaskContext we
+            construct around downstream_map_transformer.
     """
     start_time_s = time.perf_counter()
 
@@ -1285,7 +1291,8 @@ def v3_reduce_task(
         from ray.data._internal.execution.interfaces import TaskContext
 
         for out_block in downstream_map_transformer.apply_transform(
-            iter([block]), TaskContext(task_idx=partition_id)
+            iter([block]),
+            TaskContext(task_idx=partition_id, op_name=reduce_op_name),
         ):
             yield from _yield_with_stats(out_block)
 

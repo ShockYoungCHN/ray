@@ -238,6 +238,7 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
             target_max_block_size,
             self._streaming_reduce,
             self._downstream_map_transformer,
+            self.name,
         )
 
         data_task = DataOpTask(

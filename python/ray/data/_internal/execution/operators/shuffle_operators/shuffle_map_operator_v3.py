@@ -84,9 +84,7 @@ def _make_mapper_sentinel(mapper_id: int) -> List[str]:
     return [f"{_MAPPER_ID_SENTINEL}{mapper_id}"]
 
 
-class ShuffleMapOpV3(
-    InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarMixin
-):
+class ShuffleMapOpV3(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarMixin):
     """V3 map operator. See module docstring."""
 
     _DEFAULT_MAP_NUM_CPUS = 1.0
@@ -163,9 +161,7 @@ class ShuffleMapOpV3(
         # be removed when the shuffle's actors are released. Callers that
         # want their directory preserved should not pass a path they expect
         # to keep.
-        self._base_dir: str = base_dir or tempfile.mkdtemp(
-            prefix="ray_shuffle_v3_"
-        )
+        self._base_dir: str = base_dir or tempfile.mkdtemp(prefix="ray_shuffle_v3_")
         # Per-shuffle auth token; ShuffleManager rejects requests with any
         # other token. Cheap defense against accidental cross-shuffle reads
         # by misrouted reducers in a shared cluster.
@@ -270,9 +266,7 @@ class ShuffleMapOpV3(
         map_id = self._next_map_idx
         self._next_map_idx += 1
 
-        estimated_bytes = sum(
-            (m.size_bytes or 0) for m in input_bundle.metadata
-        )
+        estimated_bytes = sum((m.size_bytes or 0) for m in input_bundle.metadata)
 
         # Per-task pool budget: explicit override wins, otherwise dynamic
         # ``max(_MIN_POOL_BYTES, _POOL_GROWTH × estimated_bytes)``. A
@@ -314,6 +308,7 @@ class ShuffleMapOpV3(
             shuffle_id=self._shuffle_id,
             token=self._token,
             upstream_map_transformer=self._upstream_map_transformer,
+            map_op_name=self.name,
             pool_budget_bytes=pool_budget_bytes,
             compression=self._compression,
             fsync_on_close=self._fsync_on_close,
@@ -334,9 +329,7 @@ class ShuffleMapOpV3(
 
         all_blocks_meta = tuple(
             BlockEntry(ref=ref, metadata=meta)
-            for ref, meta in zip(
-                input_bundle.block_refs, input_bundle.metadata
-            )
+            for ref, meta in zip(input_bundle.block_refs, input_bundle.metadata)
         )
         self._metrics.on_task_submitted(
             map_id,
@@ -420,9 +413,7 @@ class ShuffleMapOpV3(
         # _running_tasks, but on_task_finished POPS it from that dict. So emit
         # the output-generated event FIRST, then mark the task finished
         # (submitted -> output_generated -> finished).
-        self._metrics.on_task_output_generated(
-            task_index=map_id, output=out_bundle
-        )
+        self._metrics.on_task_output_generated(task_index=map_id, output=out_bundle)
         self._metrics.on_task_finished(
             map_id, None, task_exec_stats=None, task_exec_driver_stats=None
         )
