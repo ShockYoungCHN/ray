@@ -30,7 +30,6 @@ import tempfile
 import typing
 from typing import Any, Dict, List, Optional
 
-import ray
 from ray.data._internal.execution.bundle_queue import (
     BaseBundleQueue,
     FIFOBundleQueue,
@@ -82,6 +81,32 @@ _MAPPER_ID_SENTINEL = "__v3_mapper__"
 
 def _make_mapper_sentinel(mapper_id: int) -> List[str]:
     return [f"{_MAPPER_ID_SENTINEL}{mapper_id}"]
+
+
+def _estimate_handle_plasma_bytes(handle_ref) -> int:
+    """Rough plasma footprint of a ShuffleHandle ref.
+
+    The handle is a small dict (manager ActorHandle + token + path +
+    per-partition index of (offset, length) tuples); the GB of partition
+    data lives on local disk via file-transport, not in plasma. We don't
+    need an exact number -- the streaming executor only uses size_bytes
+    to gate backpressure, and being within an order of magnitude of
+    reality is sufficient. Try Ray's object-locations API for an accurate
+    serialized size; fall back to a conservative constant when it's
+    unavailable (driver not joined, ref garbage-collected, etc.).
+    """
+    try:
+        from ray.experimental import get_object_locations
+
+        info = get_object_locations([handle_ref]).get(handle_ref)
+        if info is not None:
+            size = info.get("object_size")
+            if isinstance(size, int) and size > 0:
+                return size
+    except Exception:
+        pass
+    # Fallback: handles are typically a few KB.
+    return 4 * 1024
 
 
 class ShuffleMapOpV3(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBarMixin):
@@ -364,11 +389,6 @@ class ShuffleMapOpV3(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBa
         assert requested is not None
         self._map_resource_usage = self._map_resource_usage.subtract(requested)
 
-        # Read the handle once on the driver so we can grab num_rows /
-        # size_bytes for metrics. The dict is small (KBs).
-        handle = ray.get(handle_ref)
-        total_bytes = handle.get("total_bytes", 0)
-
         # OpRuntimeMetrics.on_task_output_generated asserts every output block
         # carries exec_stats with wall_time_s AND block_ser_time_s set. The
         # handle isn't a real computed block, so we attach a minimal,
@@ -380,13 +400,23 @@ class ShuffleMapOpV3(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBa
         # build(**kwargs) (builder() populates wall_time_s itself).
         exec_stats = BlockExecStats.builder().build(block_ser_time_s=0.0)
 
+        # size_bytes must reflect the bundle's *plasma footprint*, not the
+        # on-disk shuffle output. The plasma object is the ShuffleHandle dict
+        # (manager handle + token + path + per-partition index), typically a
+        # few KB. The GB of partition data lives on local disk on the map
+        # node via file-transport -- never in the object store. Reporting
+        # handle["total_bytes"] here would over-account plasma usage by
+        # orders of magnitude and trigger spurious backpressure / spill
+        # decisions in ResourcePoolManager.
+        size_bytes = _estimate_handle_plasma_bytes(handle_ref)
+
         out_meta = BlockMetadata(
             # The handle isn't itself a Block; it contributes 0 rows to the
             # row-count metric (the real rows surface at the reduce output).
             # Must be an int, not None: OpRuntimeMetrics.on_task_output_generated
             # does ``rows += output.num_rows()`` and would TypeError on None.
             num_rows=0,
-            size_bytes=total_bytes,
+            size_bytes=size_bytes,
             exec_stats=exec_stats,
             input_files=_make_mapper_sentinel(map_id),
         )
