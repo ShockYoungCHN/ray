@@ -217,9 +217,11 @@ class DataOpTask(OpTask):
                 except StopIteration:
                     self._task_done_callback(
                         None,  # exception
-                        self._last_block_meta.task_exec_stats
-                        if self._last_block_meta is not None
-                        else None,
+                        (
+                            self._last_block_meta.task_exec_stats
+                            if self._last_block_meta is not None
+                            else None
+                        ),
                         TaskExecDriverStats(
                             task_output_backpressure_s=self._total_output_backpressure_s,
                         ),
@@ -1029,6 +1031,34 @@ class PhysicalOperator(Operator):
             f"{type(self).__name__} declares "
             f"absorbs_upstream_map_transformer=True but doesn't implement "
             f"fuse_with_upstream_map_transformer"
+        )
+
+    def absorbs_downstream_map_transformer(self) -> bool:
+        """Whether this operator can absorb a downstream TaskPoolMapOperator's
+        MapTransformer and run it inside its own task body before yielding.
+
+        Mirror of absorbs_upstream_map_transformer. Used when this op is the
+        "task body owner" (e.g., ShuffleReduceOpV3) and the downstream op is
+        a generic MapOperator (e.g., Write). When True, the fusion rule calls
+        fuse_with_downstream_map_transformer with the downstream's transformer
+        to produce a fused replacement that emits transformed blocks; the
+        downstream MapOperator is removed from the DAG.
+        """
+        return False
+
+    def fuse_with_downstream_map_transformer(
+        self, downstream_map_transformer
+    ) -> "PhysicalOperator":
+        """Return a new operator that runs downstream_map_transformer on each
+        emitted block before yielding. The DAG-level effect is that the
+        downstream MapOperator is dropped; the new op's output_dependencies
+        point at whatever consumed the downstream Map's output.
+        Required only when absorbs_downstream_map_transformer returns True.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} declares "
+            f"absorbs_downstream_map_transformer=True but doesn't implement "
+            f"fuse_with_downstream_map_transformer"
         )
 
     def refresh_state(self):

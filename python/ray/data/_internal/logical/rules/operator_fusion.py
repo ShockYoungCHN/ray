@@ -1,6 +1,6 @@
 import itertools
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from ray.data._internal.compute import (
     ActorPoolStrategy,
@@ -10,11 +10,6 @@ from ray.data._internal.compute import (
 from ray.data._internal.execution.bundle_queue import ExactMultipleSize, RebundleQueue
 from ray.data._internal.execution.interfaces import (
     PhysicalOperator,
-    RefBundle,
-    TaskContext,
-)
-from ray.data._internal.execution.interfaces.transform_fn import (
-    AllToAllTransformFnResult,
 )
 from ray.data._internal.execution.operators.actor_pool_map_operator import (
     ActorPoolMapOperator,
@@ -25,7 +20,6 @@ from ray.data._internal.execution.operators.task_pool_map_operator import (
 )
 from ray.data._internal.logical.interfaces import PhysicalPlan, Rule
 from ray.data._internal.logical.operators import (
-    AbstractAllToAll,
     AbstractMap,
     AbstractUDFMap,
     MapBatches,
@@ -66,6 +60,12 @@ class FuseOperators(Rule):
         # check keeps the rule free of isinstance branches on the
         # absorber side.
         fused_dag = self._fuse_absorber_operators_in_dag(fused_dag)
+
+        # Mirror pass: emitter -> MapOperator pairs. An emitter is any op
+        # that advertises absorbs_downstream_map_transformer(). The fused
+        # op runs the downstream Map's transformer inside its own task
+        # body before yielding (e.g., ShuffleReduceOpV3 absorbs Write).
+        fused_dag = self._fuse_emitter_operators_in_dag(fused_dag)
 
         # Update output dependencies after fusion.
         # TODO(hchen): Instead of updating the depdencies manually,
@@ -195,9 +195,7 @@ class FuseOperators(Rule):
         fuse_with_upstream_map_transformer; this method handles
         DAG-level bookkeeping (logical-op mapping in _op_map).
         """
-        new_op = down_op.fuse_with_upstream_map_transformer(
-            up_op.get_map_transformer()
-        )
+        new_op = down_op.fuse_with_upstream_map_transformer(up_op.get_map_transformer())
         if down_op in self._op_map:
             self._op_map[new_op] = self._build_fused_logical_op(down_op, up_op)
             self._op_map.pop(down_op)
@@ -205,9 +203,7 @@ class FuseOperators(Rule):
             self._op_map.pop(up_op)
         return new_op
 
-    def _build_fused_logical_op(
-        self, down_op: PhysicalOperator, up_op: "MapOperator"
-    ):
+    def _build_fused_logical_op(self, down_op: PhysicalOperator, up_op: "MapOperator"):
         """Build the logical-op replacement for a fused absorber op.
 
         When the absorber's logical op is RandomShuffle or Repartition,
@@ -233,6 +229,63 @@ class FuseOperators(Rule):
             )
         return down_logical_op
 
+    def _fuse_emitter_operators_in_dag(self, dag: PhysicalOperator) -> PhysicalOperator:
+        """Traverse up the DAG fusing emitter -> downstream MapOperator pairs.
+
+        Mirror of _fuse_absorber_operators_in_dag for the opposite direction:
+        the upstream op (e.g., ShuffleReduceOpV3) advertises
+        absorbs_downstream_map_transformer() and folds the downstream
+        MapOperator's transformer into its own task body. The downstream
+        MapOperator is removed from the DAG; the new op takes its place
+        with the upstream's input_dependency unchanged.
+        """
+        upstream_ops = dag.input_dependencies
+        if (
+            len(upstream_ops) == 1
+            and isinstance(dag, MapOperator)
+            and upstream_ops[0].absorbs_downstream_map_transformer()
+            and self._can_fuse(dag, upstream_ops[0])
+        ):
+            # Absorb dag (the downstream Map) into the upstream emitter.
+            dag = self._get_fused_emitter_operator(upstream_ops[0], dag)
+            upstream_ops = dag.input_dependencies
+
+        dag._input_dependencies = [
+            self._fuse_emitter_operators_in_dag(upstream_op)
+            for upstream_op in upstream_ops
+        ]
+        return dag
+
+    def _get_fused_emitter_operator(
+        self,
+        emitter_op: PhysicalOperator,
+        down_map_op: "MapOperator",
+    ) -> PhysicalOperator:
+        """Build the fused replacement for an emitter -> MapOperator edge.
+
+        emitter_op builds the new physical op via
+        fuse_with_downstream_map_transformer; this method handles DAG-level
+        bookkeeping (logical-op mapping in _op_map) and renames the op so
+        the absorbed Map is visible in stats.
+        """
+        new_op = emitter_op.fuse_with_downstream_map_transformer(
+            down_map_op.get_map_transformer()
+        )
+        # Carry the downstream Map's name into the fused op so progress
+        # bars / stats reflect what got absorbed.
+        new_op._name = f"{emitter_op.name}->{down_map_op.name}"
+        # _op_map: the fused op takes the downstream Map's logical position
+        # (the rebuilt RandomShuffle/Repartition would still be there if
+        # also fused with upstream Map, but here we only swap in down's slot
+        # so consumers walking the logical plan still see the Write/Map op
+        # they were expecting).
+        if down_map_op in self._op_map:
+            self._op_map[new_op] = self._op_map[down_map_op]
+            self._op_map.pop(down_map_op)
+        if emitter_op in self._op_map:
+            self._op_map.pop(emitter_op)
+        return new_op
+
     def _can_fuse(self, down_op: PhysicalOperator, up_op: PhysicalOperator) -> bool:
         """Whether the given downstream op can be fused with the upstream op.
 
@@ -254,6 +307,9 @@ class FuseOperators(Rule):
         # - TaskPoolMapOperator -> any op that opts in via
         #   absorbs_upstream_map_transformer(); the down op constructs
         #   its own fused replacement.
+        # - any op that opts in via absorbs_downstream_map_transformer() ->
+        #   TaskPoolMapOperator/ActorPoolMapOperator (emitter direction:
+        #   the up op constructs its own fused replacement).
         if not (
             (
                 isinstance(up_op, TaskPoolMapOperator)
@@ -263,13 +319,20 @@ class FuseOperators(Rule):
                 isinstance(up_op, TaskPoolMapOperator)
                 and down_op.absorbs_upstream_map_transformer()
             )
+            or (
+                up_op.absorbs_downstream_map_transformer()
+                and isinstance(down_op, (TaskPoolMapOperator, ActorPoolMapOperator))
+            )
         ):
             return False
 
         down_logical_op = self._op_map[down_op]
         up_logical_op = self._op_map[up_op]
 
-        if up_op.get_additional_split_factor() > 1:
+        # get_additional_split_factor is a MapOperator-only knob; emitter
+        # ops (ShuffleReduceOpV3 etc.) don't have it -- treat absence as
+        # "no extra split" (= 1).
+        if getattr(up_op, "get_additional_split_factor", lambda: 1)() > 1:
             return False
 
         # If the downstream operator takes no input, it cannot be fused with
@@ -306,6 +369,21 @@ class FuseOperators(Rule):
                     down_logical_op.shuffle
                     or down_op.absorbs_upstream_map_transformer()
                 )
+            )
+            # Emitter direction: upstream non-Map sink absorbs downstream
+            # MapOperator. Mirror of the absorber branches above (note the
+            # swapped up/down). Used by ShuffleReduceOpV3 (a Repartition
+            # absorber on the v3 path) to fold a downstream Write into
+            # its own task body.
+            or (
+                isinstance(down_logical_op, AbstractMap)
+                and isinstance(up_logical_op, RandomShuffle)
+                and up_op.absorbs_downstream_map_transformer()
+            )
+            or (
+                isinstance(down_logical_op, AbstractMap)
+                and isinstance(up_logical_op, Repartition)
+                and up_op.absorbs_downstream_map_transformer()
             )
         ):
             return False
@@ -589,9 +667,9 @@ class FuseOperators(Rule):
             target_max_block_size_override=target_max_block_size,
             name=name,
             compute_strategy=compute,
-            min_rows_per_bundle=min_rows_per_bundled_input
-            if ref_bundler is None
-            else None,
+            min_rows_per_bundle=(
+                min_rows_per_bundled_input if ref_bundler is None else None
+            ),
             ref_bundler=ref_bundler,
             map_task_kwargs=map_task_kwargs,
             ray_remote_args=ray_remote_args,

@@ -30,7 +30,6 @@ import typing
 from collections import deque
 from typing import Any, Dict, List, Optional
 
-import ray
 from ray.data._internal.execution.interfaces import (
     ExecutionResources,
     PhysicalOperator,
@@ -57,6 +56,9 @@ from ray.data.context import DataContext
 from ray.types import ObjectRef
 
 if typing.TYPE_CHECKING:
+    from ray.data._internal.execution.operators.map_transformer import (
+        MapTransformer,
+    )
     from ray.data._internal.progress.base_progress import BaseProgressBar
 
 logger = logging.getLogger(__name__)
@@ -80,6 +82,7 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
         reduce_prefetch_dir: Optional[str] = None,
         reduce_cpus: Optional[float] = None,
         name: str = "ShuffleReduceV3",
+        downstream_map_transformer: Optional["MapTransformer"] = None,
     ):
         super().__init__(
             name=name,
@@ -89,19 +92,23 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
 
         self._num_partitions: int = num_partitions
         self._reduce_fn: ReduceFn = reduce_fn
+        # When set, OperatorFusionRule has absorbed a downstream MapOperator
+        # (typically Write) into this reduce op. v3_reduce_task applies it
+        # to each emitted block before yielding, so the downstream task
+        # never has to run -- output of this op IS the downstream's output
+        # (e.g., the write-stats blocks Write would have produced).
+        self._downstream_map_transformer: Optional["MapTransformer"] = (
+            downstream_map_transformer
+        )
         # Disallow-block-split forces blocking mode because we must hand the
         # entire partition to ``reduce_fn`` before emitting any output (e.g.
         # global sort can't stream-flush).
         self._disallow_block_splitting: bool = disallow_block_splitting
-        self._streaming_reduce: bool = (
-            streaming_reduce and not disallow_block_splitting
-        )
+        self._streaming_reduce: bool = streaming_reduce and not disallow_block_splitting
         self._max_bytes_per_fetch: int = max_bytes_per_fetch
         self._reduce_prefetch_dir: Optional[str] = reduce_prefetch_dir
         self._reduce_num_cpus: float = (
-            reduce_cpus
-            if reduce_cpus is not None
-            else self._DEFAULT_REDUCE_NUM_CPUS
+            reduce_cpus if reduce_cpus is not None else self._DEFAULT_REDUCE_NUM_CPUS
         )
 
         # -- Handle accumulation --
@@ -129,6 +136,45 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
 
         # -- Sub-progress bar --
         self._reduce_bar: Optional["BaseProgressBar"] = None
+
+    def supports_fusion(self) -> bool:
+        return True
+
+    def absorbs_downstream_map_transformer(self) -> bool:
+        return True
+
+    def fuse_with_downstream_map_transformer(
+        self, downstream_map_transformer
+    ) -> "ShuffleReduceOpV3":
+        """Return a new ShuffleReduceOpV3 that runs downstream_map_transformer
+        on each emitted block. The downstream MapOperator is dropped from
+        the DAG; the new op inherits our input_dependency and produces
+        whatever the downstream transformer produced.
+
+        Composes with any previously-absorbed downstream transformer (so
+        chained Reduce -> Map -> ... -> Write collapses across fusion-rule
+        waves into one op carrying the full transform chain). The caller
+        (fusion rule) is responsible for renaming via _name to reflect the
+        absorbed downstream op.
+        """
+        existing = self._downstream_map_transformer
+        if existing is not None:
+            combined = existing.fuse(downstream_map_transformer)
+        else:
+            combined = downstream_map_transformer
+        return ShuffleReduceOpV3(
+            input_op=self.input_dependencies[0],
+            data_context=self.data_context,
+            num_partitions=self._num_partitions,
+            reduce_fn=self._reduce_fn,
+            streaming_reduce=self._streaming_reduce,
+            disallow_block_splitting=self._disallow_block_splitting,
+            max_bytes_per_fetch=self._max_bytes_per_fetch,
+            reduce_prefetch_dir=self._reduce_prefetch_dir,
+            reduce_cpus=self._reduce_num_cpus,
+            name=self.name,
+            downstream_map_transformer=combined,
+        )
 
     def _add_input_inner(self, refs: RefBundle, input_index: int) -> None:
         """Each upstream bundle is one mapper's ShuffleHandle ref. Just
@@ -191,6 +237,7 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
             self._max_bytes_per_fetch,
             target_max_block_size,
             self._streaming_reduce,
+            self._downstream_map_transformer,
         )
 
         data_task = DataOpTask(
@@ -226,15 +273,11 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
             task_id=data_task.get_task_id(),
         )
 
-    def _handle_reduce_output_ready(
-        self, partition_id: int, bundle: RefBundle
-    ) -> None:
+    def _handle_reduce_output_ready(self, partition_id: int, bundle: RefBundle) -> None:
         """Callback for each yielded (block, metadata) pair from a reducer."""
         self._output_queue.append(bundle)
         self._metrics.on_output_queued(bundle)
-        self._metrics.on_task_output_generated(
-            task_index=partition_id, output=bundle
-        )
+        self._metrics.on_task_output_generated(task_index=partition_id, output=bundle)
         _, num_outputs, num_rows = estimate_total_num_of_blocks(
             self._num_reduce_tasks_submitted,
             self.upstream_op_num_outputs(),
@@ -331,9 +374,7 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
             bundle = task.get_requested_resource_bundle()
             if bundle is None:
                 continue
-            usage = usage.add(
-                ExecutionResources(cpu=bundle.cpu, memory=bundle.memory)
-            )
+            usage = usage.add(ExecutionResources(cpu=bundle.cpu, memory=bundle.memory))
         return usage
 
     def incremental_resource_usage(self) -> ExecutionResources:

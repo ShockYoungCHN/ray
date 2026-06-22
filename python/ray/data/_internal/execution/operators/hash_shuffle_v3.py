@@ -52,7 +52,6 @@ import ray
 from ray._raylet import (
     StreamingGeneratorStats,  # pyrefly: ignore[missing-module-attribute]
 )
-from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from ray.data._internal.output_buffer import (
     BlockOutputBuffer,
     OutputBlockSizeOption,
@@ -63,6 +62,7 @@ from ray.data.block import (
     BlockMetadataWithSchema,
     TaskExecWorkerStats,
 )
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 PartitionFn = Callable[[pa.Table], Dict[int, pa.Table]]
 ReduceFn = Callable[[int, List[pa.Table]], Iterable[pa.Table]]
@@ -132,16 +132,14 @@ _OPCODE_CLOSE = 0x00
 # Status codes
 _STATUS_OK = 0x00
 _STATUS_AUTH_FAIL = 0x01
-_STATUS_PATH_DENIED = 0x02   # path resolves outside server's base_dir
-_STATUS_NOT_FOUND = 0x03     # path doesn't exist on disk
-_STATUS_READ_ERR = 0x04      # IO error reading file content
+_STATUS_PATH_DENIED = 0x02  # path resolves outside server's base_dir
+_STATUS_NOT_FOUND = 0x03  # path doesn't exist on disk
+_STATUS_READ_ERR = 0x04  # IO error reading file content
 _STATUS_PROTOCOL_ERR = 0x05  # malformed frame / unknown opcode / etc.
 
 
 # ----------------------------------------------------------------- Arrow IPC
-def _ipc_buffer(
-    table: pa.Table, compression: ShuffleCompression = None
-) -> pa.Buffer:
+def _ipc_buffer(table: pa.Table, compression: ShuffleCompression = None) -> pa.Buffer:
     """Serialize an Arrow ``Table`` to an IPC stream and return the result as
     a zero-copy ``pa.Buffer``.
 
@@ -267,9 +265,9 @@ class _ScanCoordinator:
         self._pending: List[_ScanReq] = []
         self._stop = False
         # debug/metrics (proof the pooling + ordering actually happened)
-        self.scans = 0            # number of offset-ordered scan passes
-        self.pooled_reqs = 0      # total requests served via the coordinator
-        self.max_batch = 0        # largest cross-connection pool in one scan
+        self.scans = 0  # number of offset-ordered scan passes
+        self.pooled_reqs = 0  # total requests served via the coordinator
+        self.max_batch = 0  # largest cross-connection pool in one scan
         self.bytes_served = 0
         self.last_scan_ascending = True  # were the read offsets monotonic?
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -392,9 +390,7 @@ class _FetchHandler(socketserver.StreamRequestHandler):
             if opcode == _OPCODE_CLOSE:
                 return
             if opcode != _OPCODE_FETCH:
-                self._send_error(
-                    sock, _STATUS_PROTOCOL_ERR, f"unknown opcode {opcode}"
-                )
+                self._send_error(sock, _STATUS_PROTOCOL_ERR, f"unknown opcode {opcode}")
                 return
             self._handle_fetch(sock, srv)
 
@@ -415,7 +411,7 @@ class _FetchHandler(socketserver.StreamRequestHandler):
                 # connection (the client's protocol contract is "send full
                 # request, then read full response").
                 num_ranges = _recv_u32(sock)
-                _recvall(sock, num_ranges * 16)   # u64 offset + u64 length
+                _recvall(sock, num_ranges * 16)  # u64 offset + u64 length
                 for _ in range(num_sources - len(requests) - 1):
                     pl = _recv_u16(sock)
                     _recvall(sock, pl)
@@ -441,13 +437,11 @@ class _FetchHandler(socketserver.StreamRequestHandler):
         try:
             if srv.coordinator is not None:
                 results_per_source = [
-                    srv.coordinator.submit(path, ranges)
-                    for path, ranges in requests
+                    srv.coordinator.submit(path, ranges) for path, ranges in requests
                 ]
             else:
                 results_per_source = [
-                    self._read_direct(path, ranges)
-                    for path, ranges in requests
+                    self._read_direct(path, ranges) for path, ranges in requests
                 ]
         except FileNotFoundError as e:
             self._send_error(sock, _STATUS_NOT_FOUND, str(e))
@@ -566,9 +560,9 @@ class ShuffleManager:
             return {"merge_on_read": False}
         return {
             "merge_on_read": True,
-            "scans": c.scans,                # offset-ordered scan passes
-            "pooled_reqs": c.pooled_reqs,     # requests served via coordinator
-            "max_batch": c.max_batch,         # largest cross-connection pool
+            "scans": c.scans,  # offset-ordered scan passes
+            "pooled_reqs": c.pooled_reqs,  # requests served via coordinator
+            "max_batch": c.max_batch,  # largest cross-connection pool
             "last_scan_ascending": c.last_scan_ascending,
             "bytes_served": c.bytes_served,
         }
@@ -713,9 +707,7 @@ class _ShuffleConnection:
                             want = min(remaining, chunk_size)
                             n = self._sock.recv_into(view[:want], want)
                             if n == 0:
-                                raise ConnectionError(
-                                    "peer closed mid-fetch"
-                                )
+                                raise ConnectionError("peer closed mid-fetch")
                             f.write(view[:n])
                             remaining -= n
         except Exception:
@@ -827,9 +819,7 @@ def open_shuffle_connection(
             sock.close()
             raise PermissionError("ShuffleManager handshake: bad token")
         sock.close()
-        raise RuntimeError(
-            f"ShuffleManager handshake: unexpected status {status}"
-        )
+        raise RuntimeError(f"ShuffleManager handshake: unexpected status {status}")
     except Exception:
         try:
             sock.close()
@@ -923,9 +913,7 @@ def v3_map_task(
         namespace="ray_data_shuffle_v3",
         get_if_exists=True,
         max_restarts=-1,
-        scheduling_strategy=NodeAffinitySchedulingStrategy(
-            node_id, soft=False
-        ),
+        scheduling_strategy=NodeAffinitySchedulingStrategy(node_id, soft=False),
         num_cpus=0,
     ).remote(out_dir, token)
 
@@ -963,13 +951,12 @@ def v3_map_task(
     final_size_on_close = -1
     try:
         with open(tmp_path, "wb") as f:
+
             def flush(pid: int):
                 shards = staging.get(pid)
                 if not shards:
                     return
-                tbl = (
-                    pa.concat_tables(shards) if len(shards) > 1 else shards[0]
-                )
+                tbl = pa.concat_tables(shards) if len(shards) > 1 else shards[0]
 
                 buf = _ipc_buffer(tbl, compression=compression)
                 off = f.tell()
@@ -1005,9 +992,7 @@ def v3_map_task(
                     if not shard.num_rows:
                         continue
                     staging.setdefault(pid, []).append(shard)
-                    staging_bytes[pid] = (
-                        staging_bytes.get(pid, 0) + shard.nbytes
-                    )
+                    staging_bytes[pid] = staging_bytes.get(pid, 0) + shard.nbytes
                     peak_inflight = max(peak_inflight, pool_size())
                     # Pool overflow → spill the LARGEST bucket(s) until back under
                     # budget. Bounds total staging to pool_budget_bytes,
@@ -1046,9 +1031,7 @@ def v3_map_task(
             final_size_on_close = f.tell()
             if index:
                 expected_size = max(
-                    off + length
-                    for ranges in index.values()
-                    for off, length in ranges
+                    off + length for ranges in index.values() for off, length in ranges
                 )
             else:
                 expected_size = 0
@@ -1157,6 +1140,7 @@ def _prefetch_node_into(
     once and retry; persistent failure surfaces as ShuffleFetchError so the
     operator layer can decide what to do.
     """
+
     def _resolve() -> Tuple[str, int]:
         return ray.get(manager.endpoint.remote())
 
@@ -1172,8 +1156,7 @@ def _prefetch_node_into(
         with conn_cm as conn:
             for batch in _chunk_members_by_bytes(members, max_bytes_per_fetch):
                 sources = [
-                    (src_path, src_ranges)
-                    for _idx, src_path, src_ranges in batch
+                    (src_path, src_ranges) for _idx, src_path, src_ranges in batch
                 ]
                 conn.fetch_into(sources, out_file_obj)
     except Exception as e:
@@ -1220,6 +1203,7 @@ def v3_reduce_task(
     max_bytes_per_fetch: int = _DEFAULT_MAX_BYTES_PER_FETCH,
     target_max_block_size: Optional[int] = None,
     streaming: bool = True,
+    downstream_map_transformer: Optional[Any] = None,
 ) -> Generator[Union[Block, bytes], None, None]:
     """Fetch one partition's shards, decode mmap'd prefetch file, stream
     ``reduce_fn`` output as (block, pickled metadata) pairs.
@@ -1252,13 +1236,15 @@ def v3_reduce_task(
         target_max_block_size: output reshape target; also the streaming
             flush threshold.
         streaming: incremental flush vs accumulate-then-reduce.
+        downstream_map_transformer: when set, OperatorFusionRule has
+            absorbed a downstream MapOperator (typically Write) into this
+            reduce op. Each emitted block is run through this transformer
+            inline before the streaming-generator protocol yields it.
     """
     start_time_s = time.perf_counter()
 
     # Collect (manager, token, src_path, ranges) per source for this partition.
-    jobs: List[
-        Tuple["ray.actor.ActorHandle", str, str, List[Tuple[int, int]]]
-    ] = []
+    jobs: List[Tuple["ray.actor.ActorHandle", str, str, List[Tuple[int, int]]]] = []
     for h in handles:
         if not isinstance(h, dict):
             h = ray.get(h)
@@ -1276,9 +1262,7 @@ def v3_reduce_task(
         exec_stats_builder.finish()
         gen_stats: StreamingGeneratorStats = yield block
         exec_stats = exec_stats_builder.build(
-            block_ser_time_s=(
-                gen_stats.object_creation_dur_s if gen_stats else None
-            ),
+            block_ser_time_s=(gen_stats.object_creation_dur_s if gen_stats else None),
         )
         yield pickle.dumps(
             BlockMetadataWithSchema.from_block(
@@ -1290,11 +1274,26 @@ def v3_reduce_task(
             )
         )
 
+    # When OperatorFusionRule has absorbed a downstream MapOperator (e.g.,
+    # Write) into this reduce op, apply its MapTransformer to each block
+    # before emit. Per-block invocation matches Write's expected granularity
+    # (datasink.write is called per block and emits a stats block).
+    def _emit(block: Block):
+        if downstream_map_transformer is None:
+            yield from _yield_with_stats(block)
+            return
+        from ray.data._internal.execution.interfaces import TaskContext
+
+        for out_block in downstream_map_transformer.apply_transform(
+            iter([block]), TaskContext(task_idx=partition_id)
+        ):
+            yield from _yield_with_stats(out_block)
+
     # Empty-input shortcut: still call reduce_fn (may produce empty block)
     # and yield via the protocol so the operator gets the metadata.
     if not jobs:
         for block in reduce_fn(partition_id, []):
-            yield from _yield_with_stats(block)
+            yield from _emit(block)
         return
 
     # Decide where the prefetch file lives, and whether we own the cleanup.
@@ -1328,9 +1327,7 @@ def v3_reduce_task(
         # Phase 1: prefetch all shards into one prefetch.bin
         with open(prefetch_file, "wb") as out_f:
             for manager, token, members in groups.values():
-                _prefetch_node_into(
-                    out_f, manager, token, members, max_bytes_per_fetch
-                )
+                _prefetch_node_into(out_f, manager, token, members, max_bytes_per_fetch)
 
         # Phase 2: walk prefetch.bin, drive reduce_fn streamingly
         # Reshape buffer (created lazily on first flush) and the running
@@ -1353,11 +1350,11 @@ def v3_reduce_task(
             for block in reduce_fn(partition_id, tables):
                 if output_buffer is None:
                     # target_max_block_size=None: emit blocks as-is.
-                    yield from _yield_with_stats(block)
+                    yield from _emit(block)
                 else:
                     output_buffer.add_block(block)
                     while output_buffer.has_next():
-                        yield from _yield_with_stats(output_buffer.next())
+                        yield from _emit(output_buffer.next())
 
         mmf = pa.memory_map(prefetch_file, "r")
         try:
@@ -1394,7 +1391,7 @@ def v3_reduce_task(
             if output_buffer is not None:
                 output_buffer.finalize()
                 while output_buffer.has_next():
-                    yield from _yield_with_stats(output_buffer.next())
+                    yield from _emit(output_buffer.next())
         finally:
             try:
                 mmf.close()
@@ -1411,6 +1408,8 @@ def v3_reduce_task(
                 os.rmdir(prefetch_dir)
             except OSError:
                 pass
+
+
 def concat_reduce(partition_id: int, tables: List[pa.Table]) -> Iterable[pa.Table]:
     if not tables:
         return
