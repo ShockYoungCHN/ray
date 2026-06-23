@@ -62,6 +62,7 @@ def list_files_for_each_block(
     file_extensions: Optional[List[str]] = None,
     partition_filter: Optional["PathPartitionFilter"] = None,
     preserve_order: bool = False,
+    target_rows: Optional[int] = None,
 ) -> Iterable[Block]:
     """Expand path blocks into ``FileManifest`` blocks.
 
@@ -71,6 +72,9 @@ def list_files_for_each_block(
     Pruners are constructed once per task from ``file_extensions`` /
     ``partition_filter`` — keeps pruner construction out of the
     ``_read_datasource_v2`` entry point.
+
+    ``target_rows`` is forwarded to the indexer to enable lazy footer
+    enumeration (Parquet limit-pushdown path).
     """
     pruners = _build_pruners(file_extensions, partition_filter)
     for block in blocks:
@@ -79,6 +83,7 @@ def list_files_for_each_block(
             filesystem=filesystem,
             pruners=pruners,
             preserve_order=preserve_order,
+            target_rows=target_rows,
         ):
             if len(manifest) > 0:
                 yield manifest.as_block()
