@@ -349,6 +349,14 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
     def get_active_tasks(self) -> List[OpTask]:
         return list(self._shuffle_reduce_tasks.values())
 
+    def throttling_disabled(self) -> bool:
+        # Opt out of the ResourceManager's reservation while we're waiting
+        # for upstream map tasks to close. Until all map handles are in,
+        # this op submits zero tasks — no point reserving CPU for it.
+        # Once _dispatch_all_reducers fires (in all_inputs_done) we become
+        # eligible normally and the allocator reserves our share.
+        return not self._reducers_dispatched
+
     def has_execution_finished(self) -> bool:
         if self._shuffle_reduce_tasks or self._output_queue:
             return False
