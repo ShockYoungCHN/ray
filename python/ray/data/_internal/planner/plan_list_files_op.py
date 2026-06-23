@@ -74,6 +74,14 @@ def plan_list_files_op(
     indexer = op.file_indexer
     partitioner = op.file_partitioner
 
+    # Full-scan footer-fetch elision: when no Limit was pushed down, the
+    # row-group-aware ParquetFileChunker's per-file footer read at listing
+    # time is redundant -- every read task opens the same file and reads
+    # the same footer to slice anyway. Swap to the byte-estimate chunker
+    # (``reads_file_metadata = False``) so the listing pass returns
+    # without any per-file I/O. The reader handles both metadata shapes.
+    _maybe_swap_chunker_for_full_scan(indexer, op.pushed_limit)
+
     # Projection-aware sizing (v2c): when the read projects a subset of columns
     # (recorded on ``ListFiles.projected_columns`` by ``ProjectionPushdown``),
     # tell the Parquet chunker so its footer-derived in-memory size hint counts
@@ -81,37 +89,35 @@ def plan_list_files_op(
     # partitions by the columns the read drops.
     _apply_projected_columns_to_chunker(indexer, op.projected_columns)
 
-    # Limit-aware partitioning: when a Limit was pushed down by
-    # LimitPushdownRule (stamped onto ListFiles.pushed_limit alongside the
-    # scanner-level push_limit), wrap the partitioner so listing stops
-    # emitting partitions once the accumulated chunk row count satisfies
-    # the limit.
-    #
-    # When the rule also stamped pushed_max_rows_per_partition -- computed
-    # CPU-aware as limit_rows / (2 * avail_cpus) -- rebuild the inner
-    # partitioner with that row cap so each FileManifest (= one ReadTask)
-    # lands at roughly 1 task per CPU per round (with 2x headroom).
-    #
-    # pushed_limit > 0 guard: ds.limit(0) pushes 0 through;
-    # LimitAwareFilePartitioner requires a positive limit and the pipeline
-    # below is empty anyway, so we skip wrapping.
-    if op.pushed_limit is not None and op.pushed_limit > 0 and partitioner is not None:
-        from ray.data._internal.datasource_v2.partitioners.limit_aware_partitioner import (
-            LimitAwareFilePartitioner,
-        )
-
-        if op.pushed_max_rows_per_partition is not None:
-            partitioner = _rebuild_partitioner_with_row_cap(
-                partitioner,
-                new_max_rows_per_partition=op.pushed_max_rows_per_partition,
-                total_rows=op.pushed_limit,
-                num_partitions=op.pushed_num_partitions,
-            )
-        partitioner = LimitAwareFilePartitioner(
-            inner=partitioner, limit_rows=op.pushed_limit
+    # Limit-pushdown wiring: the indexer's lazy-enumeration path (driven by
+    # ``target_rows`` below) trims the manifest stream to exactly
+    # ``pushed_limit`` rows -- the boundary chunk's ``max_emit_rows`` is
+    # stamped at listing time, and chunks beyond the boundary are dropped.
+    # Nothing here needs to re-cap the row count; we only need to give the
+    # partitioner the requested ``num_partitions`` so it balances reads
+    # across CPUs instead of falling back to the file-count floor.
+    if (
+        op.pushed_limit is not None
+        and op.pushed_limit > 0
+        and op.pushed_max_rows_per_partition is not None
+        and partitioner is not None
+    ):
+        partitioner = _rebuild_partitioner_with_row_cap(
+            partitioner,
+            new_max_rows_per_partition=op.pushed_max_rows_per_partition,
+            num_partitions=op.pushed_num_partitions,
         )
 
     shuffle_config = op.shuffle_config_factory()
+
+    # Forward the pushed limit to the indexer so it can short-circuit footer
+    # enumeration via the lazy-enumeration path once running rows cover the
+    # target. Only kicks in for Parquet (the only chunker stamping num_rows
+    # today); other formats see ``target_rows=None`` and use the eager
+    # streaming path.
+    lazy_target_rows = (
+        op.pushed_limit if op.pushed_limit is not None and op.pushed_limit > 0 else None
+    )
 
     transform_fns: List[MapTransformFn] = [
         BlockMapTransformFn(
@@ -122,6 +128,7 @@ def plan_list_files_op(
                 file_extensions=file_extensions,
                 partition_filter=partition_filter,
                 preserve_order=data_context.execution_options.preserve_order,
+                target_rows=lazy_target_rows,
             ),
             # Disable block-shaping: produce manifest blocks as-is.
             disable_block_shaping=True,
@@ -176,7 +183,6 @@ def _rebuild_partitioner_with_row_cap(
     partitioner: "FilePartitioner",
     *,
     new_max_rows_per_partition: int,
-    total_rows: Optional[int] = None,
     num_partitions: Optional[int] = None,
 ) -> "FilePartitioner":
     """Return a partitioner with the given row cap stacked on top of its
@@ -189,14 +195,14 @@ def _rebuild_partitioner_with_row_cap(
     the row cap never trips and the byte cap continues to drive flushing
     as before.
 
-    When ``total_rows`` and ``num_partitions`` are both provided, enables
-    adaptive cross-file mode on FileAffinityPartitioner -- a single shared
-    bucket flushes at an adaptive target (remaining_rows /
-    remaining_partitions) so the partitioner can merge chunks across files
-    and hit ``num_partitions`` even when the file count would otherwise
-    floor it (e.g., 3000-file datasets with parallelism=500). Without
-    these args, the partitioner stays in per-file mode and ``new_max_rows
-    _per_partition`` acts only as an upper cap on file splitting.
+    When ``num_partitions`` is provided, enables the static cross-file
+    mode on :class:`FileAffinityPartitioner` -- chunks are buffered and
+    redistributed across ``num_partitions`` balanced buckets at finalize,
+    so the partitioner can merge chunks across files and hit the requested
+    parallelism even when the file count would otherwise floor it (e.g.,
+    3000-file datasets with parallelism=500). Without it, the partitioner
+    stays in per-file mode and ``new_max_rows_per_partition`` acts only
+    as an upper cap on file splitting.
 
     Falls back to partitioner unchanged for types that don't expose a
     row-count cap. RoundRobinPartitioner is not row-count-aware and is
@@ -211,10 +217,44 @@ def _rebuild_partitioner_with_row_cap(
             in_memory_size_estimator=partitioner._in_memory_size_estimator,
             max_bucket_size=partitioner._max_bucket_size,
             max_rows_per_partition=new_max_rows_per_partition,
-            total_rows=total_rows,
             num_partitions=num_partitions,
         )
     return partitioner
+
+
+def _maybe_swap_chunker_for_full_scan(indexer, pushed_limit) -> None:
+    """Swap row-group-aware ParquetFileChunker -> byte-estimate chunker
+    when there's no pushed limit.
+
+    The row-group-aware chunker reads a Parquet footer per file at listing
+    time to compute exact (start, end) row-group ranges and a row count.
+    That cost is only worth paying when the lazy-enumeration path needs
+    the row count to stop early -- i.e. when a Limit was pushed down.
+    For full scans the row count is unused, every read task ends up
+    opening the file and reading its own footer anyway, and the
+    listing-time pre-fetch is pure duplicate I/O (~14-30s on
+    sf1000-class datasets).
+
+    No-op when (a) a limit IS pushed down (lazy enum needs num_rows),
+    (b) the chunker is not the row-group-aware ParquetFileChunker
+    (already byte-estimate, whole-file, line-delimited, etc.), or
+    (c) the indexer doesn't expose a settable ``file_chunker``.
+    """
+    if pushed_limit is not None and pushed_limit > 0:
+        return
+    chunker = getattr(indexer, "file_chunker", None)
+    from ray.data._internal.datasource_v2.chunkers.file_chunker import (
+        ByteEstimateParquetFileChunker,
+        ParquetFileChunker,
+    )
+
+    if not isinstance(chunker, ParquetFileChunker):
+        return
+    try:
+        indexer.file_chunker = ByteEstimateParquetFileChunker()
+    except AttributeError:
+        # Indexer didn't expose a setter; leave the chunker in place.
+        pass
 
 
 def _apply_projected_columns_to_chunker(indexer, projected_columns) -> None:

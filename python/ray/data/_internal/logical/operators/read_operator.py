@@ -461,11 +461,11 @@ class ListFiles(LogicalOperator, SourceOperator):
     projected_columns: Optional[List[str]] = None
     # Row count pushed down from a ``Limit`` op above the consuming
     # ``ReadFiles``. Populated by ``LimitPushdownRule`` alongside the scanner-
-    # level ``push_limit``. ``plan_list_files_op`` reads it to wrap the
-    # partitioner with :class:`LimitAwareFilePartitioner` so listing stops
-    # emitting partitions once the accumulated row count satisfies the limit,
-    # avoiding dispatch of read tasks whose output would be discarded.
-    # ``None`` means "no pushed limit" (full listing).
+    # level ``push_limit``. ``plan_list_files_op`` forwards it to the
+    # indexer's lazy-enumeration path so listing stops reading footers (and
+    # thus stops emitting chunks) once the accumulated row count satisfies
+    # the limit, avoiding dispatch of read tasks whose output would be
+    # discarded. ``None`` means "no pushed limit" (full listing).
     pushed_limit: Optional[int] = None
     # Optional plan-time per-task row budget, set by LimitPushdownRule to
     # align ReadTask count with cluster CPU count: limit_rows / (2 *

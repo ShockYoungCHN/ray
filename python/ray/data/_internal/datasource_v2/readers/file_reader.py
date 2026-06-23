@@ -253,11 +253,11 @@ class FileReader(Reader[FileManifest]):
         scanner_kwargs.update(self._arrow_scanner_kwargs())
 
         # Per-task emit budget derived from the manifest's chunk metadata.
-        # ``LimitAwareFilePartitioner`` stamps ``max_emit_rows`` on the
-        # boundary chunk that crosses the pushed scanner limit; the other
-        # chunks in this task have their full ``num_rows``. The effective
-        # task cap is the min of the global per-task ``self._limit`` and
-        # this per-task local budget — which is what makes per-task emit
+        # The indexer's lazy-enumeration path stamps ``max_emit_rows`` on
+        # the boundary chunk that crosses the pushed scanner limit; the
+        # other chunks in this task have their full ``num_rows``. The
+        # effective task cap is the min of the global per-task ``self._limit``
+        # and this per-task local budget — which is what makes per-task emit
         # row-precise (the precondition for safely deleting the downstream
         # ``Limit`` op and enabling Read+ShuffleMap fusion).
         manifest_budget = _compute_manifest_emit_budget(input_split)
@@ -534,8 +534,8 @@ def _compute_manifest_emit_budget(manifest: FileManifest) -> Optional[int]:
 
     Chunkers that support row-precise pushdown (supports_row_count_limit=True)
     stamp max_emit_rows on every chunk: full num_rows by default,
-    overwritten to the residual on the boundary chunk by
-    LimitAwareFilePartitioner. Their sum is the exact number of rows this
+    overwritten to the residual on the boundary chunk by the indexer's
+    lazy-enumeration path. Their sum is the exact number of rows this
     task should emit, so per-task emit is row-precise and the downstream
     Limit op can be dropped.
 

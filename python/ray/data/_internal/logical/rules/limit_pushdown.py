@@ -235,13 +235,15 @@ class LimitPushdownRule(Rule):
                             scanner=op.scanner.push_limit(limit),
                         )
                         # Mirror the pushed limit onto the upstream
-                        # ListFiles so its physical planner can wrap the
-                        # partitioner with LimitAwareFilePartitioner and
-                        # stop dispatching read tasks whose rows would be
-                        # discarded by the downstream Limit op. Compute a
-                        # per-task row cap so each bucket lands ~1-2 tasks
-                        # per CPU; when the read specifies an explicit
-                        # parallelism, honor it instead of the CPU default.
+                        # ListFiles so its physical planner forwards it to
+                        # the indexer's lazy-enumeration path; that stops
+                        # reading footers once the running rows cover the
+                        # limit, avoiding read-task dispatch for chunks
+                        # whose rows the downstream Limit would discard.
+                        # Compute a per-task row cap so each bucket lands
+                        # ~1-2 tasks per CPU; when the read specifies an
+                        # explicit parallelism, honor it instead of the
+                        # CPU default.
                         explicit_partitions = (
                             new_op.parallelism if new_op.parallelism > 0 else None
                         )
@@ -381,7 +383,10 @@ def _can_drop_limit_after_pushdown(
     1. The scanner absorbed the pushdown (``pushed`` is a new instance with
        the limit set on its scanner).
     2. The upstream ``ListFiles`` accepted the same pushed limit, which
-       implies ``LimitAwareFilePartitioner`` will wrap the partitioner.
+       triggers the indexer's lazy-enumeration path -- footers are read
+       only until the running row count covers the limit, the boundary
+       chunk has ``max_emit_rows`` stamped, and chunks past the boundary
+       are dropped before reaching the partitioner.
     3. The ``ListFiles.file_indexer.file_chunker`` advertises
        ``supports_row_count_limit = True``. Only chunkers that stamp
        ``num_rows`` + ``max_emit_rows`` on chunk metadata make the

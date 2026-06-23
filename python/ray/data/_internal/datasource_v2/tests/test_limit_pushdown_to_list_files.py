@@ -4,8 +4,8 @@ Complements ``test_execution_optimizer_limit_pushdown.py`` (which covers
 the broad rule semantics on V1 ``Read``) with V2-specific behavior: when
 ``LimitPushdownRule`` pushes a limit into a ``ReadFiles`` scanner that
 implements ``SupportsLimitPushdown``, it must also mirror the limit onto
-the upstream ``ListFiles`` so the listing-time partitioner can be wrapped
-with :class:`LimitAwareFilePartitioner`.
+the upstream ``ListFiles`` so the indexer's lazy-enumeration path can
+trim the manifest stream at listing time.
 
 Avoids spinning up a Ray cluster: exercises the rule helper directly on
 constructed logical-op trees.
@@ -220,9 +220,11 @@ def test_direct_read_limit_triggers_pushdown_via_apply():
 def test_limit_op_dropped_when_pushdown_safe():
     """When (a) Limit's input is ReadFiles, (b) scanner supports
     pushdown, (c) upstream is ListFiles, AND (d) the chunker advertises
-    row-count-limit support, the Limit node becomes redundant:
-    ``LimitAwareFilePartitioner`` ensures row-precise per-task emit.
-    Verify the Limit node is dropped from the plan tree."""
+    row-count-limit support, the Limit node becomes redundant: the
+    indexer's lazy-enumeration path trims to exact limit at listing time
+    and stamps ``max_emit_rows`` on the boundary chunk for per-task
+    row-precise emit. Verify the Limit node is dropped from the plan
+    tree."""
     list_files = ListFiles(
         paths=["s3://bucket/data/"],
         # ``_StubIndexer`` carries a chunker with
@@ -303,8 +305,8 @@ def test_pushdown_falls_back_to_no_row_cap_when_cpus_unknown(monkeypatch):
 
 def test_limit_op_preserved_when_chunker_lacks_row_count_support():
     """Corner case: non-Parquet chunkers (WholeFile / LineDelimited /
-    ByteEstimate) don't stamp ``num_rows`` on chunk metadata, so
-    ``LimitAwareFilePartitioner`` can't pick a boundary and
+    ByteEstimate) don't stamp ``num_rows`` on chunk metadata, so the
+    indexer's lazy-enumeration path can't pick a boundary and
     ``max_emit_rows`` is never set. Deleting the Limit op in that state
     would silently allow multi-task over-emission (each task capped at
     per-task ``scanner.limit`` rather than at a chunk-derived budget).
