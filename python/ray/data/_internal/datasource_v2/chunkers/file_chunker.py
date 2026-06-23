@@ -7,6 +7,7 @@ reader carry the per-chunk metadata through to the read task.
 """
 
 import abc
+import functools
 import logging
 import math
 from typing import (
@@ -116,9 +117,18 @@ class ChunkMetadata(TypedDict):
 _ChunkMetadataT = TypeVar("_ChunkMetadataT", bound=ChunkMetadata)
 
 
+@functools.lru_cache(maxsize=None)
+def _required_chunk_keys(cls: Type[_ChunkMetadataT]) -> frozenset:
+    """Cache the TypedDict field set per class. ``get_type_hints`` does full
+    annotation introspection (module-namespace eval) and is ~the dominant
+    per-chunk cost when building tens of thousands of ChunkMetadata at listing
+    time; ``cls`` is one of a couple of fixed types, so cache by class."""
+    return frozenset(get_type_hints(cls).keys())
+
+
 def create_chunk_metadata(cls: Type[_ChunkMetadataT], **kwargs) -> _ChunkMetadataT:
     """Create a metadata instance with validation, ensure the keys are correct."""
-    required_keys = list(get_type_hints(cls).keys())
+    required_keys = _required_chunk_keys(cls)
 
     missing_keys = [key for key in required_keys if key not in kwargs]
     if missing_keys:
