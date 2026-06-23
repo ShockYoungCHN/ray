@@ -1,5 +1,7 @@
 import logging
 import math
+import os
+import time
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -39,6 +41,11 @@ _LAZY_OVER_ESTIMATE = 1.15
 # client side -- PyArrow only spawns threads as needed.
 _PYARROW_IO_THREADS = env_integer("RAY_DATA_PYARROW_IO_THREADS", 128)
 _pyarrow_io_threads_applied = False
+
+# When set, prints a one-line ``LISTING_PROF`` summary per ListFiles task
+# with per-phase wall times. Mirrors ``RAY_DATA_SHUFFLE_PROFILE``'s style so
+# both can be parsed by the same tooling. Off by default — no overhead.
+_LIST_FILES_PROFILE = os.environ.get("RAY_DATA_LIST_FILES_PROFILE") == "1"
 
 
 def _ensure_pyarrow_io_thread_count() -> None:
@@ -339,13 +346,20 @@ class NonSamplingFileIndexer(FileIndexer):
         # behind a tiny internal pool.
         _ensure_pyarrow_io_thread_count()
         chunker = self._file_chunker
+        t_materialize = time.perf_counter()
         files: List[FileInfo] = list(file_infos)
+        materialize_s = time.perf_counter() - t_materialize
         if not files:
             return
 
         accepted: List[Tuple[str, int, Optional[ChunkMetadata]]] = []
         running_rows = 0
         num_threads = max(self._DEFAULT_LAZY_FOOTER_THREADS, 1)
+        phase_a_s = 0.0
+        phase_b_s = 0.0
+        phase_c_s = 0.0
+        phase_d_s = 0.0
+        phase_c_iters = 0
 
         def fetch_one(
             fi: FileInfo,
@@ -370,7 +384,9 @@ class NonSamplingFileIndexer(FileIndexer):
         # is the average we extrapolate from -- 0 only when the file had no
         # rows at all (truly empty parquet), in which case we can't size
         # the bulk fetch and fall back to the streaming pipeline.
+        t_a = time.perf_counter()
         absorb(fetch_one(files[0]))
+        phase_a_s = time.perf_counter() - t_a
         if running_rows == 0:
             yield from accepted
             yield from self._generate_chunk_records(
@@ -380,7 +396,23 @@ class NonSamplingFileIndexer(FileIndexer):
         avg_rows_per_file = float(running_rows)
         if running_rows >= target_rows:
             # First file already covers the target.
+            t_d = time.perf_counter()
             self._trim_to_target(accepted, target_rows)
+            phase_d_s = time.perf_counter() - t_d
+            self._maybe_log_lazy_profile(
+                len(files),
+                1,
+                len(accepted),
+                target_rows,
+                running_rows,
+                materialize_s,
+                phase_a_s,
+                phase_b_s,
+                phase_c_s,
+                phase_c_iters,
+                phase_d_s,
+                num_threads,
+            )
             yield from accepted
             return
 
@@ -391,12 +423,15 @@ class NonSamplingFileIndexer(FileIndexer):
             len(files),
         )
         if files_needed > cursor:
+            t_b = time.perf_counter()
             with ThreadPoolExecutor(max_workers=num_threads) as ex:
                 for records in ex.map(fetch_one, files[cursor:files_needed]):
                     absorb(records)
+            phase_b_s = time.perf_counter() - t_b
             cursor = files_needed
 
         # Phase C: top-up loop -- only fires when our estimate undershot.
+        t_c = time.perf_counter()
         while running_rows < target_rows and cursor < len(files):
             residual = target_rows - running_rows
             more = max(1, math.ceil(residual / avg_rows_per_file * _LAZY_OVER_ESTIMATE))
@@ -405,11 +440,63 @@ class NonSamplingFileIndexer(FileIndexer):
                 for records in ex.map(fetch_one, files[cursor:end]):
                     absorb(records)
             cursor = end
+            phase_c_iters += 1
+        phase_c_s = time.perf_counter() - t_c
 
         # Phase D: stamp ``max_emit_rows`` on the boundary and drop chunks
         # past it so the manifest carries exactly ``target_rows``.
+        t_d = time.perf_counter()
         self._trim_to_target(accepted, target_rows)
+        phase_d_s = time.perf_counter() - t_d
+        self._maybe_log_lazy_profile(
+            len(files),
+            cursor,
+            len(accepted),
+            target_rows,
+            running_rows,
+            materialize_s,
+            phase_a_s,
+            phase_b_s,
+            phase_c_s,
+            phase_c_iters,
+            phase_d_s,
+            num_threads,
+        )
         yield from accepted
+
+    @staticmethod
+    def _maybe_log_lazy_profile(
+        n_files: int,
+        n_footers_read: int,
+        n_chunks: int,
+        target_rows: int,
+        running_rows: int,
+        materialize_s: float,
+        phase_a_s: float,
+        phase_b_s: float,
+        phase_c_s: float,
+        phase_c_iters: int,
+        phase_d_s: float,
+        num_threads: int,
+    ) -> None:
+        """Emit a single ``LISTING_PROF`` line when the env flag is set.
+
+        Mirrors v3_map_task's ``SHUFFLE_PROF`` format so the same parser
+        can aggregate across listing + map tasks. Printed once per
+        ListFiles task; cheap when the flag is off (env read at import).
+        """
+        if not _LIST_FILES_PROFILE:
+            return
+        total = materialize_s + phase_a_s + phase_b_s + phase_c_s + phase_d_s
+        print(
+            f"LISTING_PROF target_rows={target_rows} running_rows={running_rows} "
+            f"files_total={n_files} footers_read={n_footers_read} chunks={n_chunks} "
+            f"threads={num_threads} total_s={total:.3f} "
+            f"materialize_s={materialize_s:.3f} phase_a_s={phase_a_s:.3f} "
+            f"phase_b_s={phase_b_s:.3f} phase_c_s={phase_c_s:.3f} "
+            f"phase_c_iters={phase_c_iters} phase_d_s={phase_d_s:.3f}",
+            flush=True,
+        )
 
     @staticmethod
     def _trim_to_target(
