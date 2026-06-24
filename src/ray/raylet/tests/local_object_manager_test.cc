@@ -163,15 +163,6 @@ class MockIOWorkerClient : public rpc::FakeCoreWorkerClient {
   void RestoreSpilledObjects(
       const rpc::RestoreSpilledObjectsRequest &request,
       const rpc::ClientCallback<rpc::RestoreSpilledObjectsReply> &callback) override {
-    // Capture per-RPC batch shape so tests can verify the post-based
-    // batching coalesced multiple AsyncRestoreSpilledObject calls into
-    // one RPC (and grouped by base_url) instead of N independent RPCs.
-    restore_request_object_counts.push_back(request.object_ids_to_restore_size());
-    std::vector<std::string> urls;
-    for (int i = 0; i < request.spilled_objects_url_size(); ++i) {
-      urls.push_back(request.spilled_objects_url(i));
-    }
-    restore_request_urls.push_back(std::move(urls));
     restore_callbacks.push_back(callback);
   }
 
@@ -231,14 +222,6 @@ class MockIOWorkerClient : public rpc::FakeCoreWorkerClient {
   }
 
   std::vector<int> spill_request_object_counts;
-  // One entry per RestoreSpilledObjects RPC issued; the value is the
-  // batch size that arrived in that RPC.  Used by tests verifying the
-  // post-based batching coalesces multiple AsyncRestoreSpilledObject
-  // calls into one (or few) RPC instead of one-per-object.
-  std::vector<int> restore_request_object_counts;
-  // Parallel list of urls included in each RestoreSpilledObjects RPC,
-  // so tests can assert the by-base-url grouping behaviour.
-  std::vector<std::vector<std::string>> restore_request_urls;
   std::list<rpc::ClientCallback<rpc::SpillObjectsReply>> callbacks;
   std::list<rpc::ClientCallback<rpc::DeleteSpilledObjectsReply>> delete_callbacks;
   std::list<rpc::ClientCallback<rpc::RestoreSpilledObjectsReply>> restore_callbacks;
@@ -564,11 +547,6 @@ TEST_F(LocalObjectManagerTest, TestRestoreSpilledObject) {
         });
   }
   ASSERT_EQ(num_times_fired, 0);
-  // Drain the post-based batch flush task that AsyncRestoreSpilledObject
-  // queues on io_service_.  In production raylet the io_service is being
-  // run() on the main thread; in unit tests we must pump it manually so
-  // FlushPendingRestoreBatch fires and PopRestoreWorker is invoked.
-  io_service_.run_one();
 
   // When restore workers are pushed, the request should be dedupped.
   for (int i = 0; i < 10; i++) {
@@ -578,125 +556,6 @@ TEST_F(LocalObjectManagerTest, TestRestoreSpilledObject) {
   worker_pool.io_worker_client->ReplyRestoreObjects(10);
   // The restore should've been invoked.
   ASSERT_EQ(num_times_fired, 1);
-}
-
-// AsyncRestoreSpilledObject defers the actual RPC dispatch onto
-// io_service_ via post().  A single call with nothing else in the queue
-// should still produce exactly one RPC after io_service_ pumps once and
-// an IO worker becomes available.
-TEST_F(LocalObjectManagerTest, TestRestoreBatch_SingleObject) {
-  ObjectID object_id = ObjectID::FromRandom();
-  const std::string url = BuildURL("file_A", /*offset=*/0);
-  int num_times_fired = 0;
-  EXPECT_CALL(worker_pool, PushRestoreWorker(_));
-
-  manager.AsyncRestoreSpilledObject(
-      object_id, /*object_size=*/1024, url, [&](const Status &status) {
-        ASSERT_TRUE(status.ok());
-        num_times_fired++;
-      });
-
-  // Before draining, no RPC has been issued.
-  ASSERT_EQ(worker_pool.io_worker_client->restore_request_object_counts.size(), 0u);
-
-  // Pump the io_service_; the posted FlushPendingRestoreBatch runs once
-  // and calls PopRestoreWorker which queues a callback waiting for an
-  // io worker.
-  io_service_.run_one();
-  // Provide the io worker — its arrival fires the queued callback which
-  // sends the actual RPC the mock can observe.
-  worker_pool.RestoreWorkerPushed();
-
-  // Exactly one RPC dispatched, carrying exactly one object.
-  ASSERT_EQ(worker_pool.io_worker_client->restore_request_object_counts.size(), 1u);
-  ASSERT_EQ(worker_pool.io_worker_client->restore_request_object_counts[0], 1);
-
-  worker_pool.io_worker_client->ReplyRestoreObjects(/*bytes_restored=*/1024);
-  ASSERT_EQ(num_times_fired, 1);
-}
-
-// Multiple distinct objects whose URLs share the same base file should
-// be coalesced into a single RPC by ParseBaseSpillUrl + by_file
-// grouping in FlushPendingRestoreBatch.
-TEST_F(LocalObjectManagerTest, TestRestoreBatch_SameFileCoalesces) {
-  const std::string base = "file_A";
-  constexpr int N = 5;
-  std::vector<ObjectID> ids;
-  ids.reserve(N);
-  for (int i = 0; i < N; ++i) ids.push_back(ObjectID::FromRandom());
-
-  int num_times_fired = 0;
-  EXPECT_CALL(worker_pool, PushRestoreWorker(_));
-
-  // All 5 calls issued back-to-back inside the same synchronous
-  // sequence — they all push into pending_restore_batch_ and share one
-  // posted flush task (batch_flush_scheduled_ stays true after #1).
-  for (int i = 0; i < N; ++i) {
-    manager.AsyncRestoreSpilledObject(
-        ids[i], /*object_size=*/256,
-        BuildURL(base, /*offset=*/i * 256),
-        [&](const Status &status) {
-          ASSERT_TRUE(status.ok());
-          num_times_fired++;
-        });
-  }
-
-  ASSERT_EQ(worker_pool.io_worker_client->restore_request_object_counts.size(), 0u);
-  io_service_.run_one();   // flushes the batch, calls PopRestoreWorker once
-  worker_pool.RestoreWorkerPushed();   // hands the worker so RPC actually sends
-
-  // One RPC, carrying all 5 objects (same base url).
-  ASSERT_EQ(worker_pool.io_worker_client->restore_request_object_counts.size(), 1u);
-  ASSERT_EQ(worker_pool.io_worker_client->restore_request_object_counts[0], N);
-  ASSERT_EQ(worker_pool.io_worker_client->restore_request_urls[0].size(),
-            static_cast<size_t>(N));
-
-  worker_pool.io_worker_client->ReplyRestoreObjects(/*bytes_restored=*/N * 256);
-  // Per-object callbacks each fire once.
-  ASSERT_EQ(num_times_fired, N);
-}
-
-// Two different base URLs in the same flush window produce two RPCs.
-// Verifies the by-base-url grouping splits unrelated files but the
-// outer post-based coalescing still saves wakeups (1 flush, multiple
-// PopRestoreWorker calls).
-TEST_F(LocalObjectManagerTest, TestRestoreBatch_SplitByBaseUrl) {
-  std::vector<ObjectID> ids_a;
-  std::vector<ObjectID> ids_b;
-  for (int i = 0; i < 3; ++i) ids_a.push_back(ObjectID::FromRandom());
-  for (int i = 0; i < 2; ++i) ids_b.push_back(ObjectID::FromRandom());
-
-  int num_times_fired = 0;
-  // Two distinct base URLs → two PopRestoreWorker calls expected.
-  EXPECT_CALL(worker_pool, PushRestoreWorker(_)).Times(2);
-
-  for (size_t i = 0; i < ids_a.size(); ++i) {
-    manager.AsyncRestoreSpilledObject(
-        ids_a[i], 128, BuildURL("file_A", static_cast<int>(i * 128)),
-        [&](const Status &s) { ASSERT_TRUE(s.ok()); num_times_fired++; });
-  }
-  for (size_t i = 0; i < ids_b.size(); ++i) {
-    manager.AsyncRestoreSpilledObject(
-        ids_b[i], 128, BuildURL("file_B", static_cast<int>(i * 128)),
-        [&](const Status &s) { ASSERT_TRUE(s.ok()); num_times_fired++; });
-  }
-
-  io_service_.run_one();   // flushes, queues two PopRestoreWorker callbacks
-  // Need to push twice — one for each file-group RPC.
-  worker_pool.RestoreWorkerPushed();
-  worker_pool.RestoreWorkerPushed();
-
-  // Two RPCs — sizes (3, 2) in some order (unordered_map iteration).
-  ASSERT_EQ(worker_pool.io_worker_client->restore_request_object_counts.size(), 2u);
-  std::vector<int> sizes = worker_pool.io_worker_client->restore_request_object_counts;
-  std::sort(sizes.begin(), sizes.end());
-  ASSERT_EQ(sizes[0], 2);
-  ASSERT_EQ(sizes[1], 3);
-
-  // Drain both RPC replies.
-  worker_pool.io_worker_client->ReplyRestoreObjects(/*bytes_restored=*/3 * 128);
-  worker_pool.io_worker_client->ReplyRestoreObjects(/*bytes_restored=*/2 * 128);
-  ASSERT_EQ(num_times_fired, static_cast<int>(ids_a.size() + ids_b.size()));
 }
 
 TEST_F(LocalObjectManagerTest, TestExplicitSpill) {
@@ -821,7 +680,7 @@ TEST_F(LocalObjectManagerTest, TestTryToSpillObjectsZero) {
   manager.PinObjectsAndWaitForFree(object_ids, std::move(objects), owner_address);
   // Make sure providing 0 bytes as min_spilling_size_ will spill one object.
   manager.min_spilling_size_ = 0;
-  ASSERT_TRUE(manager.TryToSpillObjects(SpillTrigger::kThresholdMonitor));
+  ASSERT_TRUE(manager.TryToSpillObjects());
   ASSERT_TRUE(worker_pool.FlushPopSpillWorkerCallbacks());
   EXPECT_CALL(worker_pool, PushSpillWorker(_));
   const std::string url = BuildURL("url" + std::to_string(object_ids.size()));
@@ -856,7 +715,7 @@ TEST_F(LocalObjectManagerTest, TestSpillUptoMaxFuseCount) {
   }
   manager.PinObjectsAndWaitForFree(object_ids, std::move(objects), owner_address);
   manager.min_spilling_size_ = total_size;
-  ASSERT_TRUE(manager.TryToSpillObjects(SpillTrigger::kThresholdMonitor));
+  ASSERT_TRUE(manager.TryToSpillObjects());
   ASSERT_TRUE(worker_pool.FlushPopSpillWorkerCallbacks());
   for (const auto &id : object_ids) {
     ASSERT_EQ((*unpins)[id], 0);
@@ -902,14 +761,14 @@ TEST_F(LocalObjectManagerTest, TestSpillObjectNotEvictable) {
 
   manager.PinObjectsAndWaitForFree(object_ids, std::move(objects), owner_address);
   manager.min_spilling_size_ = 1000;
-  ASSERT_FALSE(manager.TryToSpillObjects(SpillTrigger::kThresholdMonitor));
+  ASSERT_FALSE(manager.TryToSpillObjects());
   for (const auto &id : object_ids) {
     ASSERT_EQ((*unpins)[id], 0);
   }
 
   // Now object is evictable. Spill should succeed.
   unevictable_objects_.erase(object_id);
-  ASSERT_TRUE(manager.TryToSpillObjects(SpillTrigger::kThresholdMonitor));
+  ASSERT_TRUE(manager.TryToSpillObjects());
 
   AssertIOWorkersDoSpill(/*num_objects*/ 1, /*num_batches*/ 1);
   ASSERT_EQ(GetCurrentSpilledCount(), 1);
@@ -937,11 +796,11 @@ TEST_F(LocalObjectManagerTest, TestSpillUptoMaxThroughput) {
   manager.PinObjectsAndWaitForFree(object_ids, std::move(objects), owner_address);
 
   // This will spill until 2 workers are occupied.
-  manager.SpillObjectUptoMaxThroughput(SpillTrigger::kThresholdMonitor);
+  manager.SpillObjectUptoMaxThroughput();
   ASSERT_TRUE(worker_pool.FlushPopSpillWorkerCallbacks());
   ASSERT_TRUE(manager.IsSpillingInProgress());
   // Spilling is still going on, meaning we can make the pace. So it should return true.
-  manager.SpillObjectUptoMaxThroughput(SpillTrigger::kThresholdMonitor);
+  manager.SpillObjectUptoMaxThroughput();
   ASSERT_TRUE(worker_pool.FlushPopSpillWorkerCallbacks());
   ASSERT_TRUE(manager.IsSpillingInProgress());
   // No object ids are spilled yet.
@@ -967,10 +826,10 @@ TEST_F(LocalObjectManagerTest, TestSpillUptoMaxThroughput) {
   // Now, there's only one object that is current spilling.
   // SpillObjectUptoMaxThroughput will spill one more object (since one worker is
   // available).
-  manager.SpillObjectUptoMaxThroughput(SpillTrigger::kThresholdMonitor);
+  manager.SpillObjectUptoMaxThroughput();
   ASSERT_TRUE(worker_pool.FlushPopSpillWorkerCallbacks());
   ASSERT_TRUE(manager.IsSpillingInProgress());
-  manager.SpillObjectUptoMaxThroughput(SpillTrigger::kThresholdMonitor);
+  manager.SpillObjectUptoMaxThroughput();
   ASSERT_TRUE(manager.IsSpillingInProgress());
   ASSERT_FALSE(worker_pool.FlushPopSpillWorkerCallbacks());
 
@@ -993,7 +852,7 @@ TEST_F(LocalObjectManagerTest, TestSpillUptoMaxThroughput) {
   }
 
   // We cannot spill anymore as there is no more pinned object.
-  manager.SpillObjectUptoMaxThroughput(SpillTrigger::kThresholdMonitor);
+  manager.SpillObjectUptoMaxThroughput();
   ASSERT_FALSE(worker_pool.FlushPopSpillWorkerCallbacks());
   ASSERT_FALSE(manager.IsSpillingInProgress());
 }
@@ -1632,14 +1491,14 @@ TEST_F(LocalObjectManagerFusedTest, TestMinSpillingSize) {
     objects.push_back(std::move(object));
   }
   manager.PinObjectsAndWaitForFree(object_ids, std::move(objects), owner_address);
-  manager.SpillObjectUptoMaxThroughput(SpillTrigger::kThresholdMonitor);
+  manager.SpillObjectUptoMaxThroughput();
   // Only 2 of the objects should be spilled.
   ASSERT_TRUE(worker_pool.FlushPopSpillWorkerCallbacks());
   ASSERT_FALSE(worker_pool.FlushPopSpillWorkerCallbacks());
   for (const auto &id : object_ids) {
     ASSERT_EQ((*unpins)[id], 0);
   }
-  manager.SpillObjectUptoMaxThroughput(SpillTrigger::kThresholdMonitor);
+  manager.SpillObjectUptoMaxThroughput();
   ASSERT_FALSE(worker_pool.FlushPopSpillWorkerCallbacks());
 
   // Check that half the objects get spilled and the URLs get added to the
@@ -1670,7 +1529,7 @@ TEST_F(LocalObjectManagerFusedTest, TestMinSpillingSize) {
 
   // We will spill the last object, even though we're under the min spilling
   // size, because they are the only spillable objects.
-  manager.SpillObjectUptoMaxThroughput(SpillTrigger::kThresholdMonitor);
+  manager.SpillObjectUptoMaxThroughput();
   ASSERT_TRUE(worker_pool.FlushPopSpillWorkerCallbacks());
   ASSERT_FALSE(worker_pool.FlushPopSpillWorkerCallbacks());
 }
@@ -1694,7 +1553,7 @@ TEST_F(LocalObjectManagerFusedTest, TestMinSpillingSizeMaxFusionCount) {
     objects.push_back(std::move(object));
   }
   manager.PinObjectsAndWaitForFree(object_ids, std::move(objects), owner_address);
-  manager.SpillObjectUptoMaxThroughput(SpillTrigger::kThresholdMonitor);
+  manager.SpillObjectUptoMaxThroughput();
   // First two spill batches succeed because they have at least 15 objects.
   ASSERT_TRUE(worker_pool.FlushPopSpillWorkerCallbacks());
   ASSERT_TRUE(worker_pool.FlushPopSpillWorkerCallbacks());
@@ -1718,7 +1577,7 @@ TEST_F(LocalObjectManagerFusedTest, TestMinSpillingSizeMaxFusionCount) {
 
   // We will spill the last objects even though we're under the min spilling
   // size because they are the only spillable objects.
-  manager.SpillObjectUptoMaxThroughput(SpillTrigger::kThresholdMonitor);
+  manager.SpillObjectUptoMaxThroughput();
   ASSERT_TRUE(worker_pool.FlushPopSpillWorkerCallbacks());
   ASSERT_FALSE(worker_pool.FlushPopSpillWorkerCallbacks());
 
@@ -1763,7 +1622,7 @@ TEST_F(LocalObjectManagerMaxFileSizeFusedTest, TestMaxSpillingFileSizeMaxFusionC
   // batches are spilled.
   size_t batch_idx = 0;
   while (batch_idx < expected_batches.size()) {
-    manager.SpillObjectUptoMaxThroughput(SpillTrigger::kThresholdMonitor);
+    manager.SpillObjectUptoMaxThroughput();
 
     // This round may enqueue 0/1/2 pop callbacks (depending on max_io_workers=2).
     while (worker_pool.FlushPopSpillWorkerCallbacks()) {
@@ -1820,7 +1679,7 @@ TEST_F(LocalObjectManagerMaxFileSizeFusedTest,
 
   manager.PinObjectsAndWaitForFree(object_ids, std::move(objects), owner_address);
 
-  manager.SpillObjectUptoMaxThroughput(SpillTrigger::kThresholdMonitor);
+  manager.SpillObjectUptoMaxThroughput();
   ASSERT_TRUE(worker_pool.FlushPopSpillWorkerCallbacks());
 
   ASSERT_EQ(worker_pool.io_worker_client->spill_request_object_counts.size(), 1);

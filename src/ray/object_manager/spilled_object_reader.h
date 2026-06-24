@@ -33,15 +33,6 @@ class SpilledObjectReader : public IObjectReader {
   static std::optional<SpilledObjectReader> CreateSpilledObjectReader(
       const std::string &object_url);
 
-  ~SpilledObjectReader();
-
-  // Move-only: holds an owned fd. const members are copy-initialized in the move
-  // ctor (same effect as the prior implicit move); fd_ is transferred.
-  SpilledObjectReader(SpilledObjectReader &&other) noexcept;
-  SpilledObjectReader(const SpilledObjectReader &) = delete;
-  SpilledObjectReader &operator=(const SpilledObjectReader &) = delete;
-  SpilledObjectReader &operator=(SpilledObjectReader &&) = delete;
-
   uint64_t GetDataSize() const override;
 
   uint64_t GetMetadataSize() const override;
@@ -56,17 +47,13 @@ class SpilledObjectReader : public IObjectReader {
                                std::string &output) const override;
 
  private:
-  // Trailing `fd` defaults to -1 so existing tests that construct via the
-  // private ctor (FRIEND_TEST) compile unchanged; production goes through
-  // CreateSpilledObjectReader which always supplies a real fd.
   SpilledObjectReader(std::string file_path,
                       uint64_t total_size,
                       uint64_t data_offset,
                       uint64_t data_size,
                       uint64_t metadata_offset,
                       uint64_t metadata_size,
-                      rpc::Address owner_address,
-                      int fd = -1);
+                      rpc::Address owner_address);
 
   /// Parse the object url in the form of {path}?offset={offset}&size={size}.
   /// Return false if parsing failed.
@@ -131,11 +118,6 @@ class SpilledObjectReader : public IObjectReader {
   const uint64_t metadata_offset_;
   const uint64_t metadata_size_;
   const rpc::Address owner_address_;
-  // Persistent read-only fd opened in CreateSpilledObjectReader; used by
-  // pread()-based ReadFromDataSection/ReadFromMetadataSection so each chunk
-  // read no longer pays an open()+close() syscall. -1 means "no fd"
-  // (test-only ctor path).
-  int fd_;
 };
 
 }  // namespace ray

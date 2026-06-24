@@ -7,7 +7,7 @@ import time
 import urllib
 import uuid
 from collections import namedtuple
-from typing import IO, Dict, List, Optional, Tuple, Union
+from typing import IO, List, Optional, Tuple, Union
 
 import ray
 from ray._private.ray_constants import DEFAULT_OBJECT_PREFIX
@@ -349,49 +349,28 @@ class FileSystemStorage(ExternalStorage):
     def restore_spilled_objects(
         self, object_refs: List[ObjectRef], url_with_offset_list: List[str]
     ):
-        # Group requests by spill-file base_url so each file gets opened at
-        # most once per RPC.  Spill files are fused (multiple objects per
-        # file) so a batched restore from the C++ side often sends many
-        # offsets that resolve to the same file; opening it once + reading
-        # offsets in ascending order lets the kernel readahead prefetch.
-        from collections import defaultdict
-
-        # (index_in_caller_lists, offset, size) tuples per base_url.
-        items_by_file: Dict[str, List[tuple]] = defaultdict(list)
-        for i, url_with_offset in enumerate(url_with_offset_list):
-            parsed = parse_url_with_offset(url_with_offset.decode())
-            items_by_file[parsed.base_url].append((i, parsed.offset, parsed.size))
-
         total = 0
-        for base_url, items in items_by_file.items():
-            # Sort by offset so the file is read in monotonically
-            # increasing order.  On HDD this is the difference between
-            # ~10 ms seeks and ~50 us seq reads; on SSD it still helps
-            # kernel readahead amortize the syscall cost.
-            items.sort(key=lambda t: t[1])
+        for i in range(len(object_refs)):
+            object_ref = object_refs[i]
+            url_with_offset = url_with_offset_list[i].decode()
+            # Retrieve the information needed.
+            parsed_result = parse_url_with_offset(url_with_offset)
+            base_url = parsed_result.base_url
+            offset = parsed_result.offset
+            # Read a part of the file and recover the object.
             with open(base_url, "rb") as f:
-                # POSIX_FADV_SEQUENTIAL on the fd tells the kernel to
-                # double the readahead window and aggressively drop the
-                # pages we've already read.  Best-effort; no-op on macOS
-                # / Windows.
-                try:
-                    os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_SEQUENTIAL)
-                except (AttributeError, OSError):
-                    pass
-                for i, offset, size in items:
-                    object_ref = object_refs[i]
-                    f.seek(offset)
-                    address_len = int.from_bytes(f.read(8), byteorder="little")
-                    metadata_len = int.from_bytes(f.read(8), byteorder="little")
-                    buf_len = int.from_bytes(f.read(8), byteorder="little")
-                    self._size_check(address_len, metadata_len, buf_len, size)
-                    total += buf_len
-                    owner_address = f.read(address_len)
-                    metadata = f.read(metadata_len)
-                    # read remaining data to our buffer
-                    self._put_object_to_store(
-                        metadata, buf_len, f, object_ref, owner_address
-                    )
+                f.seek(offset)
+                address_len = int.from_bytes(f.read(8), byteorder="little")
+                metadata_len = int.from_bytes(f.read(8), byteorder="little")
+                buf_len = int.from_bytes(f.read(8), byteorder="little")
+                self._size_check(address_len, metadata_len, buf_len, parsed_result.size)
+                total += buf_len
+                owner_address = f.read(address_len)
+                metadata = f.read(metadata_len)
+                # read remaining data to our buffer
+                self._put_object_to_store(
+                    metadata, buf_len, f, object_ref, owner_address
+                )
         return total
 
     def delete_spilled_objects(self, urls: List[str]):

@@ -15,11 +15,8 @@
 #include "ray/raylet/local_object_manager.h"
 
 #include <algorithm>
-#include <cstdlib>
-#include <filesystem>
 #include <memory>
 #include <string>
-#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -27,64 +24,10 @@
 #include "ray/asio/instrumented_io_context.h"
 #include "ray/common/filter_local_objects_util.h"
 #include "ray/stats/tag_defs.h"
-#include "spdlog/sinks/basic_file_sink.h"
-#include "spdlog/spdlog.h"
 
 namespace ray {
 
 namespace raylet {
-
-namespace {
-
-// Lazily-initialized dedicated logger for spill telemetry. We keep it in a
-// function-local static rather than a global so the storage is constructed
-// only on first reference (matches Ray's other singleton patterns) and so
-// tests that don't call InitSpillEventLogger silently get a no-op.
-std::shared_ptr<spdlog::logger> &MutableSpillEventLogger() {
-  static std::shared_ptr<spdlog::logger> logger;
-  return logger;
-}
-
-// Emit a structured event to the dedicated spill-events file. No-op when the
-// logger hasn't been initialized (unit tests, ad-hoc tools). One line per
-// call; format is `<unix_ns> key=val key=val ...` — no JSON envelope.
-template <typename... Args>
-void EmitSpillEvent(fmt::format_string<Args...> fmt, Args &&...args) {
-  auto &lg = MutableSpillEventLogger();
-  if (lg) {
-    lg->info(fmt, std::forward<Args>(args)...);
-  }
-}
-
-}  // namespace
-
-void InitSpillEventLogger(const std::string &fallback_log_dir) {
-  if (MutableSpillEventLogger()) {
-    return;
-  }
-
-  std::string path;
-  const char *env_path = std::getenv("RAY_SPILL_EVENTS_LOG_PATH");
-  if (env_path != nullptr && *env_path != '\0') {
-    path = env_path;
-  } else {
-    path = "/tmp/raylet_spill_events.out";
-  }
-
-  std::error_code mkdir_ec;
-  std::filesystem::path fs_path(path);
-  if (fs_path.has_parent_path()) {
-    std::filesystem::create_directories(fs_path.parent_path(), mkdir_ec);
-  }
-
-  RAY_LOG(INFO) << "Initializing spill event logger at " << path;
-
-  auto lg = spdlog::basic_logger_st("raylet_spill_events", path, /*truncate=*/false);
-  lg->set_pattern("%E.%f %v");
-  lg->set_level(spdlog::level::info);
-  lg->flush_on(spdlog::level::info);
-  MutableSpillEventLogger() = lg;
-}
 
 void LocalObjectManager::PinObjectsAndWaitForFree(
     const std::vector<ObjectID> &object_ids,
@@ -239,9 +182,7 @@ bool LocalObjectManager::ObjectPendingDeletion(const ObjectID &object_id) {
   return objects_pending_deletion_.find(object_id) != objects_pending_deletion_.end();
 }
 
-void LocalObjectManager::SpillObjectUptoMaxThroughput(SpillTrigger trigger) {
-  EmitSpillEvent("fn=SpillObjectUptoMaxThroughput trigger={}",
-                 SpillTriggerToString(trigger));
+void LocalObjectManager::SpillObjectUptoMaxThroughput() {
   if (RayConfig::instance().object_spilling_config().empty()) {
     return;
   }
@@ -249,7 +190,7 @@ void LocalObjectManager::SpillObjectUptoMaxThroughput(SpillTrigger trigger) {
   // Spill as fast as we can using all our spill workers.
   bool can_spill_more = true;
   while (can_spill_more) {
-    if (!TryToSpillObjects(trigger)) {
+    if (!TryToSpillObjects()) {
       break;
     }
     can_spill_more = num_active_workers_ < max_active_workers_;
@@ -258,11 +199,7 @@ void LocalObjectManager::SpillObjectUptoMaxThroughput(SpillTrigger trigger) {
 
 bool LocalObjectManager::IsSpillingInProgress() { return num_active_workers_ > 0; }
 
-bool LocalObjectManager::TryToSpillObjects(SpillTrigger trigger) {
-  EmitSpillEvent("fn=TryToSpillObjects trigger={} pinned={} pending={}",
-                 SpillTriggerToString(trigger),
-                 pinned_objects_.size(),
-                 objects_pending_spill_.size());
+bool LocalObjectManager::TryToSpillObjects() {
   if (RayConfig::instance().object_spilling_config().empty()) {
     return false;
   }
@@ -312,10 +249,7 @@ bool LocalObjectManager::TryToSpillObjects(SpillTrigger trigger) {
   auto start_time = clock_.NowUnixNanos();
   SpillObjectsInternal(
       objects_to_spill,
-      [this, bytes_to_spill, objects_to_spill, start_time, trigger](const Status &status) {
-        // NOTE: this is the throughput/log callback; the per-object metric emission
-        // happens inside SpillObjectsInternal → OnObjectSpilled which already has
-        // access to the trigger.
+      [this, bytes_to_spill, objects_to_spill, start_time](const Status &status) {
         if (!status.ok()) {
           RAY_LOG(DEBUG) << "Failed to spill objects: " << status.ToString();
         } else {
@@ -351,31 +285,19 @@ bool LocalObjectManager::TryToSpillObjects(SpillTrigger trigger) {
             }
           }
           last_spill_finish_ns_ = now;
-
-
-          EmitSpillEvent("fn=SpillObjectsInternal spill bytes={}, duration={}, objCnt={}, type={}",
-                         bytes_to_spill,
-                         (now - start_time) / 1e6,
-                         objects_to_spill.size(),
-                         SpillTriggerToString(trigger));
         }
-      },
-      trigger);
+      });
   return true;
 }
 
 void LocalObjectManager::SpillObjects(const std::vector<ObjectID> &object_ids,
                                       std::function<void(const ray::Status &)> callback) {
-  // The public `SpillObjects(ids, cb)` entry point is reserved for explicit
-  // callers (see SpillTrigger::kExplicitApi). Currently only test code reaches
-  // this path; future proactive-spilling APIs will route through here too.
-  SpillObjectsInternal(object_ids, std::move(callback), SpillTrigger::kExplicitApi);
+  SpillObjectsInternal(object_ids, std::move(callback));
 }
 
 void LocalObjectManager::SpillObjectsInternal(
     const std::vector<ObjectID> &object_ids,
-    std::function<void(const ray::Status &)> callback,
-    SpillTrigger trigger) {
+    std::function<void(const ray::Status &)> callback) {
   std::vector<ObjectID> objects_to_spill;
   // Filter for the objects that can be spilled.
   // TODO(dayshah): The logic in this loop should be moved to TryToSpillObjects. We can
@@ -408,14 +330,6 @@ void LocalObjectManager::SpillObjectsInternal(
 
       pinned_objects_size_ -= object_size;
       pinned_objects_.erase(it);
-
-      // Stamp the trigger on LocalObjectInfo so OnObjectSpilled (size metric)
-      // and ProcessSpilledObjectsDeleteQueue (duration metric) both see a
-      // consistent source label.
-      auto info_it = local_objects_.find(id);
-      if (info_it != local_objects_.end()) {
-        info_it->second.last_spill_trigger_ = trigger;
-      }
     }
   }
 
@@ -426,10 +340,7 @@ void LocalObjectManager::SpillObjectsInternal(
     return;
   }
   num_active_workers_ += 1;
-  io_worker_pool_.PopSpillWorker([this,
-                                  objects_to_spill,
-                                  callback = std::move(callback),
-                                  trigger](
+  io_worker_pool_.PopSpillWorker([this, objects_to_spill, callback = std::move(callback)](
                                      std::shared_ptr<WorkerInterface> io_worker) mutable {
     rpc::SpillObjectsRequest request;
     std::vector<ObjectID> requested_objects_to_spill;
@@ -462,8 +373,7 @@ void LocalObjectManager::SpillObjectsInternal(
         [this,
          requested_objects_to_spill = std::move(requested_objects_to_spill),
          callback = std::move(callback),
-         io_worker,
-         trigger](const ray::Status &status, const rpc::SpillObjectsReply &r) {
+         io_worker](const ray::Status &status, const rpc::SpillObjectsReply &r) {
           num_active_workers_ -= 1;
           io_worker_pool_.PushSpillWorker(io_worker);
           size_t num_objects_spilled = status.ok() ? r.spilled_objects_url_size() : 0;
@@ -486,7 +396,7 @@ void LocalObjectManager::SpillObjectsInternal(
             RAY_LOG(ERROR) << "Failed to send object spilling request: "
                            << status.ToString();
           } else {
-            OnObjectSpilled(requested_objects_to_spill, r, trigger);
+            OnObjectSpilled(requested_objects_to_spill, r);
           }
           if (callback) {
             callback(status);
@@ -503,14 +413,7 @@ void LocalObjectManager::SpillObjectsInternal(
 }
 
 void LocalObjectManager::OnObjectSpilled(const std::vector<ObjectID> &object_ids,
-                                         const rpc::SpillObjectsReply &worker_reply,
-                                         SpillTrigger trigger) {
-  const int64_t completion_ns = absl::GetCurrentTimeNanos();
-  const char *trigger_label = SpillTriggerToString(trigger);
-  EmitSpillEvent("fn=OnObjectSpilled n_ids={} reply_urls={} trigger={}",
-                 object_ids.size(),
-                 worker_reply.spilled_objects_url_size(),
-                 trigger_label);
+                                         const rpc::SpillObjectsReply &worker_reply) {
   for (size_t i = 0; i < static_cast<size_t>(worker_reply.spilled_objects_url_size());
        ++i) {
     const ObjectID &object_id = object_ids[i];
@@ -541,28 +444,8 @@ void LocalObjectManager::OnObjectSpilled(const std::vector<ObjectID> &object_ids
     spilled_bytes_current_ += object_size;
     spilled_objects_total_++;
 
-    // Stamp spill completion and emit the per-object spill event. The
-    // creator_type comes from LocalObjectInfo (Phase 1: always kUnknown until
-    // CoreWorker plumbs the real value). Lookups can miss if the object was
-    // already freed during the spill — fall back to kUnknown.
-    // todo: how about secondary copy?
-    auto freed_it = local_objects_.find(object_id);
-    // ObjectCreatorType creator_type = ObjectCreatorType::kUnknown;
-    if (freed_it != local_objects_.end()) {
-      freed_it->second.spill_completion_ns_ = completion_ns;
-      freed_it->second.last_spill_trigger_ = trigger;
-      // creator_type = freed_it->second.creator_type_;
-    }
-    // Aggregated post-run by scanning `raylet_spill_events.out` across nodes —
-    // the OTel-Histogram→Prometheus path was unreliable, this file is the
-    // authoritative source for spill analytics.
-    // EmitSpillEvent("phase=spilled object_id={} size={} trigger={} creator={}",
-    //                object_id.Hex(),
-    //                object_size,
-    //                trigger_label,
-    //                ObjectCreatorTypeToString(creator_type));
-
     // Asynchronously Update the spilled URL.
+    auto freed_it = local_objects_.find(object_id);
     if (freed_it == local_objects_.end() || freed_it->second.is_freed_) {
       RAY_LOG(DEBUG) << "Spilled object already freed, skipping send of spilled URL to "
                         "object directory for object "
@@ -594,18 +477,6 @@ std::string LocalObjectManager::GetLocalSpilledObjectURL(const ObjectID &object_
   }
 }
 
-namespace {
-
-/// Strip ``?offset=...&size=...`` query-string from a spilled-object URL
-/// so two URLs that point to different offsets in the **same backing
-/// file** group together for batch IO.
-std::string ParseBaseSpillUrl(const std::string &url) {
-  const auto pos = url.find('?');
-  return (pos == std::string::npos) ? url : url.substr(0, pos);
-}
-
-}  // namespace
-
 void LocalObjectManager::AsyncRestoreSpilledObject(
     const ObjectID &object_id,
     int64_t object_size,
@@ -619,82 +490,31 @@ void LocalObjectManager::AsyncRestoreSpilledObject(
   RAY_CHECK(objects_pending_restore_.emplace(object_id).second)
       << "Object dedupe wasn't done properly. Please report if you see this issue.";
   num_bytes_pending_restore_ += object_size;
-
-  // Append to the per-LOM batch and schedule a single flush task for the
-  // end of the current event-loop iteration.  Multiple AsyncRestoreSpilled
-  // Object calls inside the same callback batch (e.g. a Subscribe-reply
-  // burst, a Tick iteration, or a Pull bundle activation) all coalesce
-  // into one flush — see ``FlushPendingRestoreBatch`` for the grouping.
-  pending_restore_batch_.push_back(PendingRestoreRequest{
-      object_id, object_size, object_url, std::move(callback)});
-  if (!batch_flush_scheduled_) {
-    batch_flush_scheduled_ = true;
-    io_service_.post([this] { FlushPendingRestoreBatch(); },
-                     "LocalObjectManager.FlushPendingRestoreBatch");
-  }
-}
-
-void LocalObjectManager::FlushPendingRestoreBatch() {
-  batch_flush_scheduled_ = false;
-  if (pending_restore_batch_.empty()) {
-    return;
-  }
-
-  // Group by spill-file base URL so multiple offsets in the same file
-  // travel in one RPC and get read sequentially by the IO worker.
-  absl::flat_hash_map<std::string, std::vector<PendingRestoreRequest>> by_file;
-  for (auto &req : pending_restore_batch_) {
-    auto base = ParseBaseSpillUrl(req.object_url);
-    by_file[std::move(base)].push_back(std::move(req));
-  }
-  pending_restore_batch_.clear();
-
-  for (auto &kv : by_file) {
-    SendBatchRestoreRPC(std::move(kv.second));
-  }
-}
-
-void LocalObjectManager::SendBatchRestoreRPC(
-    std::vector<PendingRestoreRequest> group) {
-  RAY_CHECK(!group.empty());
-  io_worker_pool_.PopRestoreWorker(
-      [this, group = std::move(group)](
-          std::shared_ptr<WorkerInterface> io_worker) mutable {
-    const auto start_time = clock_.NowUnixNanos();
-    RAY_LOG(DEBUG) << "Sending batched restore spilled object request, n_objects="
-                   << group.size();
+  io_worker_pool_.PopRestoreWorker([this, object_id, object_size, object_url, callback](
+                                       std::shared_ptr<WorkerInterface> io_worker) {
+    auto start_time = clock_.NowUnixNanos();
+    RAY_LOG(DEBUG) << "Sending restore spilled object request";
     rpc::RestoreSpilledObjectsRequest request;
-    for (const auto &req : group) {
-      request.add_spilled_objects_url(req.object_url);
-      request.add_object_ids_to_restore(req.object_id.Binary());
-    }
+    request.add_spilled_objects_url(object_url);
+    request.add_object_ids_to_restore(object_id.Binary());
     io_worker->rpc_client()->RestoreSpilledObjects(
         request,
-        [this, start_time, group = std::move(group), io_worker](
-            const ray::Status &status,
-            const rpc::RestoreSpilledObjectsReply &reply) mutable {
+        [this, start_time, object_id, object_size, callback, io_worker](
+            const ray::Status &status, const rpc::RestoreSpilledObjectsReply &r) {
           io_worker_pool_.PushRestoreWorker(io_worker);
-          // Update per-object accounting + fire user callbacks.  Each
-          // object in the batch shares the batch-level status — IO
-          // worker either restored all of them or none.
-          for (auto &req : group) {
-            num_bytes_pending_restore_ -= req.object_size;
-            objects_pending_restore_.erase(req.object_id);
-          }
+          num_bytes_pending_restore_ -= object_size;
+          objects_pending_restore_.erase(object_id);
           if (!status.ok()) {
             RAY_LOG(ERROR) << "Failed to send restore spilled object request: "
                            << status.ToString();
           } else {
-            const auto now = clock_.NowUnixNanos();
-            const auto restored_bytes = reply.bytes_restored_total();
+            auto now = clock_.NowUnixNanos();
+            auto restored_bytes = r.bytes_restored_total();
             RAY_LOG(DEBUG) << "Restored " << restored_bytes << " in "
-                           << (now - start_time) / 1e6 << "ms. n_objects="
-                           << group.size();
+                           << (now - start_time) / 1e6 << "ms. Object id:" << object_id;
             restored_bytes_total_ += restored_bytes;
-            restored_objects_total_ += group.size();
-            // Concurrency-adjusted throughput timing identical to the
-            // pre-batch behaviour, just counted once per batch instead of
-            // once per object.
+            restored_objects_total_ += 1;
+            // Adjust throughput timing to account for concurrent restore operations.
             restore_time_total_s_ +=
                 (now - std::max(start_time, last_restore_finish_ns_)) / 1e9;
             if (now - last_restore_log_ns_ > 1e9) {
@@ -709,23 +529,14 @@ void LocalObjectManager::SendBatchRestoreRPC(
             }
             last_restore_finish_ns_ = now;
           }
-          // Fire per-object callbacks last so any caller follow-up runs
-          // after our internal bookkeeping is settled.
-          for (auto &req : group) {
-            if (req.callback) {
-              req.callback(status);
-            }
+          if (callback) {
+            callback(status);
           }
         });
   });
 }
 
 void LocalObjectManager::ProcessSpilledObjectsDeleteQueue(uint32_t max_batch_size) {
-  if (!spilled_object_pending_delete_.empty()) {
-    EmitSpillEvent("fn=ProcessSpilledObjectsDeleteQueue queue_size={} max_batch={}",
-                   spilled_object_pending_delete_.size(),
-                   max_batch_size);
-  }
   std::vector<std::string> object_urls_to_delete;
   // Process upto batch size of objects to delete.
   while (!spilled_object_pending_delete_.empty() &&
@@ -767,22 +578,7 @@ void LocalObjectManager::ProcessSpilledObjectsDeleteQueue(uint32_t max_batch_siz
       // Update current spilled objects metrics
       RAY_CHECK(local_objects_.contains(object_id))
           << "local objects should contain the spilled object: " << object_id;
-      const auto &info = local_objects_.at(object_id);
-      spilled_bytes_current_ -= info.object_size_;
-      // Emit the spill→delete duration. spill_completion_ns_ is set by
-      // OnObjectSpilled; if zero, the object never actually completed a spill
-      // (we shouldn't be in this branch, but guard anyway).
-      if (info.spill_completion_ns_ > 0) {
-        const double duration_ms =
-            (absl::GetCurrentTimeNanos() - info.spill_completion_ns_) / 1e6;
-        EmitSpillEvent(
-            "phase=deleted object_id={} duration_ms={} size={} trigger={} creator={}",
-            object_id.Hex(),
-            duration_ms,
-            info.object_size_,
-            SpillTriggerToString(info.last_spill_trigger_),
-            ObjectCreatorTypeToString(info.creator_type_));
-      }
+      spilled_bytes_current_ -= local_objects_.at(object_id).object_size_;
     } else {
       // If the object was not spilled, it gets pinned again. Unpin here to
       // prevent a memory leak.
@@ -848,7 +644,6 @@ void LocalObjectManager::FillObjectStoreStats(rpc::GetNodeStatsReply *reply) con
 void LocalObjectManager::RecordMetrics() const {
   /// Record Metrics.
   if (spilled_bytes_total_ != 0 && spill_time_total_s_ != 0) {
-
     spill_manager_metrics_.spill_manager_throughput_mb_gauge.Record(
         spilled_bytes_total_ / 1024 / 1024 / spill_time_total_s_, {{"Type", "Spilled"}});
   }
@@ -885,51 +680,6 @@ void LocalObjectManager::RecordMetrics() const {
 
   spill_manager_metrics_.spill_manager_request_total_gauge.Record(
       num_failed_deletion_requests_, {{"Type", "FailedDeletion"}});
-
-  // Also write a flat key=value snapshot of the same numbers into the
-  // dedicated spill events log so Python tooling has an independent
-  // data source to cross-check against Prometheus.
-  LogSpillManagerSummary();
-}
-
-void LocalObjectManager::LogSpillManagerSummary() const {
-  // Pre-compute the derived throughput fields the same way RecordMetrics
-  // does so consumers don't have to re-derive them from totals + time.
-  double spill_throughput_mb = 0.0;
-  if (spilled_bytes_total_ != 0 && spill_time_total_s_ != 0) {
-    spill_throughput_mb = static_cast<double>(spilled_bytes_total_) / 1024.0 /
-                          1024.0 / spill_time_total_s_;
-  }
-  double restore_throughput_mb = 0.0;
-  if (restored_bytes_total_ != 0 && restore_time_total_s_ != 0) {
-    restore_throughput_mb = static_cast<double>(restored_bytes_total_) / 1024.0 /
-                            1024.0 / restore_time_total_s_;
-  }
-  EmitSpillEvent(
-      "phase=spill_manager_summary source=raylet_cpp "
-      "spilled_bytes_total={} spilled_objects_total={} spill_time_total_s={} "
-      "spill_throughput_mb={} "
-      "restored_bytes_total={} restored_objects_total={} "
-      "restore_time_total_s={} restore_throughput_mb={} "
-      "pinned_size_bytes={} pinned_count={} "
-      "pending_spill_bytes={} pending_spill_count={} "
-      "pending_restore_bytes={} pending_restore_count={} "
-      "failed_deletions={}",
-      spilled_bytes_total_,
-      spilled_objects_total_,
-      spill_time_total_s_,
-      spill_throughput_mb,
-      restored_bytes_total_,
-      restored_objects_total_,
-      restore_time_total_s_,
-      restore_throughput_mb,
-      pinned_objects_size_,
-      pinned_objects_.size(),
-      num_bytes_pending_spill_,
-      objects_pending_spill_.size(),
-      num_bytes_pending_restore_,
-      objects_pending_restore_.size(),
-      num_failed_deletion_requests_.load());
 }
 
 int64_t LocalObjectManager::GetPrimaryBytes() const {

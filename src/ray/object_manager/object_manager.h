@@ -21,7 +21,10 @@
 #include <utility>
 #include <vector>
 
+#include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/synchronization/mutex.h"
+#include "absl/time/time.h"
 #include "ray/asio/instrumented_io_context.h"
 #include "ray/common/id.h"
 #include "ray/common/status.h"
@@ -521,6 +524,29 @@ class ObjectManager : public ObjectManagerInterface,
   size_t num_bytes_received_total_ = 0;
   size_t num_bytes_pushed_from_disk_ = 0;
   size_t num_bytes_pushed_from_plasma_ = 0;
+
+  /// Per-object timestamp of when the local raylet's PullManager fired the
+  /// Pull RPC for that object. Consumed (and erased) when the first chunk
+  /// of that object arrives in `HandlePush`, to emit `phase=object_first_byte`.
+  /// Overwritten on retry. Accessed from both `SendPullRequest` (main
+  /// service thread) and `HandlePush` (gRPC handler thread), so guarded
+  /// by `pull_sent_time_mu_`. The map is bounded by the number of in-flight
+  /// pulls without a first chunk yet, typically small.
+  absl::Mutex pull_sent_time_mu_;
+  absl::flat_hash_map<ObjectID, absl::Time> pull_sent_time_
+      ABSL_GUARDED_BY(pull_sent_time_mu_);
+  /// Cumulative count of Pull RPCs we have ever fired for each object_id
+  /// over this raylet's lifetime. Incremented in SendPullRequest, read by
+  /// HandlePush when emitting `object_first_byte` (carried as `attempt=N`).
+  /// `attempt > 1` ⇒ this object was Pull-ed at least twice — either an
+  /// in-session retry, or, more interestingly, an evicted-and-re-pulled
+  /// cycle (object once landed in our plasma, was later evicted, and is
+  /// now being fetched again). The aggregator distinguishes the two by
+  /// joining with the previous attempt's `object_first_byte` line. Grows
+  /// with the unique-object-id count over raylet lifetime; bounded in
+  /// practice by the number of distinct objects this node ever pulled.
+  absl::flat_hash_map<ObjectID, int64_t> pull_attempt_count_
+      ABSL_GUARDED_BY(pull_sent_time_mu_);
 
   /// Running total of received chunks.
   size_t num_chunks_received_total_ = 0;

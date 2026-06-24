@@ -142,10 +142,23 @@ def _summarize(per_node: List[Dict[str, Any]]) -> Dict[str, Any]:
     # ratio is recoverable.
     incomplete_by_task: Dict[str, int] = defaultdict(int)
 
+    # Terminal stats (one bundle_terminal per bundle at CancelPull). These
+    # are the only reliable signal for the population that never reaches
+    # bundle_complete + the deactivate/reactivate churn that bundle_active
+    # cannot see (first-activation only).
+    per_task_terminal_lifetime: Dict[str, List[float]] = defaultdict(list)
+    per_task_dx_count: Dict[str, List[int]] = defaultdict(list)
+    per_task_dx_total_ms: Dict[str, List[float]] = defaultdict(list)
+    # (task -> {"complete": int, "no_complete": int}) outcome counters.
+    per_task_outcome: Dict[str, Dict[str, int]] = defaultdict(
+        lambda: {"complete": 0, "no_complete": 0}
+    )
+
     for (_node_ip, _req_id), phases in per_bundle.items():
         locate = phases.get("bundle_locate")
         active = phases.get("bundle_active")
         complete = phases.get("bundle_complete")
+        terminal = phases.get("bundle_terminal")
 
         if locate is not None:
             task = locate.get("task", "-")
@@ -182,15 +195,35 @@ def _summarize(per_node: List[Dict[str, Any]]) -> Dict[str, Any]:
         elif locate is not None:
             incomplete_by_task[locate.get("task", "-")] += 1
 
+        if terminal is not None:
+            task = terminal.get("task", "-")
+            outcome = terminal.get("outcome", "no_complete")
+            per_task_outcome[task][outcome] = (
+                per_task_outcome[task].get(outcome, 0) + 1
+            )
+            try:
+                per_task_terminal_lifetime[task].append(
+                    float(terminal["lifetime_ms"])
+                )
+                per_task_dx_count[task].append(int(terminal["dx_count"]))
+                per_task_dx_total_ms[task].append(float(terminal["dx_total_ms"]))
+            except (KeyError, ValueError):
+                pass
+
     # Per-task summary block. Keep `task` keys stable so downstream dashboards
     # don't drift when task names change order.
     tasks = sorted(
         {task for (task, _warm) in per_task_locate}
         | set(per_task_active.keys())
         | set(per_task_complete_transfer.keys())
+        | set(per_task_outcome.keys())
     )
     per_task_summary = {}
     for task in tasks:
+        outcome = per_task_outcome.get(task, {})
+        complete_n = outcome.get("complete", 0)
+        no_complete_n = outcome.get("no_complete", 0)
+        total_terminal = complete_n + no_complete_n
         per_task_summary[task] = {
             "bundle_size": _summarize_distribution(
                 [float(x) for x in per_task_bundle_size.get(task, [])]
@@ -211,11 +244,110 @@ def _summarize(per_node: List[Dict[str, Any]]) -> Dict[str, Any]:
                 per_task_complete_total.get(task, [])
             ),
             "incomplete_bundles": incomplete_by_task.get(task, 0),
+            # Terminal / churn stats. completion_ratio uses the
+            # bundle_terminal population (only bundles that actually ended),
+            # so it's not skewed by bundles that were still in flight at
+            # scan time. The dx_total_ms distribution is the plasma-pressure
+            # signal — see PULL_EVENTS_LOG_FORMAT.md §6 gotcha #7.
+            "outcome_counts": {
+                "complete": complete_n,
+                "no_complete": no_complete_n,
+            },
+            "completion_ratio": (
+                complete_n / total_terminal if total_terminal else 0.0
+            ),
+            "bundle_terminal_lifetime_ms": _summarize_distribution(
+                per_task_terminal_lifetime.get(task, [])
+            ),
+            "bundle_terminal_dx_count": _summarize_distribution(
+                [float(x) for x in per_task_dx_count.get(task, [])]
+            ),
+            "bundle_terminal_dx_total_ms": _summarize_distribution(
+                per_task_dx_total_ms.get(task, [])
+            ),
         }
+
+    # Receiver-side per-object first-byte + re-pull aggregation. Each
+    # object_first_byte line carries `attempt=N`: N=1 is the first ever
+    # Pull for this object on this node; N>1 means we Pull-ed it again
+    # (either in-session retry or eviction + re-pull cycle). For OOC
+    # shuffle, the re-pull byte ratio quantifies how much of the
+    # cross-node fetch traffic was wasted re-fetching evicted objects.
+    first_byte_count = 0
+    first_byte_ms_first_attempt: List[float] = []
+    first_byte_ms_repull: List[float] = []
+    repull_bytes = 0
+    first_attempt_bytes = 0
+    plasma_create_wait_ms: List[float] = []
+    plasma_create_wait_fail_count = 0
+    for n in per_node:
+        for ev in n["events"]:
+            phase = ev.get("phase")
+            if phase == "object_first_byte":
+                first_byte_count += 1
+                try:
+                    ms = float(ev["first_byte_ms"])
+                    b = int(ev["bytes"])
+                    attempt = int(ev.get("attempt", 1))
+                except (KeyError, ValueError):
+                    continue
+                if attempt > 1:
+                    first_byte_ms_repull.append(ms)
+                    repull_bytes += b
+                else:
+                    first_byte_ms_first_attempt.append(ms)
+                    first_attempt_bytes += b
+            elif phase == "plasma_create_wait":
+                try:
+                    plasma_create_wait_ms.append(float(ev["wait_ms"]))
+                    if ev.get("ok") != "1":
+                        plasma_create_wait_fail_count += 1
+                except (KeyError, ValueError):
+                    pass
+
+    # Sender-side per-object push timing aggregation. These are completely
+    # independent from the per-bundle events above — `phase=object_pushed`
+    # is emitted by the SENDER node when it finishes serving an object to
+    # some requester. Splitting by `from_disk`:
+    #   from_disk=1: PushFromFilesystem (spill-file -> network), the
+    #                ONLY signal for cross-node spill IO (restored_* in
+    #                spill_events misses this entirely).
+    #   from_disk=0: PushLocalObject (plasma -> network).
+    push_disk_bytes = 0
+    push_disk_ms = 0.0
+    push_disk_ms_per_obj: List[float] = []
+    push_plasma_bytes = 0
+    push_plasma_ms = 0.0
+    push_plasma_ms_per_obj: List[float] = []
+    push_disk_count = 0
+    push_plasma_count = 0
+    for n in per_node:
+        for ev in n["events"]:
+            if ev.get("phase") != "object_pushed":
+                continue
+            try:
+                b = int(ev["bytes"])
+                ms = float(ev["push_wall_ms"])
+            except (KeyError, ValueError):
+                continue
+            if ev.get("from_disk") == "1":
+                push_disk_bytes += b
+                push_disk_ms += ms
+                push_disk_ms_per_obj.append(ms)
+                push_disk_count += 1
+            else:
+                push_plasma_bytes += b
+                push_plasma_ms += ms
+                push_plasma_ms_per_obj.append(ms)
+                push_plasma_count += 1
 
     total_bundles = len(per_bundle)
     warm_total = warm_counter["warm"]
     cold_total = warm_counter["cold"]
+    complete_total = sum(o.get("complete", 0) for o in per_task_outcome.values())
+    no_complete_total = sum(
+        o.get("no_complete", 0) for o in per_task_outcome.values()
+    )
 
     return {
         "total_events": total_events,
@@ -225,9 +357,85 @@ def _summarize(per_node: List[Dict[str, Any]]) -> Dict[str, Any]:
         "warm_ratio": warm_total / max(1, warm_total + cold_total),
         "phase_counts": dict(phase_counts),
         "incomplete_bundles_total": sum(incomplete_by_task.values()),
+        # Cluster-wide outcome counters from bundle_terminal. Use these
+        # rather than `incomplete_bundles_total` (which is computed from
+        # missing bundle_complete and can include in-flight bundles).
+        "bundle_terminal_total": complete_total + no_complete_total,
+        "outcome_complete": complete_total,
+        "outcome_no_complete": no_complete_total,
+        "completion_ratio": (
+            complete_total / (complete_total + no_complete_total)
+            if (complete_total + no_complete_total)
+            else 0.0
+        ),
         "num_nodes_with_events": sum(1 for n in per_node if n["num_events"] > 0),
         "num_nodes_scanned": len(per_node),
         "per_task": per_task_summary,
+        # Cluster-wide sender-side push aggregation. The cross-node spill IO
+        # path (PushFromFilesystem) is invisible to spill_events.restored_*;
+        # the only way to see "how many bytes did this cluster read from
+        # spill files to serve other nodes" is push_disk_bytes here.
+        "object_pushed": {
+            "from_disk": {
+                "object_count": push_disk_count,
+                "bytes_total": push_disk_bytes,
+                "wall_ms_total": push_disk_ms,
+                "effective_mb_per_s": (
+                    (push_disk_bytes / 1e6) / (push_disk_ms / 1e3)
+                    if push_disk_ms > 0
+                    else 0.0
+                ),
+                "wall_ms_per_object": _summarize_distribution(
+                    push_disk_ms_per_obj
+                ),
+            },
+            "from_plasma": {
+                "object_count": push_plasma_count,
+                "bytes_total": push_plasma_bytes,
+                "wall_ms_total": push_plasma_ms,
+                "effective_mb_per_s": (
+                    (push_plasma_bytes / 1e6) / (push_plasma_ms / 1e3)
+                    if push_plasma_ms > 0
+                    else 0.0
+                ),
+                "wall_ms_per_object": _summarize_distribution(
+                    push_plasma_ms_per_obj
+                ),
+            },
+            "from_disk_byte_share": (
+                push_disk_bytes / (push_disk_bytes + push_plasma_bytes)
+                if (push_disk_bytes + push_plasma_bytes) > 0
+                else 0.0
+            ),
+        },
+        # Receiver-side first-byte + re-pull stats. `repull_byte_share`
+        # is the direct "wasted bytes from evict + re-pull" indicator;
+        # >0 means objects were Pull-ed more than once on this node,
+        # which for OOC shuffle typically means GET-path eviction
+        # pressure forced a re-fetch.
+        "object_first_byte": {
+            "event_count": first_byte_count,
+            "first_attempt": {
+                "byte_total": first_attempt_bytes,
+                "ms_distribution": _summarize_distribution(
+                    first_byte_ms_first_attempt
+                ),
+            },
+            "repull": {
+                "byte_total": repull_bytes,
+                "ms_distribution": _summarize_distribution(first_byte_ms_repull),
+            },
+            "repull_byte_share": (
+                repull_bytes / (repull_bytes + first_attempt_bytes)
+                if (repull_bytes + first_attempt_bytes) > 0
+                else 0.0
+            ),
+        },
+        "plasma_create_wait": {
+            "event_count": len(plasma_create_wait_ms),
+            "failed_count": plasma_create_wait_fail_count,
+            "wait_ms_distribution": _summarize_distribution(plasma_create_wait_ms),
+        },
     }
 
 

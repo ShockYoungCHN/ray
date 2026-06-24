@@ -1,4 +1,3 @@
-import os
 from typing import Optional
 
 import numpy as np
@@ -14,24 +13,6 @@ from ray.data.context import DataContext
 from ray.data.dataset import Dataset
 from ray.exceptions import RayTaskError
 from ray.tests.conftest import *  # noqa
-
-
-# When ``RAY_DATA_TEST_USE_V2_JOIN=1`` is set, every join test below runs
-# against the V2 hash-join physical plan (ShuffleMap+ShuffleReduce, stateless
-# tasks) instead of the V1 actor-pool join.  Defaulted via an autouse fixture
-# so the existing test bodies stay untouched and can validate both impls.
-_USE_V2_JOIN = os.environ.get("RAY_DATA_TEST_USE_V2_JOIN") == "1"
-
-
-@pytest.fixture(autouse=True)
-def _toggle_v2_join():
-    ctx = DataContext.get_current()
-    previous = getattr(ctx, "enable_v2_join", False)
-    ctx.enable_v2_join = _USE_V2_JOIN
-    try:
-        yield
-    finally:
-        ctx.enable_v2_join = previous
 
 
 @pytest.mark.parametrize(

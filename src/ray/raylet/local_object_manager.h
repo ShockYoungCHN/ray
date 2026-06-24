@@ -41,20 +41,6 @@ namespace raylet {
 /// The default number of retries when spilled object deletion failed.
 inline constexpr int64_t kDefaultSpilledObjectDeleteRetries = 3;
 
-/// Initialize a dedicated spdlog sink for spill telemetry. Writes one event
-/// per line to `<dir>/raylet_spill_events.out`.
-///
-/// Directory resolution (first match wins):
-///   1. $RAY_SPILL_EVENTS_DIR if set,
-///   2. /home/ray/default/raylet_spill_events if that dir exists (Anyscale
-///      workspaces — persistent, survives session restart),
-///   3. `fallback_log_dir` (typically the raylet's session log dir under /tmp).
-///
-/// Safe to call at most once per process; subsequent calls are no-ops. If
-/// never called (e.g. in unit tests), emission is dropped silently — see
-/// `EmitSpillEvent` in the .cc.
-void InitSpillEventLogger(const std::string &fallback_log_dir);
-
 /// This class implements memory management for primary objects, objects that
 /// have been freed, and objects that have been spilled.
 class LocalObjectManager : public LocalObjectManagerInterface {
@@ -146,11 +132,8 @@ class LocalObjectManager : public LocalObjectManagerInterface {
 
   /// Spill objects as much as possible as fast as possible up to the max throughput.
   ///
-  /// \param trigger Identifies which production trigger path initiated this
-  /// spill. Recorded as a Prometheus label on per-object spill metrics so the
-  /// three trigger paths can be told apart in monitoring/post-mortems.
   /// \return True if spilling is in progress.
-  void SpillObjectUptoMaxThroughput(SpillTrigger trigger) override;
+  void SpillObjectUptoMaxThroughput() override;
 
   /// TODO(dayshah): This function is only used for testing, we should remove and just
   /// keep SpillObjectsInternal.
@@ -212,42 +195,6 @@ class LocalObjectManager : public LocalObjectManagerInterface {
   /// Record object spilling stats to metrics.
   void RecordMetrics() const override;
 
-  /// Emit a single-line summary of the spill-manager state to the
-  /// dedicated spill events log file.  This gives Python tooling an
-  /// independent source of truth for cumulative spill counters
-  /// (Prometheus exposes the same numbers but goes through a separate
-  /// scrape path and label-flattening; comparing the two surfaces
-  /// scraper/labelling bugs).  Called from ``RecordMetrics`` so the
-  /// cadence is the same as Prometheus reporting.
-  void LogSpillManagerSummary() const;
-
- private:
-  /// A single deferred restore request held in the per-LOM batch queue
-  /// between the moment ``AsyncRestoreSpilledObject`` is called and the
-  /// moment ``FlushPendingRestoreBatch`` actually dispatches RPCs.
-  struct PendingRestoreRequest {
-    ObjectID object_id;
-    int64_t object_size;
-    std::string object_url;
-    std::function<void(const ray::Status &)> callback;
-  };
-
-  /// Flush the per-LOM pending restore batch by grouping requests by
-  /// their spill file's base URL and dispatching one ``RestoreSpilledObjects``
-  /// RPC per group.  Posted onto ``io_service_`` from
-  /// ``AsyncRestoreSpilledObject`` so multiple restore requests issued
-  /// inside the same event-loop callback batch get coalesced into a
-  /// single RPC per spill file.  Zero-timer; relies on Asio's "execute
-  /// posted tasks after current callback batch finishes" semantics.
-  void FlushPendingRestoreBatch();
-
-  /// Issue one ``RestoreSpilledObjects`` RPC carrying every entry in
-  /// ``group``.  ``group`` is moved into the RPC continuation so the
-  /// per-object callbacks remain alive until the IO worker replies.
-  void SendBatchRestoreRPC(std::vector<PendingRestoreRequest> group);
-
- public:
-
   /// Return the spilled object URL if the object is spilled locally,
   /// or the empty string otherwise.
   /// If the external storage is cloud, this will always return an empty string.
@@ -279,30 +226,15 @@ class LocalObjectManager : public LocalObjectManagerInterface {
   struct LocalObjectInfo {
     LocalObjectInfo(const rpc::Address &owner_address,
                     const ObjectID &generator_id,
-                    size_t object_size,
-                    ObjectCreatorType creator_type = ObjectCreatorType::kUnknown)
+                    size_t object_size)
         : owner_address_(owner_address),
           generator_id_(generator_id.IsNil() ? std::nullopt
                                              : std::optional<ObjectID>(generator_id)),
-          object_size_(object_size),
-          creator_type_(creator_type) {}
+          object_size_(object_size) {}
     rpc::Address owner_address_;
     bool is_freed_ = false;
     std::optional<ObjectID> generator_id_;
     size_t object_size_;
-    /// What kind of caller created this object (e.g. ray.put vs. task return).
-    /// Phase 1: always kUnknown; reserved for CoreWorker to populate later so
-    /// the spill metrics get real attribution without further raylet changes.
-    ObjectCreatorType creator_type_ = ObjectCreatorType::kUnknown;
-    /// Nanosecond timestamp at which spill completed for this object. Zero
-    /// until OnObjectSpilled fires. Used to emit the spill→delete duration
-    /// histogram when the object eventually exits via
-    /// ProcessSpilledObjectsDeleteQueue.
-    int64_t spill_completion_ns_ = 0;
-    /// Trigger path that produced the in-flight or completed spill. Captured
-    /// at SpillObjectsInternal entry and read by OnObjectSpilled and
-    /// ProcessSpilledObjectsDeleteQueue when emitting spill metrics.
-    SpillTrigger last_spill_trigger_ = SpillTrigger::kExplicitApi;
   };
 
   FRIEND_TEST(LocalObjectManagerTest, TestTryToSpillObjectsZero);
@@ -319,15 +251,12 @@ class LocalObjectManager : public LocalObjectManagerInterface {
   /// currently spilling objects time to finish.
   /// NOTE(sang): If 0 is given, this method spills a single object.
   ///
-  /// \param trigger Trigger path forwarded by SpillObjectUptoMaxThroughput so
-  /// per-object spill metrics can record the correct source label.
   /// \return True if it decides to spill more objects. False otherwise.
-  bool TryToSpillObjects(SpillTrigger trigger);
+  bool TryToSpillObjects();
 
   /// Internal helper method for spilling objects.
   void SpillObjectsInternal(const std::vector<ObjectID> &objects_ids,
-                            std::function<void(const ray::Status &)> callback,
-                            SpillTrigger trigger);
+                            std::function<void(const ray::Status &)> callback);
 
   /// Do operations that are needed after spilling objects such as
   /// 1. Unpin the pending spilling object.
@@ -335,8 +264,7 @@ class LocalObjectManager : public LocalObjectManagerInterface {
   /// 3. Update the spilled URL to the local directory if it doesn't
   ///    use the external storages like S3.
   void OnObjectSpilled(const std::vector<ObjectID> &object_ids,
-                       const rpc::SpillObjectsReply &worker_reply,
-                       SpillTrigger trigger);
+                       const rpc::SpillObjectsReply &worker_reply);
 
   /// Delete spilled objects stored in given urls.
   ///
@@ -393,19 +321,6 @@ class LocalObjectManager : public LocalObjectManagerInterface {
   /// The field is used to dedup the same restore request while restoration is in
   /// progress.
   absl::flat_hash_set<ObjectID> objects_pending_restore_;
-
-  /// Requests queued in the current event-loop iteration that are waiting
-  /// for ``FlushPendingRestoreBatch`` to run on the io_service post queue.
-  /// Reset to empty after each flush; size is bounded by how many
-  /// AsyncRestoreSpilledObject calls happen back-to-back inside a single
-  /// epoll wakeup (typically a Subscribe-reply burst or a Tick).
-  std::vector<PendingRestoreRequest> pending_restore_batch_;
-
-  /// True when a ``FlushPendingRestoreBatch`` task is already sitting on
-  /// the io_service post queue waiting to run.  Prevents re-scheduling the
-  /// flush task for every push when many requests arrive in one tick.
-  /// Reset back to false at the start of FlushPendingRestoreBatch.
-  bool batch_flush_scheduled_ = false;
 
   /// Objects that are out of scope in the application and that should be freed
   /// from plasma. The cache is flushed when it reaches the

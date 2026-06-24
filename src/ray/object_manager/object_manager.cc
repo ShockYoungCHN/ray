@@ -15,6 +15,7 @@
 #include "ray/object_manager/object_manager.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -24,6 +25,7 @@
 #include <vector>
 
 #include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "ray/asio/asio_util.h"
 #include "ray/common/filter_local_objects_util.h"
 #include "ray/common/protobuf_utils.h"
@@ -299,6 +301,25 @@ void ObjectManager::MarkObjectFailed(const ObjectID &object_id,
 void ObjectManager::SendPullRequest(const ObjectID &object_id, const NodeID &client_id) {
   auto rpc_client = GetRpcClient(client_id);
   if (rpc_client) {
+    // T0 for `phase=object_first_byte`: stamp the wall-clock here so that
+    // when the first chunk arrives in HandlePush we can compute send-to-
+    // first-byte latency. Overwrite on retry — only the most recent Pull
+    // is relevant. Map entry is erased on first chunk receive; if the pull
+    // is cancelled before any chunk, the entry leaks (bounded by in-flight
+    // count, negligible).
+    //
+    // Also increment the cumulative pull-attempt counter so the eventual
+    // `object_first_byte` line can carry `attempt=N`. `attempt > 1`
+    // signals "we sent Pull for this object more than once" — i.e. the
+    // object was either retried in-session or was evicted from local
+    // plasma after a previous pull cycle and is now being re-fetched.
+    // Counts over raylet lifetime, never reset, so the value is comparable
+    // across the whole run.
+    {
+      absl::MutexLock lock(&pull_sent_time_mu_);
+      pull_sent_time_[object_id] = absl::Now();
+      ++pull_attempt_count_[object_id];
+    }
     // Try pulling from the client.
     rpc_service_.post(
         [this, object_id, client_id, rpc_client]() {
@@ -504,8 +525,27 @@ void ObjectManager::PushObjectInternal(const ObjectID &object_id,
       << ", total data size: " << chunk_reader->GetObject().GetObjectSize();
 
   auto push_id = UniqueID::FromRandom();
+
+  // Sender-side push timing. Captured by-value into the chunk closures so
+  // each chunk's send callback can decrement the shared counter; the last
+  // chunk to complete emits `phase=object_pushed`. This is the *only*
+  // place we measure the wall time of cross-node spill-file reads
+  // (from_disk=1) — see PULL_EVENTS_LOG_FORMAT.md §3 for why this lives in
+  // pull_events rather than spill_events: PushObjectInternal is exclusively
+  // triggered by a remote Pull RPC (HandlePull or queued HandleObjectAdded
+  // path), so the byte volume here is by definition pull-driven traffic.
+  // Counter is heap-allocated + ref-counted so the value survives across
+  // the rpc_service_ -> SendObjectChunk -> on_complete bounce.
+  const auto push_start_time = absl::Now();
+  const auto chunks_remaining =
+      std::make_shared<std::atomic<int64_t>>(chunk_reader->GetNumChunks());
+  const auto object_size = chunk_reader->GetObject().GetObjectSize();
+  const std::string dest_node_hex = node_id.Hex();
+  const std::string object_id_hex = object_id.Hex();
+
   push_manager_->StartPush(
-      node_id, object_id, chunk_reader->GetNumChunks(), [=](int64_t chunk_id) {
+      node_id, object_id, chunk_reader->GetNumChunks(),
+      [=](int64_t chunk_id) {
         rpc_service_.post(
             [=]() {
               // Post to the multithreaded RPC event loop so that data is copied
@@ -521,6 +561,19 @@ void ObjectManager::PushObjectInternal(const ObjectID &object_id,
                     // PushManager is not thread-safe.
                     main_service_->post([this]() { push_manager_->OnChunkComplete(); },
                                         "ObjectManager.Push");
+                    // Last completed chunk emits the timing line. fetch_sub
+                    // returns the pre-decrement value, so == 1 means we
+                    // just drove the counter to 0.
+                    if (chunks_remaining->fetch_sub(1) == 1) {
+                      EmitPullEvent(
+                          "phase=object_pushed object_id={} bytes={} "
+                          "push_wall_ms={} from_disk={} dest_node={}",
+                          object_id_hex,
+                          object_size,
+                          absl::ToDoubleMilliseconds(absl::Now() - push_start_time),
+                          from_disk ? 1 : 0,
+                          dest_node_hex);
+                    }
                   },
                   chunk_reader,
                   from_disk);
@@ -597,6 +650,40 @@ void ObjectManager::HandlePush(rpc::PushRequest request,
   const rpc::Address &owner_address = request.owner_address();
   const std::string &data = request.data();
 
+  // T1 for `phase=object_first_byte`: the *first* chunk arrival for an
+  // object that we previously fired a Pull RPC for. Chunks may not arrive
+  // in order, so use the presence of a pull_sent_time_ entry as the "first"
+  // sentinel rather than chunk_index == 0. Erase the entry to ensure this
+  // event fires exactly once per pull cycle. Same-process pulls (no Pull
+  // RPC fired) won't have an entry and are silently skipped.
+  absl::Time first_byte_start;
+  int64_t pull_attempt = 0;
+  bool emit_first_byte = false;
+  {
+    absl::MutexLock lock(&pull_sent_time_mu_);
+    auto it = pull_sent_time_.find(object_id);
+    if (it != pull_sent_time_.end()) {
+      first_byte_start = it->second;
+      pull_sent_time_.erase(it);
+      // pull_attempt_count_ is incremented in SendPullRequest, so the
+      // current value is the attempt index for THIS pull cycle. Read it
+      // here (still under lock) before we lose the synchronization point.
+      auto cnt_it = pull_attempt_count_.find(object_id);
+      pull_attempt = (cnt_it != pull_attempt_count_.end()) ? cnt_it->second : 1;
+      emit_first_byte = true;
+    }
+  }
+  if (emit_first_byte) {
+    EmitPullEvent(
+        "phase=object_first_byte object_id={} bytes={} first_byte_ms={} "
+        "attempt={} from_node={}",
+        object_id.Hex(),
+        data_size,
+        absl::ToDoubleMilliseconds(absl::Now() - first_byte_start),
+        pull_attempt,
+        node_id.Hex());
+  }
+
   bool success = ReceiveObjectChunk(
       node_id, object_id, owner_address, data_size, metadata_size, chunk_index, data);
   num_chunks_received_total_++;
@@ -629,8 +716,25 @@ bool ObjectManager::ReceiveObjectChunk(const NodeID &node_id,
     // This object is no longer being actively pulled. Do not create the object.
     return false;
   }
+  // Time spent inside `buffer_pool_.CreateChunk` for chunk_index == 0 is
+  // the receiver-side plasma admission wait — includes any plasma eviction
+  // / spill we have to drive before there's room for this object's buffer.
+  // For OOC shuffle GET path (reduce ray.get), this is the dominant
+  // hidden component of `bundle_complete.transfer_ms` (GET bundles never
+  // get PullManager-level dx_memory churn, so the wait shows up here
+  // instead). We emit only on chunk_index == 0 since subsequent chunks
+  // hit the already-allocated buffer slot and are fast.
+  const absl::Time create_start_time = absl::Now();
   auto chunk_status = buffer_pool_.CreateChunk(
       object_id, owner_address, data_size, metadata_size, chunk_index);
+  if (chunk_index == 0) {
+    EmitPullEvent(
+        "phase=plasma_create_wait object_id={} bytes={} wait_ms={} ok={}",
+        object_id.Hex(),
+        data_size,
+        absl::ToDoubleMilliseconds(absl::Now() - create_start_time),
+        chunk_status.ok() ? 1 : 0);
+  }
   if (!pull_manager_->IsObjectActive(object_id)) {
     num_chunks_received_cancelled_++;
     // This object is no longer being actively pulled. Abort the object. We

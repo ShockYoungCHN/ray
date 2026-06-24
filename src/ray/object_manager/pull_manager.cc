@@ -33,27 +33,15 @@
 
 namespace ray {
 
-namespace {
-
-// Lazily-initialized dedicated logger for pull telemetry. Mirrors the spill
-// event logger pattern in local_object_manager.cc — function-local static so
-// tests that don't call InitPullEventLogger silently get a no-op.
+// Logger storage. The accessor + EmitPullEvent template are declared in
+// pull_manager.h so non-PullManager translation units (e.g. object_manager.cc
+// for `phase=object_pushed`) can emit directly into the same file.
 std::shared_ptr<spdlog::logger> &MutablePullEventLogger() {
   static std::shared_ptr<spdlog::logger> logger;
   return logger;
 }
 
-// Emit a structured event to the dedicated pull-events file. No-op when the
-// logger hasn't been initialized. One line per call; format is
-// `<unix_seconds>.<microseconds> key=val key=val ...` (set by the spdlog
-// pattern in InitPullEventLogger), parallel to the spill-events format.
-template <typename... Args>
-void EmitPullEvent(fmt::format_string<Args...> fmt, Args &&...args) {
-  auto &lg = MutablePullEventLogger();
-  if (lg) {
-    lg->info(fmt, std::forward<Args>(args)...);
-  }
-}
+namespace {
 
 // Single place that decides T1 has fired and writes the event line. Safe to
 // call from both the warm-construct path in Pull() and OnLocationChange's
@@ -106,6 +94,43 @@ void RecordBundleCompleteLatency(uint64_t request_id,
       bundle_size,
       absl::ToDoubleMilliseconds(transfer),
       absl::ToDoubleMilliseconds(total),
+      task_name.empty() ? "-" : task_name);
+}
+
+// Per-bundle terminal summary, emitted once at CancelPull regardless of
+// whether the bundle ever became fully local. This is the single line that
+// covers the population of bundles that never reach `bundle_complete` —
+// without it those cases are invisible. Also surfaces the deactivate/
+// reactivate churn counters that are *not* visible from
+// bundle_active.wait_ms (which only measures first activation; see notes
+// in ActivateNextBundlePullRequest).
+//
+// `outcome=complete` iff complete_time was ever stamped. lifetime_ms is
+// always T_cancel - T0 so cancelled bundles still get an observable
+// duration.
+void RecordBundleTerminal(uint64_t request_id,
+                          size_t bundle_size,
+                          bool completed,
+                          int num_deactivations,
+                          int num_reactivations,
+                          int num_dx_memory,
+                          int num_dx_unpullable,
+                          absl::Duration dx_total,
+                          absl::Duration lifetime,
+                          const std::string &task_name) {
+  EmitPullEvent(
+      "phase=bundle_terminal req_id={} bundle_size={} outcome={} "
+      "dx_count={} reax_count={} dx_memory={} dx_unpullable={} "
+      "dx_total_ms={} lifetime_ms={} task={}",
+      request_id,
+      bundle_size,
+      completed ? "complete" : "no_complete",
+      num_deactivations,
+      num_reactivations,
+      num_dx_memory,
+      num_dx_unpullable,
+      absl::ToDoubleMilliseconds(dx_total),
+      absl::ToDoubleMilliseconds(lifetime),
       task_name.empty() ? "-" : task_name);
 }
 
@@ -328,11 +353,18 @@ bool PullManager::ActivateNextBundlePullRequest(BundlePullRequestQueue &bundles,
   // Record the activation wait (T1 -> T2) exactly once per bundle. Pullable
   // bundles that get deactivated and re-activated will not be re-counted
   // here — the `!active_time.has_value()` guard locks the value to the
-  // first activation. Use the non-const accessor since we just looked the
-  // bundle up via const ref above; the mutation is bookkeeping only.
+  // first activation.
+  //
+  // Re-activations (the bundle came back from inactive due to plasma
+  // churn) ARE counted, just on a separate axis: bump num_reactivations
+  // and accumulate the time the bundle spent in inactive since the last
+  // deactivation. That cumulative duration is the real plasma-backpressure
+  // signal — first-activation wait is structurally near-zero because
+  // admission is opportunistic+preemptive (see notes on `active_time` in
+  // pull_manager.h).
   auto &mutable_request = map_find_or_die(bundles.requests, next_request_id);
+  const absl::Time now = absl::Now();
   if (!mutable_request.active_time.has_value()) {
-    const absl::Time now = absl::Now();
     mutable_request.active_time = now;
     const absl::Duration wait =
         mutable_request.pullable_time.has_value()
@@ -342,6 +374,11 @@ bool PullManager::ActivateNextBundlePullRequest(BundlePullRequestQueue &bundles,
                               mutable_request.objects_.size(),
                               wait,
                               mutable_request.task_key_.first);
+  } else if (mutable_request.last_deactivated_time.has_value()) {
+    mutable_request.num_reactivations++;
+    mutable_request.total_deactivated_dur +=
+        now - *mutable_request.last_deactivated_time;
+    mutable_request.last_deactivated_time.reset();
   }
 
   num_active_bundles_ += 1;
@@ -351,8 +388,12 @@ bool PullManager::ActivateNextBundlePullRequest(BundlePullRequestQueue &bundles,
 void PullManager::DeactivateBundlePullRequest(
     BundlePullRequestQueue &bundles,
     uint64_t request_id,
-    std::unordered_set<ObjectID> *objects_to_cancel) {
-  const auto &request = map_find_or_die(bundles.requests, request_id);
+    std::unordered_set<ObjectID> *objects_to_cancel,
+    DeactivationReason reason) {
+  // Note: bind to a non-const ref so the churn counters below can be
+  // updated. The existing per-object iteration (read-only) used a const
+  // ref; switching to non-const is purely additive.
+  auto &request = map_find_or_die(bundles.requests, request_id);
   for (const auto &obj_id : request.objects_) {
     absl::MutexLock lock(&active_objects_mu_);
     auto it = active_object_pull_requests_.find(obj_id);
@@ -372,6 +413,21 @@ void PullManager::DeactivateBundlePullRequest(
 
   bundles.DeactivateBundlePullRequest(request_id);
   num_active_bundles_ -= 1;
+
+  // Churn bookkeeping: kCancelled is final teardown via CancelPull, not
+  // plasma backpressure — skip counting it so the dx_count / dx_total_ms
+  // fields stay attributable to memory/unpullable pressure.
+  if (reason != DeactivationReason::kCancelled) {
+    request.num_deactivations++;
+    if (reason == DeactivationReason::kMemoryPressure) {
+      request.num_dx_memory++;
+    } else {
+      request.num_dx_unpullable++;
+    }
+    // Stamp the time so the next re-activation can accumulate inactive
+    // duration into total_deactivated_dur.
+    request.last_deactivated_time = absl::Now();
+  }
 }
 
 void PullManager::DeactivateUntilMarginAvailable(
@@ -388,7 +444,10 @@ void PullManager::DeactivateUntilMarginAvailable(
     RAY_LOG(DEBUG) << "Deactivating " << debug_name << " " << request_id
                    << " num bytes being pulled: " << num_bytes_being_pulled_
                    << " num bytes available: " << num_bytes_available_;
-    DeactivateBundlePullRequest(bundles, request_id, object_ids_to_cancel);
+    DeactivateBundlePullRequest(bundles,
+                                request_id,
+                                object_ids_to_cancel,
+                                DeactivationReason::kMemoryPressure);
   }
 }
 
@@ -495,13 +554,38 @@ std::vector<ObjectID> PullManager::CancelPull(uint64_t request_id) {
   // If the pull request was being actively pulled, deactivate it now.
   if (bundles.active_requests.count(request_id) > 0) {
     std::unordered_set<ObjectID> object_ids_to_cancel;
-    DeactivateBundlePullRequest(bundles, request_id, &object_ids_to_cancel);
+    DeactivateBundlePullRequest(bundles,
+                                request_id,
+                                &object_ids_to_cancel,
+                                DeactivationReason::kCancelled);
     for (const auto &obj_id : object_ids_to_cancel) {
       // Call the cancellation callback outside of the lock.
       RAY_LOG(DEBUG) << "Pull cancellation requested for object " << obj_id
                      << ", aborting creation.";
       cancel_pull_request_(obj_id);
     }
+  }
+
+  // Terminal summary: emitted once per bundle at the only universal exit
+  // point. Captures the population of bundles that never reached
+  // bundle_complete (outcome=no_complete) plus the deactivate/reactivate
+  // churn that bundle_active.wait_ms cannot see. Must run before
+  // RemoveBundlePullRequest below, which drops the bundle from the map.
+  // Empty bundles are skipped (no objects = trivially "complete" and
+  // never carried churn — they only exist as a degenerate case).
+  if (!bundle_it->second.objects_.empty()) {
+    const absl::Duration lifetime =
+        absl::Now() - bundle_it->second.subscribe_start_time;
+    RecordBundleTerminal(request_id,
+                         bundle_it->second.objects_.size(),
+                         bundle_it->second.complete_time.has_value(),
+                         bundle_it->second.num_deactivations,
+                         bundle_it->second.num_reactivations,
+                         bundle_it->second.num_dx_memory,
+                         bundle_it->second.num_dx_unpullable,
+                         bundle_it->second.total_deactivated_dur,
+                         lifetime,
+                         bundle_it->second.task_key_.first);
   }
 
   // Erase this pull request.
@@ -605,7 +689,10 @@ void PullManager::OnLocationChange(const ObjectID &object_id,
           // It's active now so we need to deactivate it
           // to free memory for other requests.
           std::unordered_set<ObjectID> objects_to_cancel;
-          DeactivateBundlePullRequest(bundles, bundle_request_id, &objects_to_cancel);
+          DeactivateBundlePullRequest(bundles,
+                                      bundle_request_id,
+                                      &objects_to_cancel,
+                                      DeactivationReason::kBecameUnpullable);
           for (const auto &obj_id : objects_to_cancel) {
             cancel_pull_request_(obj_id);
           }

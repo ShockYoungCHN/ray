@@ -790,10 +790,7 @@ int main(int argc, char *argv[]) {
           // This callback is called from the plasma store thread.
           // NOTE: It means the local object manager should be thread-safe.
           main_service.post(
-              [&]() {
-                local_object_manager->SpillObjectUptoMaxThroughput(
-                    ray::raylet::SpillTrigger::kEvictionOnCreate);
-              },
+              [&]() { local_object_manager->SpillObjectUptoMaxThroughput(); },
               "NodeManager.SpillObjects");
           return local_object_manager->IsSpillingInProgress();
         },
@@ -1109,16 +1106,12 @@ int main(int argc, char *argv[]) {
                         RayConfig::instance().emit_event_to_log_file());
     };
 
-    // Dedicated spill-events log. Independent from RayEventInit because spill
-    // events are high-volume, structured, and consumed by ad-hoc aggregation
-    // tooling rather than the dashboard event pipeline.
-    if (!log_dir.empty()) {
-      ray::raylet::InitSpillEventLogger(log_dir);
-      // Sibling logger for bundle-pull telemetry. Same rationale: high
-      // volume + structured + analyzed offline.  See pull_manager.cc.
-      if (RayConfig::instance().pull_manager_event_log_enabled()) {
-        ray::InitPullEventLogger(log_dir);
-      }
+    // Dedicated bundle-pull telemetry log. High volume + structured +
+    // analyzed offline, so separate from RayEventInit / dashboard pipeline.
+    // See pull_manager.cc.
+    if (!log_dir.empty() &&
+        RayConfig::instance().pull_manager_event_log_enabled()) {
+      ray::InitPullEventLogger(log_dir);
     }
 
     ray::rpc::GcsNodeInfo self_node_info;
