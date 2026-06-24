@@ -1110,11 +1110,14 @@ int main(int argc, char *argv[]) {
     };
 
     // Dedicated event logs. High volume + structured + consumed by ad-hoc
-    // aggregation tooling rather than the dashboard event pipeline.
-    // - Spill events: raylet_spill_events.out (always on when log_dir set)
-    // - Pull events:  raylet_pull_events.out  (gated by env var)
+    // aggregation tooling rather than the dashboard event pipeline. Each is
+    // gated by its own env var so neither is paid for unless requested.
+    // - Spill events: raylet_spill_events.out  (RAY_spill_manager_event_log_enabled)
+    // - Pull events:  raylet_pull_events.out   (RAY_pull_manager_event_log_enabled)
     if (!log_dir.empty()) {
-      ray::raylet::InitSpillEventLogger(log_dir);
+      if (RayConfig::instance().spill_manager_event_log_enabled()) {
+        ray::raylet::InitSpillEventLogger(log_dir);
+      }
       if (RayConfig::instance().pull_manager_event_log_enabled()) {
         ray::InitPullEventLogger(log_dir);
       }

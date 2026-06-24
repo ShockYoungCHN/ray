@@ -384,6 +384,13 @@ RAY_CONFIG(int, object_manager_pull_timeout_ms, 10000)
 /// a no-op (dump to nowhere) — all call sites pay only a single nullptr check.
 RAY_CONFIG(bool, pull_manager_event_log_enabled, false)
 
+/// Sibling of pull_manager_event_log_enabled for the spill-event logger.
+/// When true, raylet initializes the spill-event logger that writes structured
+/// spill telemetry (one line per event) to <log_dir>/raylet_spill_events.out.
+/// When false (default), the logger is left uninitialized and EmitSpillEvent is
+/// a no-op — call sites pay only a single nullptr check.
+RAY_CONFIG(bool, spill_manager_event_log_enabled, false)
+
 /// Timeout, in milliseconds, to wait until the Push request fails.
 /// Special value:
 /// Negative: waiting infinitely.
