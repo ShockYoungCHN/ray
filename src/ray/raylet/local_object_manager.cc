@@ -855,7 +855,7 @@ void LocalObjectManager::LogSpillManagerSummary() const {
       objects_pending_spill_.size(),
       num_bytes_pending_restore_,
       objects_pending_restore_.size(),
-      num_failed_deletion_requests_);
+      num_failed_deletion_requests_.load());
 }
 
 int64_t LocalObjectManager::GetPrimaryBytes() const {
