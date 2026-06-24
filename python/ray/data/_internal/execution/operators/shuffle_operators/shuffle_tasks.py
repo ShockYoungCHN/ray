@@ -242,6 +242,12 @@ def _shuffle_reduce_task(
     accum_tables: List[pa.Table] = []
     accum_bytes: int = 0
     output_buffer: Optional[BlockOutputBuffer] = None
+    # Accumulated wall-clock inside ``_get_shard_batch`` for this task; the
+    # value yielded with the *final* block's metadata reflects the task's
+    # complete ray.get cost.  Intermediate yields in streaming mode also
+    # carry the running total — fine, they get overwritten downstream by
+    # the last block's stats per partition.
+    get_time_total_s: float = 0.0
 
     def _yield_with_stats(block: Block):
         """Yield (block, pickled metadata) following the streaming-gen protocol."""
@@ -257,6 +263,7 @@ def _shuffle_reduce_task(
                 block_exec_stats=exec_stats,
                 task_exec_stats=TaskExecWorkerStats(
                     task_wall_time_s=time.perf_counter() - start_time_s,
+                    reduce_get_time_s=get_time_total_s,
                 ),
             )
         )
@@ -280,13 +287,16 @@ def _shuffle_reduce_task(
     num_batches = math.ceil(len(shard_refs) / batch_size) if batch_size else 0
     for batch_index, batch_start in enumerate(range(0, len(shard_refs), batch_size)):
         batch = shard_refs[batch_start : batch_start + batch_size]
-        for buf in _get_shard_batch(
+        get_start_s = time.perf_counter()
+        bufs = _get_shard_batch(
             batch,
             partition_id,
             batch_index,
             num_batches,
             get_timeout_s,
-        ):
+        )
+        get_time_total_s += time.perf_counter() - get_start_s
+        for buf in bufs:
             if buf is None:
                 continue
             table = _read_partition_ipc(buf)
