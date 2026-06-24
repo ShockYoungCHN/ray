@@ -27,6 +27,7 @@
 #include "absl/time/time.h"
 #include "ray/common/ray_config.h"
 #include "ray/util/logging.h"
+#include "ray/util/time.h"
 #include "spdlog/sinks/basic_file_sink.h"
 #include "spdlog/spdlog.h"
 
@@ -312,7 +313,7 @@ bool PullManager::ActivateNextBundlePullRequest(BundlePullRequestQueue &bundles,
       if (needs_pull) {
         RAY_LOG(DEBUG) << "Activating pull for object " << obj_id;
         auto &request = map_find_or_die(object_pull_requests_, obj_id);
-        request.activate_time_ms = absl::GetCurrentTimeNanos() / 1e3;
+        request.activate_time_ms = current_time_ns() / 1e3;
 
         TryPinObject(obj_id);
         objects_to_pull->push_back(obj_id);
@@ -512,7 +513,7 @@ std::vector<ObjectID> PullManager::CancelPull(uint64_t request_id) {
       it->second.bundle_request_ids.erase(bundle_it->first);
       if (it->second.bundle_request_ids.empty()) {
         pull_manager_object_request_time_ms_histogram_.Record(
-            absl::GetCurrentTimeNanos() / 1e3 - it->second.request_start_time_ms,
+            current_time_ns() / 1e3 - it->second.request_start_time_ms,
             {{"Type", "StartToCancel"}});
         object_pull_requests_.erase(it);
         object_ids_to_cancel_subscription.push_back(obj_id);
@@ -827,11 +828,11 @@ bool PullManager::TryPinObject(const ObjectID &object_id) {
     auto it = object_pull_requests_.find(object_id);
     RAY_CHECK(it != object_pull_requests_.end());
     pull_manager_object_request_time_ms_histogram_.Record(
-        absl::GetCurrentTimeNanos() / 1e3 - it->second.request_start_time_ms,
+        current_time_ns() / 1e3 - it->second.request_start_time_ms,
         {{"Type", "StartToPin"}});
     if (it->second.activate_time_ms > 0) {
       pull_manager_object_request_time_ms_histogram_.Record(
-          absl::GetCurrentTimeNanos() / 1e3 - it->second.activate_time_ms,
+          current_time_ns() / 1e3 - it->second.activate_time_ms,
           {{"Type", "MemoryAvailableToPin"}});
     }
     return true;
