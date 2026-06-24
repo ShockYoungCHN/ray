@@ -92,19 +92,27 @@ Join all per-bundle phases for one bundle by `req_id` (unique per raylet
 process; not globally unique across nodes). To get a cluster-wide unique
 key, prefix with `node_ip` (the aggregator does this).
 
-**Per-object (sender-side, ObjectManager)**:
+**Per-object (sender-side, ObjectManager + PushManager)**:
 
 ```
+phase=push_queued           ← PushManager dequeued this push for first send
+phase=push_dispatched       ← all chunks handed to chunk_send_fn_ (in flight)
 phase=object_pushed         ← one line per object after all chunks ACKed
 ```
 
-Emitted by the node that *served* an object to a remote requester. Carries
-the wall-clock for the sender side of the cross-node transfer and a
-`from_disk` flag separating spill-served (`PushFromFilesystem`) from
-plasma-served (`PushLocalObject`). The byte sum of `from_disk=1` lines is
-the *only* place in the entire telemetry surface where cross-node spill IO
-is measurable — `restored_*` in `raylet_spill_events.out` does NOT cover
-this path. See §3.5.
+Emitted by the node that *served* an object to a remote requester.
+
+`phase=object_pushed` carries the wall-clock for the sender side of the
+cross-node transfer and a `from_disk` flag separating spill-served
+(`PushFromFilesystem`) from plasma-served (`PushLocalObject`). The byte
+sum of `from_disk=1` lines is the *only* place in the entire telemetry
+surface where cross-node spill IO is measurable — `restored_*` in
+`raylet_spill_events.out` does NOT cover this path. See §3.5.
+
+`phase=push_queued` and `phase=push_dispatched` decompose `push_wall_ms`
+into PushManager-internal phases — see §3.8. Join all three lines by
+`(node_ip, object_id, dest_node)` to derive
+`drain_ms = push_wall_ms - queue_ms - dispatch_ms` (the network ack tail).
 
 **Per-object (receiver-side, ObjectManager)**:
 
@@ -361,7 +369,60 @@ Only emitted on chunk 0 (one line per object per pull attempt). Later
 chunks reuse the already-allocated buffer slot and are fast — instrumenting
 them would multiply line volume without adding signal.
 
-### 3.8 What's NOT in this file (yet)
+### 3.8 `phase=push_queued` / `phase=push_dispatched` (sender-side, PushManager internals)
+
+Emitted by `PushManager` directly (not `ObjectManager`). Together with
+`phase=object_pushed` they decompose `push_wall_ms` into three phases per
+sender-side push:
+
+```
+T0 = StartPush()            push enters push_requests_with_chunks_to_send_
+T1 = first SendOneChunk()  ← phase=push_queued       queue_ms = T1 - T0
+T2 = last  SendOneChunk()  ← phase=push_dispatched   dispatch_ms = T2 - T1
+T3 = last  OnChunkComplete ← phase=object_pushed     push_wall_ms ≈ T3 - T0
+                              drain_ms = push_wall_ms - queue_ms - dispatch_ms
+```
+
+```
+1780900100.111111 phase=push_queued     object_id=<hex32> dest_node=<hex> chunks=<int> queue_ms=<float>
+1780900100.222222 phase=push_dispatched object_id=<hex32> dest_node=<hex> chunks=<int> dispatch_ms=<float>
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `object_id` | hex32 | Object being served |
+| `dest_node` | hex | Receiving NodeID. Same object can have multiple lines, one per destination |
+| `chunks` | int | Total chunks for this push (constant across the two phases) |
+| `queue_ms` | float | Wait inside `push_requests_with_chunks_to_send_` for the `chunks_in_flight` window to open. Fires once per push (resends don't re-emit) |
+| `dispatch_ms` | float | Time from first to last chunk dispatched. If `dispatch_ms / chunks` ≫ chunk RTT, the throttle is binding |
+
+**Join key**: `(node_ip, object_id, dest_node)`. Same key as `object_pushed`.
+
+**Interpretation matrix**:
+
+| Component | Bottleneck if large |
+|---|---|
+| `queue_ms` | HOL blocking — other pushes on this sender are saturating `max_chunks_in_flight`, or destination is congested |
+| `dispatch_ms` | Window throttle — sender is window-bound, not CPU/disk bound |
+| `drain_ms` | Network / receiver — last in-flight chunks slow to ack; check `plasma_create_wait` on the receiver |
+
+**Caveats**:
+
+1. **No emit when logger disabled**: like all `EmitPullEvent` lines, these
+   are no-ops unless `RAY_pull_manager_event_log_enabled=1` was set when
+   the raylet started.
+2. **Resend behavior**: if `StartPush` is called twice for the same
+   `(dest, object)` (duplicate Pull from peer), the second call invokes
+   `ResendAllChunks` which does NOT reset `first_sent_at_`. So
+   `queue_ms` reflects original-enqueue → first-send only; a resend that
+   completes earlier than the first attempt will appear as a clean
+   single-push timeline.
+3. **`HandleNodeRemoved`**: pushes cancelled by node removal are erased
+   from `push_requests_with_chunks_to_send_` without going through the
+   "num_chunks_to_send_ == 0" path, so `push_dispatched` is NOT emitted
+   for them. The aggregator counts these as `queue_only_count`.
+
+### 3.9 What's NOT in this file (yet)
 
 These would be useful additions but are not implemented:
 
@@ -401,6 +462,13 @@ per-node fan-out via NodeAffinity tasks and produces a summary:
   the `from_disk_byte_share` ratio that quantifies "how much of the
   cross-node transfer was served from spill files" (the OOC severity
   signal `restored_*` cannot give)
+- **PushManager-internal decomposition** of `push_wall_ms`:
+  `queue_ms_per_object` / `dispatch_ms_per_object` / `drain_ms_per_object`
+  distributions inside both `from_disk={0,1}` buckets. Joins
+  `phase=push_queued` + `phase=push_dispatched` + `phase=object_pushed`
+  by `(node_ip, object_id, dest_node)`; orphan counts
+  (`queue_only_count` / `dispatch_only_count`) flag pushes that never
+  completed (e.g. node removal mid-push)
 
 Run:
 
@@ -426,8 +494,12 @@ python aggregate_pull_events.py --output pull_events_summary.json
 1780900001.008200 phase=bundle_active   req_id=44 bundle_size=12 wait_ms=0.1 task=ShuffleReduce
 1780900001.510000 phase=bundle_terminal req_id=44 bundle_size=12 outcome=no_complete dx_count=5 reax_count=5 dx_memory=4 dx_unpullable=1 dx_total_ms=341.0 lifetime_ms=510.0 task=ShuffleReduce
 
-1780900002.012300 phase=object_pushed object_id=abc123 bytes=33554432 push_wall_ms=128.4 from_disk=1 dest_node=node-B-hex
-1780900002.012800 phase=object_pushed object_id=def456 bytes=33554432 push_wall_ms=4.2 from_disk=0 dest_node=node-B-hex
+1780900002.001000 phase=push_queued     object_id=abc123 dest_node=node-B-hex chunks=64 queue_ms=12.0
+1780900002.008000 phase=push_dispatched object_id=abc123 dest_node=node-B-hex chunks=64 dispatch_ms=7.0
+1780900002.012300 phase=object_pushed   object_id=abc123 bytes=33554432 push_wall_ms=128.4 from_disk=1 dest_node=node-B-hex
+1780900002.011500 phase=push_queued     object_id=def456 dest_node=node-B-hex chunks=64 queue_ms=0.3
+1780900002.012100 phase=push_dispatched object_id=def456 dest_node=node-B-hex chunks=64 dispatch_ms=0.6
+1780900002.012800 phase=object_pushed   object_id=def456 bytes=33554432 push_wall_ms=4.2 from_disk=0 dest_node=node-B-hex
 ```
 
 Interpretation:
@@ -444,12 +516,16 @@ Interpretation:
   1 from spill), 341 ms of cumulative deactivated time, **never reached
   `bundle_complete`**. This is the class of bundles that's invisible
   without `bundle_terminal`.
-- The two `phase=object_pushed` lines are sender-side from a third node
-  serving objects to node-B. `from_disk=1` (32 MiB in 128 ms ≈ 250 MB/s
-  effective) is a spill-file read served over network; `from_disk=0`
-  (same bytes in 4 ms ≈ 8 GB/s) is a plasma → network push — orders of
-  magnitude faster, illustrating exactly why mixing the two paths into
-  `bundle_complete.transfer_ms` is so opaque.
+- The two object pushes (sender-side from a third node serving objects
+  to node-B) decompose cleanly:
+  - `abc123` (`from_disk=1`, 32 MiB in 128.4 ms ≈ 250 MB/s effective): 12 ms
+    of queue, 7 ms to dispatch all 64 chunks, **109 ms of drain** —
+    suggests receiver-side plasma admission or spill-disk read is the
+    binder (cross-check with `plasma_create_wait.wait_ms` on node-B).
+  - `def456` (`from_disk=0`, 32 MiB in 4.2 ms ≈ 8 GB/s): 0.3 ms queue,
+    0.6 ms dispatch, **3.3 ms drain** — clean plasma→network path. Orders
+    of magnitude faster, illustrating exactly why mixing the two paths
+    into `bundle_complete.transfer_ms` is so opaque.
 
 ---
 

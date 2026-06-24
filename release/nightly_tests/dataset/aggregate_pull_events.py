@@ -5,10 +5,19 @@ This file is written by the dedicated spdlog logger initialized in
 ``src/ray/object_manager/pull_manager.cc``).  Every line is one event; no
 JSON envelope.  See ``PULL_EVENTS_LOG_FORMAT.md`` for the schema.
 
-Three event phases per bundle:
+Receiver-side per-bundle phases (joined by ``(node_ip, req_id)``):
   - phase=bundle_locate   (T0 -> T1): subscribe to all-locations-resolved
   - phase=bundle_active   (T1 -> T2): plasma-quota wait before activation
   - phase=bundle_complete (T0 -> T3): full end-to-end fetch wall time
+  - phase=bundle_terminal             at CancelPull, captures dx/reax churn
+  - phase=object_first_byte           first chunk arrival, attempt counter
+  - phase=plasma_create_wait          receiver-side admission wait
+
+Sender-side per-push phases (joined by ``(node_ip, object_id, dest_node)``):
+  - phase=push_queued     (T0 -> T1): wait inside PushManager for window
+  - phase=push_dispatched (T1 -> T2): time to feed all chunks into network
+  - phase=object_pushed   (T-1 -> T3): full sender-side push wall time
+  (drain_ms = wall - queue - dispatch is computed by this script.)
 
 This script:
   1. fans out one remote task per node (NodeAffinity-pinned) to parse the
@@ -313,6 +322,18 @@ def _summarize(per_node: List[Dict[str, Any]]) -> Dict[str, Any]:
     #                ONLY signal for cross-node spill IO (restored_* in
     #                spill_events misses this entirely).
     #   from_disk=0: PushLocalObject (plasma -> network).
+    #
+    # Also decomposes push_wall_ms into PushManager-internal phases:
+    #   queue_ms     (phase=push_queued)     T0 -> T1: time waiting in
+    #                                        push_requests_with_chunks_to_send_
+    #                                        for the chunks_in_flight window.
+    #   dispatch_ms  (phase=push_dispatched) T1 -> T2: time to hand every
+    #                                        chunk to chunk_send_fn_.
+    #   drain_ms     = push_wall_ms - queue_ms - dispatch_ms (T2 -> T3):
+    #                                        wait for the last in-flight
+    #                                        chunks to ack on the network.
+    # Joined by (node_ip, object_id, dest_node) since the same object can
+    # be pushed to multiple destinations from the same sender.
     push_disk_bytes = 0
     push_disk_ms = 0.0
     push_disk_ms_per_obj: List[float] = []
@@ -321,25 +342,96 @@ def _summarize(per_node: List[Dict[str, Any]]) -> Dict[str, Any]:
     push_plasma_ms_per_obj: List[float] = []
     push_disk_count = 0
     push_plasma_count = 0
+
+    # Per-(node, object, dest) row collecting the three phases for join.
+    # Each push gets at most one row; if the same object is pushed twice
+    # to the same destination, later phase events overwrite (we treat them
+    # as the most-recent attempt — matches push_wall_ms semantics).
+    push_rows: Dict[Tuple[str, str, str], Dict[str, Any]] = defaultdict(dict)
     for n in per_node:
+        node_ip = n["node_ip"]
         for ev in n["events"]:
-            if ev.get("phase") != "object_pushed":
+            phase = ev.get("phase")
+            if phase not in ("object_pushed", "push_queued", "push_dispatched"):
                 continue
-            try:
-                b = int(ev["bytes"])
-                ms = float(ev["push_wall_ms"])
-            except (KeyError, ValueError):
+            object_id = ev.get("object_id")
+            dest_node = ev.get("dest_node")
+            if object_id is None or dest_node is None:
                 continue
-            if ev.get("from_disk") == "1":
+            row = push_rows[(node_ip, object_id, dest_node)]
+            if phase == "object_pushed":
+                try:
+                    row["bytes"] = int(ev["bytes"])
+                    row["wall_ms"] = float(ev["push_wall_ms"])
+                    row["from_disk"] = ev.get("from_disk") == "1"
+                except (KeyError, ValueError):
+                    pass
+            elif phase == "push_queued":
+                try:
+                    row["queue_ms"] = float(ev["queue_ms"])
+                except (KeyError, ValueError):
+                    pass
+            elif phase == "push_dispatched":
+                try:
+                    row["dispatch_ms"] = float(ev["dispatch_ms"])
+                except (KeyError, ValueError):
+                    pass
+
+    # Per-bucket distributions of queue_ms / dispatch_ms / drain_ms. We
+    # only compute drain_ms when wall_ms + queue_ms + dispatch_ms are all
+    # present (drain has no standalone event). Pushes missing object_pushed
+    # still contribute to queue/dispatch distributions — they capture the
+    # PushManager-side timing regardless of network completion.
+    push_disk_queue_ms: List[float] = []
+    push_disk_dispatch_ms: List[float] = []
+    push_disk_drain_ms: List[float] = []
+    push_plasma_queue_ms: List[float] = []
+    push_plasma_dispatch_ms: List[float] = []
+    push_plasma_drain_ms: List[float] = []
+    # Rows that have queue/dispatch but no object_pushed yet — count
+    # separately so the orphan ratio is observable. Large orphan share
+    # means many pushes never completed (cancelled / node lost / still
+    # in flight at scan time).
+    queue_orphan_count = 0
+    dispatch_orphan_count = 0
+
+    for row in push_rows.values():
+        wall_ms = row.get("wall_ms")
+        queue_ms = row.get("queue_ms")
+        dispatch_ms = row.get("dispatch_ms")
+        from_disk = row.get("from_disk")
+
+        if wall_ms is not None:
+            b = row.get("bytes", 0)
+            if from_disk:
                 push_disk_bytes += b
-                push_disk_ms += ms
-                push_disk_ms_per_obj.append(ms)
+                push_disk_ms += wall_ms
+                push_disk_ms_per_obj.append(wall_ms)
                 push_disk_count += 1
+                if queue_ms is not None:
+                    push_disk_queue_ms.append(queue_ms)
+                if dispatch_ms is not None:
+                    push_disk_dispatch_ms.append(dispatch_ms)
+                if queue_ms is not None and dispatch_ms is not None:
+                    drain = wall_ms - queue_ms - dispatch_ms
+                    push_disk_drain_ms.append(drain)
             else:
                 push_plasma_bytes += b
-                push_plasma_ms += ms
-                push_plasma_ms_per_obj.append(ms)
+                push_plasma_ms += wall_ms
+                push_plasma_ms_per_obj.append(wall_ms)
                 push_plasma_count += 1
+                if queue_ms is not None:
+                    push_plasma_queue_ms.append(queue_ms)
+                if dispatch_ms is not None:
+                    push_plasma_dispatch_ms.append(dispatch_ms)
+                if queue_ms is not None and dispatch_ms is not None:
+                    drain = wall_ms - queue_ms - dispatch_ms
+                    push_plasma_drain_ms.append(drain)
+        else:
+            if queue_ms is not None:
+                queue_orphan_count += 1
+            if dispatch_ms is not None:
+                dispatch_orphan_count += 1
 
     total_bundles = len(per_bundle)
     warm_total = warm_counter["warm"]
@@ -388,6 +480,22 @@ def _summarize(per_node: List[Dict[str, Any]]) -> Dict[str, Any]:
                 "wall_ms_per_object": _summarize_distribution(
                     push_disk_ms_per_obj
                 ),
+                # PushManager-internal decomposition. queue_ms = wait for
+                # chunks_in_flight window; dispatch_ms = handing all chunks
+                # to chunk_send_fn_; drain_ms = wall - queue - dispatch =
+                # network ack wait for the final in-flight chunks. Large
+                # queue_ms + small dispatch_ms => HOL blocking from other
+                # pushes; large dispatch_ms => window throttle binding;
+                # large drain_ms => network / receiver-plasma bound.
+                "queue_ms_per_object": _summarize_distribution(
+                    push_disk_queue_ms
+                ),
+                "dispatch_ms_per_object": _summarize_distribution(
+                    push_disk_dispatch_ms
+                ),
+                "drain_ms_per_object": _summarize_distribution(
+                    push_disk_drain_ms
+                ),
             },
             "from_plasma": {
                 "object_count": push_plasma_count,
@@ -401,12 +509,28 @@ def _summarize(per_node: List[Dict[str, Any]]) -> Dict[str, Any]:
                 "wall_ms_per_object": _summarize_distribution(
                     push_plasma_ms_per_obj
                 ),
+                "queue_ms_per_object": _summarize_distribution(
+                    push_plasma_queue_ms
+                ),
+                "dispatch_ms_per_object": _summarize_distribution(
+                    push_plasma_dispatch_ms
+                ),
+                "drain_ms_per_object": _summarize_distribution(
+                    push_plasma_drain_ms
+                ),
             },
             "from_disk_byte_share": (
                 push_disk_bytes / (push_disk_bytes + push_plasma_bytes)
                 if (push_disk_bytes + push_plasma_bytes) > 0
                 else 0.0
             ),
+            # Rows that had push_queued / push_dispatched but no
+            # object_pushed in the scanned window. Bounded by in-flight
+            # pushes at scan time + pushes that were cancelled (node death,
+            # HandleNodeRemoved). A large value relative to object_count
+            # indicates many pushes never completed.
+            "queue_only_count": queue_orphan_count,
+            "dispatch_only_count": dispatch_orphan_count,
         },
         # Receiver-side first-byte + re-pull stats. `repull_byte_share`
         # is the direct "wasted bytes from evict + re-pull" indicator;
