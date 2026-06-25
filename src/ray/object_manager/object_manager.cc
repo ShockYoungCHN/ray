@@ -545,6 +545,14 @@ void ObjectManager::PushObjectInternal(const ObjectID &object_id,
   // can be split: drain_ms - get_chunk_ms_total is the network + receiver
   // share (and any remaining rpc_service_ scheduling slack).
   const auto get_chunk_ns_total = std::make_shared<std::atomic<int64_t>>(0);
+  // Cumulative lag from "rpc_service_ posts OnChunkComplete to main_service_"
+  // to "main_service_ thread actually runs the lambda".  Measures contention
+  // on the single main_service_ thread that serializes all PushManager state
+  // updates.  Reported as bounce_lag_ms_total in `phase=object_pushed`;
+  // bounce_lag_ms_total / network_recv_ms localizes the bottleneck inside
+  // drain_ms.  Skips the last chunk's bounce (which is in flight at emit
+  // time); for any non-trivial chunk count (N>>1) the omission is negligible.
+  const auto bounce_ns_total = std::make_shared<std::atomic<int64_t>>(0);
   const auto object_size = chunk_reader->GetObject().GetObjectSize();
   const std::string dest_node_hex = node_id.Hex();
   const std::string object_id_hex = object_id.Hex();
@@ -564,21 +572,30 @@ void ObjectManager::PushObjectInternal(const ObjectID &object_id,
                   rpc_client,
                   [=](const Status &status) {
                     // Post back to the main event loop because the
-                    // PushManager is not thread-safe.
-                    main_service_->post([this]() { push_manager_->OnChunkComplete(); },
-                                        "ObjectManager.Push");
+                    // PushManager is not thread-safe.  Time the bounce:
+                    // stamp before post(), have the lambda subtract on entry.
+                    const int64_t bounce_post_ns = absl::GetCurrentTimeNanos();
+                    main_service_->post(
+                        [this, bounce_ns_total, bounce_post_ns]() {
+                          bounce_ns_total->fetch_add(
+                              absl::GetCurrentTimeNanos() - bounce_post_ns,
+                              std::memory_order_relaxed);
+                          push_manager_->OnChunkComplete();
+                        },
+                        "ObjectManager.Push");
                     // Last completed chunk emits the timing line. fetch_sub
                     // returns the pre-decrement value, so == 1 means we
                     // just drove the counter to 0.
                     if (chunks_remaining->fetch_sub(1) == 1) {
                       EmitPullEvent(
                           "phase=object_pushed object_id={} bytes={} "
-                          "push_wall_ms={} get_chunk_ms_total={} from_disk={} "
-                          "dest_node={}",
+                          "push_wall_ms={} get_chunk_ms_total={} "
+                          "bounce_lag_ms_total={} from_disk={} dest_node={}",
                           object_id_hex,
                           object_size,
                           absl::ToDoubleMilliseconds(absl::Now() - push_start_time),
                           get_chunk_ns_total->load(std::memory_order_relaxed) / 1e6,
+                          bounce_ns_total->load(std::memory_order_relaxed) / 1e6,
                           from_disk ? 1 : 0,
                           dest_node_hex);
                     }

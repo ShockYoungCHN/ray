@@ -370,6 +370,9 @@ def _summarize(per_node: List[Dict[str, Any]]) -> Dict[str, Any]:
                     gc = ev.get("get_chunk_ms_total")
                     if gc is not None:
                         row["get_chunk_ms"] = float(gc)
+                    bl = ev.get("bounce_lag_ms_total")
+                    if bl is not None:
+                        row["bounce_lag_ms"] = float(bl)
                 except (KeyError, ValueError):
                     pass
             elif phase == "push_queued":
@@ -396,11 +399,17 @@ def _summarize(per_node: List[Dict[str, Any]]) -> Dict[str, Any]:
     # get_chunk separates "disk read on sender" from "network + receiver".
     push_disk_get_chunk_ms: List[float] = []
     push_disk_network_recv_ms: List[float] = []
+    # bounce_lag_ms_total = cumulative time across this push's chunks from
+    # main_service_->post(OnChunkComplete) to the lambda actually running.
+    # High value = main_service_ contention is the bottleneck inside
+    # network_recv_ms.  Low value = network / receiver-side is.
+    push_disk_bounce_lag_ms: List[float] = []
     push_plasma_queue_ms: List[float] = []
     push_plasma_dispatch_ms: List[float] = []
     push_plasma_drain_ms: List[float] = []
     push_plasma_get_chunk_ms: List[float] = []
     push_plasma_network_recv_ms: List[float] = []
+    push_plasma_bounce_lag_ms: List[float] = []
     # Rows that have queue/dispatch but no object_pushed yet — count
     # separately so the orphan ratio is observable. Large orphan share
     # means many pushes never completed (cancelled / node lost / still
@@ -413,6 +422,7 @@ def _summarize(per_node: List[Dict[str, Any]]) -> Dict[str, Any]:
         queue_ms = row.get("queue_ms")
         dispatch_ms = row.get("dispatch_ms")
         get_chunk_ms = row.get("get_chunk_ms")
+        bounce_lag_ms = row.get("bounce_lag_ms")
         from_disk = row.get("from_disk")
 
         if wall_ms is not None:
@@ -432,6 +442,8 @@ def _summarize(per_node: List[Dict[str, Any]]) -> Dict[str, Any]:
                     if get_chunk_ms is not None:
                         push_disk_get_chunk_ms.append(get_chunk_ms)
                         push_disk_network_recv_ms.append(drain - get_chunk_ms)
+                    if bounce_lag_ms is not None:
+                        push_disk_bounce_lag_ms.append(bounce_lag_ms)
             else:
                 push_plasma_bytes += b
                 push_plasma_ms += wall_ms
@@ -447,6 +459,8 @@ def _summarize(per_node: List[Dict[str, Any]]) -> Dict[str, Any]:
                     if get_chunk_ms is not None:
                         push_plasma_get_chunk_ms.append(get_chunk_ms)
                         push_plasma_network_recv_ms.append(drain - get_chunk_ms)
+                    if bounce_lag_ms is not None:
+                        push_plasma_bounce_lag_ms.append(bounce_lag_ms)
         else:
             if queue_ms is not None:
                 queue_orphan_count += 1
@@ -527,6 +541,13 @@ def _summarize(per_node: List[Dict[str, Any]]) -> Dict[str, Any]:
                 "network_recv_ms_per_object": _summarize_distribution(
                     push_disk_network_recv_ms
                 ),
+                # bounce_lag_ms_total / network_recv_ms identifies main_service_
+                # contention.  >= 0.5 = OnChunkComplete bounce dominates and a
+                # PushManager-side lock-free path is justified.  < 0.1 = gRPC /
+                # network / receiver-side is the real cost.
+                "bounce_lag_ms_per_object": _summarize_distribution(
+                    push_disk_bounce_lag_ms
+                ),
             },
             "from_plasma": {
                 "object_count": push_plasma_count,
@@ -554,6 +575,9 @@ def _summarize(per_node: List[Dict[str, Any]]) -> Dict[str, Any]:
                 ),
                 "network_recv_ms_per_object": _summarize_distribution(
                     push_plasma_network_recv_ms
+                ),
+                "bounce_lag_ms_per_object": _summarize_distribution(
+                    push_plasma_bounce_lag_ms
                 ),
             },
             "from_disk_byte_share": (
