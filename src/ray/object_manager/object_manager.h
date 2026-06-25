@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -349,6 +350,11 @@ class ObjectManager : public ObjectManagerInterface,
   /// \param chunk_reader Chunk reader used to read a chunk of the object
   /// \param from_disk Whether chunk is being read from disk or plasma. This is
   /// used only for metrics.
+  /// \param get_chunk_ns_total Shared accumulator for cumulative wall-clock
+  /// time spent inside ``chunk_reader->GetChunk`` across all chunks of one
+  /// push.  Used by PushObjectInternal to split out the spill-file read
+  /// portion of drain_ms in the ``phase=object_pushed`` line.  May be
+  /// nullptr (tests / future callers that don't need the breakdown).
   void SendObjectChunk(const UniqueID &push_id,
                        const ObjectID &object_id,
                        const NodeID &node_id,
@@ -356,7 +362,8 @@ class ObjectManager : public ObjectManagerInterface,
                        std::shared_ptr<rpc::ObjectManagerClientInterface> rpc_client,
                        std::function<void(const Status &)> on_complete,
                        std::shared_ptr<ChunkObjectReader> chunk_reader,
-                       bool from_disk);
+                       bool from_disk,
+                       std::shared_ptr<std::atomic<int64_t>> get_chunk_ns_total);
 
   /// Handle starting, running, and stopping asio rpc_service.
   void StartRpcService();

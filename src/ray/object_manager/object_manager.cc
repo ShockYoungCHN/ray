@@ -539,6 +539,12 @@ void ObjectManager::PushObjectInternal(const ObjectID &object_id,
   const auto push_start_time = absl::Now();
   const auto chunks_remaining =
       std::make_shared<std::atomic<int64_t>>(chunk_reader->GetNumChunks());
+  // Cumulative ns spent inside chunk_reader->GetChunk across this push,
+  // accumulated by each rpc_service_ worker that runs SendObjectChunk.
+  // Reported as get_chunk_ms_total in `phase=object_pushed` so drain_ms
+  // can be split: drain_ms - get_chunk_ms_total is the network + receiver
+  // share (and any remaining rpc_service_ scheduling slack).
+  const auto get_chunk_ns_total = std::make_shared<std::atomic<int64_t>>(0);
   const auto object_size = chunk_reader->GetObject().GetObjectSize();
   const std::string dest_node_hex = node_id.Hex();
   const std::string object_id_hex = object_id.Hex();
@@ -567,16 +573,19 @@ void ObjectManager::PushObjectInternal(const ObjectID &object_id,
                     if (chunks_remaining->fetch_sub(1) == 1) {
                       EmitPullEvent(
                           "phase=object_pushed object_id={} bytes={} "
-                          "push_wall_ms={} from_disk={} dest_node={}",
+                          "push_wall_ms={} get_chunk_ms_total={} from_disk={} "
+                          "dest_node={}",
                           object_id_hex,
                           object_size,
                           absl::ToDoubleMilliseconds(absl::Now() - push_start_time),
+                          get_chunk_ns_total->load(std::memory_order_relaxed) / 1e6,
                           from_disk ? 1 : 0,
                           dest_node_hex);
                     }
                   },
                   chunk_reader,
-                  from_disk);
+                  from_disk,
+                  get_chunk_ns_total);
             },
             "ObjectManager.Push");
       });
@@ -590,7 +599,8 @@ void ObjectManager::SendObjectChunk(
     std::shared_ptr<rpc::ObjectManagerClientInterface> rpc_client,
     std::function<void(const Status &)> on_complete,
     std::shared_ptr<ChunkObjectReader> chunk_reader,
-    bool from_disk) {
+    bool from_disk,
+    std::shared_ptr<std::atomic<int64_t>> get_chunk_ns_total) {
   double start_time = absl::GetCurrentTimeNanos() / 1e9;
   rpc::PushRequest push_request;
   // Set request header
@@ -603,8 +613,15 @@ void ObjectManager::SendObjectChunk(
   push_request.set_metadata_size(chunk_reader->GetObject().GetMetadataSize());
   push_request.set_chunk_index(chunk_index);
 
-  // read a chunk into push_request and handle errors.
+  // read a chunk into push_request and handle errors.  Time the call so
+  // PushObjectInternal can attribute disk-read latency (the dominant
+  // component when from_disk=1) inside the otherwise-opaque drain_ms.
+  const int64_t get_chunk_start_ns = absl::GetCurrentTimeNanos();
   auto optional_chunk = chunk_reader->GetChunk(chunk_index);
+  if (get_chunk_ns_total) {
+    get_chunk_ns_total->fetch_add(absl::GetCurrentTimeNanos() - get_chunk_start_ns,
+                                  std::memory_order_relaxed);
+  }
   if (!optional_chunk.has_value()) {
     RAY_LOG(DEBUG) << "Read chunk " << chunk_index << " of object " << object_id
                    << " failed. It may have been evicted.";
