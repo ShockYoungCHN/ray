@@ -364,6 +364,12 @@ def _summarize(per_node: List[Dict[str, Any]]) -> Dict[str, Any]:
                     row["bytes"] = int(ev["bytes"])
                     row["wall_ms"] = float(ev["push_wall_ms"])
                     row["from_disk"] = ev.get("from_disk") == "1"
+                    # get_chunk_ms_total is added in newer raylet builds; old
+                    # logs (or non-from_disk pushes — though we still emit it
+                    # for from_disk=0, it'll just be near-zero) may lack it.
+                    gc = ev.get("get_chunk_ms_total")
+                    if gc is not None:
+                        row["get_chunk_ms"] = float(gc)
                 except (KeyError, ValueError):
                     pass
             elif phase == "push_queued":
@@ -385,9 +391,16 @@ def _summarize(per_node: List[Dict[str, Any]]) -> Dict[str, Any]:
     push_disk_queue_ms: List[float] = []
     push_disk_dispatch_ms: List[float] = []
     push_disk_drain_ms: List[float] = []
+    # get_chunk_ms_total = wall time inside chunk_reader->GetChunk on sender;
+    # for from_disk=1 this is the spill-file read.  network_recv_ms = drain -
+    # get_chunk separates "disk read on sender" from "network + receiver".
+    push_disk_get_chunk_ms: List[float] = []
+    push_disk_network_recv_ms: List[float] = []
     push_plasma_queue_ms: List[float] = []
     push_plasma_dispatch_ms: List[float] = []
     push_plasma_drain_ms: List[float] = []
+    push_plasma_get_chunk_ms: List[float] = []
+    push_plasma_network_recv_ms: List[float] = []
     # Rows that have queue/dispatch but no object_pushed yet — count
     # separately so the orphan ratio is observable. Large orphan share
     # means many pushes never completed (cancelled / node lost / still
@@ -399,6 +412,7 @@ def _summarize(per_node: List[Dict[str, Any]]) -> Dict[str, Any]:
         wall_ms = row.get("wall_ms")
         queue_ms = row.get("queue_ms")
         dispatch_ms = row.get("dispatch_ms")
+        get_chunk_ms = row.get("get_chunk_ms")
         from_disk = row.get("from_disk")
 
         if wall_ms is not None:
@@ -415,6 +429,9 @@ def _summarize(per_node: List[Dict[str, Any]]) -> Dict[str, Any]:
                 if queue_ms is not None and dispatch_ms is not None:
                     drain = wall_ms - queue_ms - dispatch_ms
                     push_disk_drain_ms.append(drain)
+                    if get_chunk_ms is not None:
+                        push_disk_get_chunk_ms.append(get_chunk_ms)
+                        push_disk_network_recv_ms.append(drain - get_chunk_ms)
             else:
                 push_plasma_bytes += b
                 push_plasma_ms += wall_ms
@@ -427,6 +444,9 @@ def _summarize(per_node: List[Dict[str, Any]]) -> Dict[str, Any]:
                 if queue_ms is not None and dispatch_ms is not None:
                     drain = wall_ms - queue_ms - dispatch_ms
                     push_plasma_drain_ms.append(drain)
+                    if get_chunk_ms is not None:
+                        push_plasma_get_chunk_ms.append(get_chunk_ms)
+                        push_plasma_network_recv_ms.append(drain - get_chunk_ms)
         else:
             if queue_ms is not None:
                 queue_orphan_count += 1
@@ -496,6 +516,17 @@ def _summarize(per_node: List[Dict[str, Any]]) -> Dict[str, Any]:
                 "drain_ms_per_object": _summarize_distribution(
                     push_disk_drain_ms
                 ),
+                # Further split drain_ms: get_chunk_ms (disk read on sender,
+                # dominant for from_disk=1) vs network_recv_ms (everything
+                # else: rpc_service slack, gRPC send, network, receiver
+                # plasma admission). Only present when get_chunk_ms_total
+                # was emitted; older raylet builds skip these.
+                "get_chunk_ms_per_object": _summarize_distribution(
+                    push_disk_get_chunk_ms
+                ),
+                "network_recv_ms_per_object": _summarize_distribution(
+                    push_disk_network_recv_ms
+                ),
             },
             "from_plasma": {
                 "object_count": push_plasma_count,
@@ -517,6 +548,12 @@ def _summarize(per_node: List[Dict[str, Any]]) -> Dict[str, Any]:
                 ),
                 "drain_ms_per_object": _summarize_distribution(
                     push_plasma_drain_ms
+                ),
+                "get_chunk_ms_per_object": _summarize_distribution(
+                    push_plasma_get_chunk_ms
+                ),
+                "network_recv_ms_per_object": _summarize_distribution(
+                    push_plasma_network_recv_ms
                 ),
             },
             "from_disk_byte_share": (
