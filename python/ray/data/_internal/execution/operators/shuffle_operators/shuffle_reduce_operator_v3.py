@@ -30,6 +30,8 @@ import typing
 from collections import deque
 from typing import Any, Dict, List, Optional
 
+import ray
+
 from ray.data._internal.execution.interfaces import (
     ExecutionResources,
     PhysicalOperator,
@@ -128,6 +130,9 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
         # Keep the input bundles alive so the handle refs aren't dropped
         # mid-flight; destroyed on shutdown / completion.
         self._handle_input_bundles: List[RefBundle] = []
+        # Single plasma object holding the full handle-ref list, shared by all
+        # reducers (see _dispatch_all_reducers). Kept alive until shutdown.
+        self._shared_handles_ref: Optional[ObjectRef] = None
 
         # -- Reduce task tracking --
         self._shuffle_reduce_tasks: Dict[int, DataOpTask] = {}
@@ -232,6 +237,18 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
             else self.data_context.target_max_block_size
         )
 
+        # Bundle the full handle-ref list into ONE plasma object and pass that
+        # single ref to every reducer, instead of passing all M handle ObjectRefs
+        # inline to each of the P reduce tasks. Passing M nested refs per task
+        # made Ray register/serialize M borrowed refs on every ``.remote()``
+        # (~17ms/task in-situ, ~99% of dispatch -> the P=500 reduce ramp). With a
+        # single top-level ref, Ray auto-dereferences it on the worker back to the
+        # same handle list (the existing ``for h in handles: ray.get(h)`` loop in
+        # ``v3_reduce_task`` is unchanged). Held as a member so the plasma object
+        # outlives dispatch; released in ``_do_shutdown``. The inner map-output
+        # refs stay pinned by ``_handle_input_bundles`` as before.
+        self._shared_handles_ref = ray.put(self._handle_refs)
+
         for partition_id in range(self._num_partitions):
             self._dispatch_one_reducer(partition_id, target_max_block_size)
 
@@ -250,7 +267,7 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
         }
 
         block_gen = v3_reduce_task.options(**reduce_options).remote(
-            self._handle_refs,
+            self._shared_handles_ref,
             partition_id,
             self._reduce_fn,
             self._reduce_prefetch_dir,
@@ -388,6 +405,8 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
             bundle.destroy_if_owned()
         self._handle_input_bundles.clear()
         self._handle_refs.clear()
+        # Drop our hold on the shared handle-list plasma object.
+        self._shared_handles_ref = None
 
     # Stats / progress
     def get_stats(self) -> Dict[str, List[BlockStats]]:

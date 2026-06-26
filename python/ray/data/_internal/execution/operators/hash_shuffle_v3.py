@@ -33,6 +33,7 @@ import struct
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import (
     Any,
     Callable,
@@ -227,6 +228,20 @@ def _recv_u16(sock) -> int:
 
 def _recv_u64(sock) -> int:
     return struct.unpack(">Q", _recvall(sock, 8))[0]
+
+
+def _sendfile_all(sock, in_fd: int, offset: int, count: int) -> None:
+    """Send exactly ``count`` bytes of file ``in_fd`` starting at ``offset``
+    straight to ``sock`` via kernel zero-copy. ``os.sendfile`` may transfer
+    fewer bytes per call (socket buffer pressure), so loop until done. Blocking
+    socket -> a short write means EOF/peer-gone, not EAGAIN."""
+    out_fd = sock.fileno()
+    sent = 0
+    while sent < count:
+        n = os.sendfile(out_fd, in_fd, offset + sent, count - sent)
+        if n == 0:
+            raise ConnectionError("peer closed mid-sendfile")
+        sent += n
 
 
 # ------------------------------------------------------ merge-on-read (§4.12)
@@ -430,6 +445,47 @@ class _FetchHandler(socketserver.StreamRequestHandler):
                 ranges.append((offset, length))
             requests.append((real, ranges))
 
+        # sendfile serve path (zero-copy, no coordinator). Validate every file +
+        # range FIRST so a missing file / bad range still produces an error
+        # status before we commit _STATUS_OK; then os.sendfile each range in
+        # REQUEST order (client maps positionally). SSD random reads are cheap,
+        # so we skip the coordinator's offset-sort.
+        if getattr(srv, "use_sendfile", False):
+            files = []
+            try:
+                for path, ranges in requests:
+                    f = open(path, "rb")
+                    files.append(f)
+                    sz = os.fstat(f.fileno()).st_size
+                    for off, length in ranges:
+                        if off < 0 or length < 0 or off + length > sz:
+                            raise OSError(
+                                f"range {off}+{length} outside {path} (size {sz})"
+                            )
+            except FileNotFoundError as e:
+                for f in files:
+                    f.close()
+                self._send_error(sock, _STATUS_NOT_FOUND, str(e))
+                return
+            except OSError as e:
+                for f in files:
+                    f.close()
+                self._send_error(sock, _STATUS_READ_ERR, str(e))
+                return
+            try:
+                sock.sendall(struct.pack(">B", _STATUS_OK))
+                for (path, ranges), f in zip(requests, files):
+                    fd = f.fileno()
+                    sock.sendall(struct.pack(">I", len(ranges)))
+                    for off, length in ranges:
+                        sock.sendall(struct.pack(">I", length))
+                        _sendfile_all(sock, fd, off, length)
+                        srv.bytes_served += length
+            finally:
+                for f in files:
+                    f.close()
+            return
+
         # Serve: either via the per-node ScanCoordinator (offset-sorted batched
         # reads pooled across reducer connections) or via a direct per-source
         # read. Either way, results come back in REQUEST order so the client
@@ -513,8 +569,14 @@ class ShuffleManager:
         self._server.bytes_served = 0
         # merge-on-read (§4.12): a single per-node coordinator pools fetch
         # requests across connections and serves them in offset order.
+        # Mutually exclusive with sendfile: the coordinator must hold bytes in
+        # memory to fan out across connections, so when sendfile is on we skip
+        # it and serve each range kernel zero-copy from disk.
+        self._server.use_sendfile = _USE_SENDFILE
         self._server.coordinator = (
-            _ScanCoordinator(scan_window_s) if merge_on_read else None
+            _ScanCoordinator(scan_window_s)
+            if (merge_on_read and not _USE_SENDFILE)
+            else None
         )
         self._host, self._port = self._server.server_address
         t = threading.Thread(target=self._server.serve_forever, daemon=True)
@@ -1121,8 +1183,57 @@ def _write_prefetch_file(path: str, bufs: List[bytes]) -> None:
 
 _DEFAULT_MAX_BYTES_PER_FETCH = 256 * 1024 * 1024  # 256 MiB per FETCH frame
 
+# The ShuffleManager serves byte-ranges with os.sendfile (kernel zero-copy
+# file->socket) instead of read()-into-userspace + send(). Disables the
+# merge-on-read coordinator (which must hold bytes in memory to fan out across
+# connections, so it's mutually exclusive with sendfile). Server-side only; the
+# wire protocol and client are unchanged (server stays opaque to the
+# IPC/compression payload, so zero-copy is safe).
+#
+# Default ON: zero-copy serving keeps the manager's serve-side heap ~flat under
+# 256-way incast, which is what makes large (e.g. lz4) shards OOM-safe -- the
+# coordinator path materializes every requested range into userspace bytes per
+# connection and can balloon a node past its memory limit. Opt out with
+# RAY_DATA_SHUFFLE_SENDFILE=0 to fall back to the merge-on-read coordinator.
+_USE_SENDFILE = os.environ.get("RAY_DATA_SHUFFLE_SENDFILE", "1") not in (
+    "0",
+    "false",
+    "False",
+    "",
+)
+
+# Process-global cache of ShuffleManager endpoints: {actor_id_bytes: (ip, port)}.
+# Populated lazily on first fetch to a manager; survives across reduce tasks in
+# a reused worker (max_calls>1), so the per-node ``ray.get(endpoint.remote())``
+# round-trip is paid once per manager per worker, not once per node per task.
+_ENDPOINT_CACHE: Dict[bytes, Tuple[str, int]] = {}
+
 
 _PrefetchMember = Tuple[int, str, List[Tuple[int, int]]]
+
+
+class _PwriteSink:
+    """A minimal write-only file-like that ``os.pwrite``s sequentially from a
+    fixed base offset on a shared fd. Multiple sinks (one per fetch thread) at
+    DISJOINT base regions write the same fd concurrently with no lock --
+    ``pwrite`` is positioned, so it neither uses nor mutates the fd's file
+    offset. Lets ``fetch_into`` stream frames straight to disk (page cache) at
+    a known offset, with no per-node in-RAM buffering."""
+
+    __slots__ = ("_fd", "_pos")
+
+    def __init__(self, fd: int, base_offset: int):
+        self._fd = fd
+        self._pos = base_offset
+
+    def write(self, data) -> int:
+        mv = memoryview(data)
+        total = 0
+        n_total = len(mv)
+        while total < n_total:
+            total += os.pwrite(self._fd, mv[total:], self._pos + total)
+        self._pos += total
+        return total
 
 
 def _prefetch_node_into(
@@ -1143,8 +1254,21 @@ def _prefetch_node_into(
     operator layer can decide what to do.
     """
 
-    def _resolve() -> Tuple[str, int]:
-        return ray.get(manager.endpoint.remote())
+    def _resolve(force: bool = False) -> Tuple[str, int]:
+        # Process-global cache: a manager's (ip, port) is stable for its
+        # lifetime, so this avoids a blocking ``ray.get`` actor round-trip per
+        # node per task. That round-trip also released the task's CPU (Ray frees
+        # the slot during a blocking get), which oversubscribed nodes; caching
+        # removes both costs. ``force`` bypasses + refreshes the entry after a
+        # connect failure (manager may have restarted on a new port).
+        key = manager._actor_id.binary()
+        if not force:
+            ep = _ENDPOINT_CACHE.get(key)
+            if ep is not None:
+                return ep
+        ep = ray.get(manager.endpoint.remote())
+        _ENDPOINT_CACHE[key] = ep
+        return ep
 
     endpoint = _resolve()
     try:
@@ -1152,8 +1276,8 @@ def _prefetch_node_into(
             conn_cm = open_shuffle_connection(endpoint, token)
         except (ConnectionRefusedError, ConnectionResetError, OSError):
             # Manager process may have just restarted on a new port —
-            # re-resolve once and try again.
-            endpoint = _resolve()
+            # re-resolve (bypassing the stale cache) once and try again.
+            endpoint = _resolve(force=True)
             conn_cm = open_shuffle_connection(endpoint, token)
         with conn_cm as conn:
             for batch in _chunk_members_by_bytes(members, max_bytes_per_fetch):
@@ -1196,7 +1320,7 @@ def _chunk_members_by_bytes(
         yield cur
 
 
-@ray.remote(max_calls=1)
+@ray.remote(max_calls=8)
 def v3_reduce_task(
     handles: List[ShuffleHandle],
     partition_id: int,
@@ -1336,15 +1460,35 @@ def v3_reduce_task(
         groups[key][2].append((idx, src_path, src_ranges))
 
     try:
-        # Phase 1: prefetch all shards into one prefetch.bin
-        with open(prefetch_file, "wb") as out_f:
-            for manager, token, members in groups.values():
-                _prefetch_node_into(out_f, manager, token, members, max_bytes_per_fetch)
+        # Phase 1: prefetch all shards into one prefetch.bin, fetching the 32
+        # per-node ShuffleManagers CONCURRENTLY. The per-reducer fetch is round-
+        # trip / serial-contention bound (~23 MB/s over a serial 32-node loop,
+        # far below NIC -- not bandwidth- or server-disk-bound), so overlapping
+        # the node round-trips cuts both median and tail fetch.
+        #
+        # Each frame is [u32 len][shard bytes] and the shard size == the index
+        # range length, so the FULL layout is known up front: give each node a
+        # contiguous region and have its thread os.pwrite frames at its base
+        # offset. Disjoint offsets => lock-free concurrent writes to one fd, and
+        # NO in-RAM buffering (a BytesIO version OOM'd holding ~a partition in
+        # heap). buffered pwrite lands in page cache, so phase 2's mmap reads
+        # hit cache; no fsync (local scratch, consumed immediately then deleted).
+        _fetch_threads = int(os.environ.get("RAY_DATA_SHUFFLE_FETCH_THREADS", "32"))
+        group_list = list(groups.values())
+        node_sizes = [
+            sum(4 + length for (_i, _p, rngs) in members for (_o, length) in rngs)
+            for (_mgr, _tok, members) in group_list
+        ]
+        base_offsets = []
+        _acc = 0
+        for _sz in node_sizes:
+            base_offsets.append(_acc)
+            _acc += _sz
+        total_size = _acc
 
-        # Phase 2: walk prefetch.bin, drive reduce_fn streamingly
-        # Reshape buffer (created lazily on first flush) and the running
-        # accumulator. Memory peak is bounded by `target_max_block_size`
-        # in streaming mode.
+        # Reshape buffer (created lazily on first flush) + running accumulator;
+        # peak is bounded by target_max_block_size in streaming mode. Defined
+        # before the fetch loop because we now decode WHILE fetching (below).
         accum_tables: List[pa.Table] = []
         accum_bytes: int = 0
         output_buffer: Optional[BlockOutputBuffer] = None
@@ -1368,47 +1512,104 @@ def v3_reduce_task(
                     while output_buffer.has_next():
                         yield from _emit(output_buffer.next())
 
-        mmf = pa.memory_map(prefetch_file, "r")
+        # PIPELINED fetch+decode. The old design fetched ALL shards into
+        # prefetch.bin behind a barrier, THEN decoded (task wall = fetch_s +
+        # reduce_s, serial). Fetch is network-bound -- and on burstable
+        # instances (m5.2xlarge: ~2.5 Gbps baseline) ENA-bandwidth-throttled, so
+        # its floor is fixed. Decode/reduce/write is CPU (Arrow C++, which
+        # releases the GIL) and far faster than the throttled network. So we
+        # decode each per-node region the instant its fetch future completes:
+        # the fetch threads produce, this generator thread consumes. Task wall
+        # collapses toward max(fetch, decode) instead of their sum, and peak
+        # memory drops (regions drain as they arrive instead of the whole
+        # compressed file sitting co-resident with the decode working set).
+        # Decode runs in completion order -- fine, hash-shuffle reduce is
+        # input-order-agnostic.
+        fd = os.open(prefetch_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        mmf = None
         try:
-            file_size = mmf.size()
-            while mmf.tell() < file_size:
-                length = struct.unpack(">I", bytes(mmf.read(4)))[0]
-                # Zero-copy view into mmap for uncompressed IPC; the decoder
-                # copies into fresh buffers for compressed IPC.
-                ipc_buf = mmf.read(length)
-                table = _read_ipc(ipc_buf)
-                accum_tables.append(table)
-                accum_bytes += table.nbytes
+            if total_size > 0:
+                try:
+                    os.posix_fallocate(fd, 0, total_size)
+                except (AttributeError, OSError):
+                    os.ftruncate(fd, total_size)
+                # Read-only mmap over the fallocated file. A region is only read
+                # after its fetch future completes (happens-before), so reads see
+                # fully-written bytes even while other threads pwrite disjoint
+                # regions concurrently (page-cache coherent on Linux).
+                mmf = pa.memory_map(prefetch_file, "r")
 
-                if (
-                    streaming
-                    and target_max_block_size is not None
-                    and accum_bytes >= target_max_block_size
-                ):
-                    # Detach the accumulated batch and run it through
-                    # reduce_fn before draining. Yields any blocks the
-                    # reshape buffer can emit.
-                    tables, accum_tables = accum_tables, []
-                    accum_bytes = 0
-                    yield from _flush(tables)
+            def _fetch_one(args):
+                base, size, (manager, token, members) = args
+                _prefetch_node_into(
+                    _PwriteSink(fd, base), manager, token, members, max_bytes_per_fetch
+                )
+                return base, size
 
-            # Drain any remaining accumulated shards
-            # In blocking mode this is the ONLY reduce_fn call;
-            # in streaming mode it's the tail.
+            n_threads = min(len(group_list), max(1, _fetch_threads))
+            work = list(zip(base_offsets, node_sizes, group_list))
+            # Rotate the per-reducer manager order by partition_id. When
+            # n_threads < #managers (bounded fan-in to mitigate TCP incast at the
+            # reducer's receive port), every reducer otherwise hits the SAME
+            # first n_threads managers simultaneously -- that just relocates the
+            # 256-way incast hotspot onto those managers. Rotating the start
+            # index by partition_id spreads the simultaneous fan-in across all 32
+            # managers. base_offset stays paired with its group (the on-disk
+            # prefetch layout is unchanged); only submission/execution order
+            # rotates. No-op at n_threads >= #managers (all launch at once).
+            if work:
+                _rot = partition_id % len(work)
+                work = work[_rot:] + work[:_rot]
+
+            def _decode_region(base: int, size: int):
+                """Walk frames in [base, base+size), accumulate, and drive the
+                streaming reduce. Yields output blocks."""
+                nonlocal accum_tables, accum_bytes
+                pos = base
+                end = base + size
+                while pos < end:
+                    mmf.seek(pos)
+                    length = struct.unpack(">I", bytes(mmf.read(4)))[0]
+                    # Zero-copy view into mmap for uncompressed IPC; the decoder
+                    # copies into fresh buffers for compressed IPC.
+                    ipc_buf = mmf.read(length)
+                    pos += 4 + length
+                    table = _read_ipc(ipc_buf)
+                    accum_tables.append(table)
+                    accum_bytes += table.nbytes
+                    if (
+                        streaming
+                        and target_max_block_size is not None
+                        and accum_bytes >= target_max_block_size
+                    ):
+                        tables, accum_tables = accum_tables, []
+                        accum_bytes = 0
+                        yield from _flush(tables)
+
+            with ThreadPoolExecutor(max_workers=n_threads) as ex:
+                futs = [ex.submit(_fetch_one, w) for w in work]
+                for fut in as_completed(futs):
+                    base, size = fut.result()
+                    if mmf is not None and size > 0:
+                        yield from _decode_region(base, size)
+
+            # Drain remaining accumulated shards (the only reduce_fn call in
+            # blocking mode; the tail in streaming mode).
             if accum_tables:
                 yield from _flush(accum_tables)
                 accum_tables = []
-
             # Finalize the reshape buffer: emit any partial trailing block.
             if output_buffer is not None:
                 output_buffer.finalize()
                 while output_buffer.has_next():
                     yield from _emit(output_buffer.next())
         finally:
-            try:
-                mmf.close()
-            except Exception:
-                pass
+            if mmf is not None:
+                try:
+                    mmf.close()
+                except Exception:
+                    pass
+            os.close(fd)
     finally:
         # One file, one unlink. Idempotent on partial-failure paths.
         try:
