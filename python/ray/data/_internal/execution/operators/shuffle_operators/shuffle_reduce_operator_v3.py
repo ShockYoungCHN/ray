@@ -367,12 +367,23 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
         return list(self._shuffle_reduce_tasks.values())
 
     def throttling_disabled(self) -> bool:
-        # Opt out of the ResourceManager's reservation while we're waiting
-        # for upstream map tasks to close. Until all map handles are in,
-        # this op submits zero tasks — no point reserving CPU for it.
-        # Once _dispatch_all_reducers fires (in all_inputs_done) we become
-        # eligible normally and the allocator reserves our share.
-        return not self._reducers_dispatched
+        # Opt out of the ResourceManager reservation UNCONDITIONALLY. Two effects:
+        #   (1) while the map phase runs, reduce (not yet active) stops reserving
+        #       a budget slice, so map reaches full CPU concurrency sooner;
+        #   (2) once reduce is running it isn't admission-throttled either, so all
+        #       partitions run at full concurrency.
+        # Reduce is the terminal op (Write is fused in), so there's nothing
+        # downstream to reserve for. This intentionally supersedes the earlier
+        # ``return not self._reducers_dispatched`` (which only opted out while
+        # waiting for map) to also un-throttle reduce execution itself.
+        #
+        # TODO(shuffle_v3): this removes the memory safety valve during reduce --
+        # reduce tasks request only num_cpus (no memory estimate), so throttling
+        # was the only backpressure. Unbounded reduce has OOM'd at 512GB before.
+        # Validate against OOM and gate this properly (e.g. revert to opting out
+        # only while waiting for map, and/or attach a real per-task memory
+        # estimate so the ResourceManager can back-pressure instead).
+        return True
 
     def has_execution_finished(self) -> bool:
         if self._shuffle_reduce_tasks or self._output_queue:
