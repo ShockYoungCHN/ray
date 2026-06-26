@@ -118,6 +118,14 @@ class ShuffleMapOpV3(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBa
     # working set; for normal sizes the dynamic ``_POOL_GROWTH × input``
     # formula always exceeds this.
     _MIN_POOL_BYTES = 4 * 1024 * 1024  # 4 MiB
+    # Default = UNBOUNDED pool: accumulate every partition fully and encode it
+    # ONCE at end-of-task (exactly like the v2 path in shuffle_tasks.py, which
+    # has no pool and doesn't OOM — it bounds memory via the per-task `memory`
+    # resource request instead). A small pool spills each partition in tiny
+    # increments -> tens of thousands of ~17KB zstd encodes -> the map becomes
+    # encode-bound. The pool is now opt-IN (pass `pool_budget_bytes=`) only when
+    # a hard per-task memory clamp is actually needed.
+    _UNBOUNDED_POOL_BYTES = 1 << 62
     # Multiplier on the per-task input size when sizing the partition pool.
     # 2× gives headroom over the naive "output ≈ input" identity (chunked
     # output, compression overhead pre-encode, partition skew). Higher
@@ -293,26 +301,27 @@ class ShuffleMapOpV3(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBa
 
         estimated_bytes = sum((m.size_bytes or 0) for m in input_bundle.metadata)
 
-        # Per-task pool budget: explicit override wins, otherwise dynamic
-        # ``max(_MIN_POOL_BYTES, _POOL_GROWTH × estimated_bytes)``. A
-        # 2× growth factor sized to the known input avoids the fixed-pool
-        # pathology where small inputs over-allocate and large inputs spill
-        # ``input / pool`` times mid-task; see class-level constants.
+        # Per-task pool budget: explicit override wins; otherwise UNBOUNDED
+        # (accumulate every partition fully, encode once at end-of-task — the
+        # v2 behavior). The old dynamic ``max(4MB, 2×estimated_bytes)`` formula
+        # collapsed to the 4MB floor for fused-read maps (estimated_bytes≈0,
+        # since the input bundle is ListFiles metadata, not the data read
+        # inside the task) → ~17KB shards → ~46k tiny zstd encodes → map became
+        # encode-bound (80s/task). Default to no mid-task flushing.
         if self._pool_budget_override is not None:
             pool_budget_bytes = self._pool_budget_override
         else:
-            pool_budget_bytes = max(
-                self._MIN_POOL_BYTES,
-                self._POOL_GROWTH * estimated_bytes,
-            )
+            pool_budget_bytes = self._UNBOUNDED_POOL_BYTES
 
-        # Memory ask = input block resident in worker heap + transient
-        # partition output held in the pool. ``v3_map_task`` enforces the
-        # pool cap internally, so this is a tight upper bound (not a 2×
-        # guess like before).
+        # Memory ask: peak working set ≈ input resident + full partition output
+        # ≈ 2× input (the v2 SHUFFLE_PEAK_MEMORY_MULTIPLIER). Sized from the
+        # input estimate, NOT the pool budget (the default pool is unbounded;
+        # adding it would request 2^62 bytes and never schedule). When
+        # estimated_bytes is 0 (fused read: input bundle is ListFiles metadata),
+        # no memory ask is made and Ray packs by CPU — same as v2 in that case.
         resources: Dict[str, Any] = {"num_cpus": self._map_num_cpus}
         if estimated_bytes > 0:
-            resources["memory"] = estimated_bytes + pool_budget_bytes
+            resources["memory"] = estimated_bytes * 2
 
         ray_options: Dict[str, Any] = dict(resources)
         if target_node_id is not None:
