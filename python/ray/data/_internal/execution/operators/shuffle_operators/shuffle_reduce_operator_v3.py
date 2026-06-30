@@ -195,6 +195,7 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
             reduce_fn=self._reduce_fn,
             streaming_reduce=self._streaming_reduce,
             disallow_block_splitting=self._disallow_block_splitting,
+            coalesce_output=self._coalesce_output,
             max_bytes_per_fetch=self._max_bytes_per_fetch,
             reduce_prefetch_dir=self._reduce_prefetch_dir,
             reduce_cpus=self._reduce_num_cpus,
