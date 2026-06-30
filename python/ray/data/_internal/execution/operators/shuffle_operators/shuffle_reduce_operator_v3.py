@@ -79,7 +79,6 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
         num_partitions: int,
         reduce_fn: ReduceFn,
         streaming_reduce: bool = True,
-        disallow_block_splitting: bool = False,
         coalesce_output: bool = False,
         max_bytes_per_fetch: int = _DEFAULT_MAX_BYTES_PER_FETCH,
         reduce_prefetch_dir: Optional[str] = None,
@@ -112,12 +111,8 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
         self._downstream_map_task_kwargs: Dict[str, Any] = (
             downstream_map_task_kwargs or {}
         )
-        # Disallow-block-split forces blocking mode because we must hand the
-        # entire partition to ``reduce_fn`` before emitting any output (e.g.
-        # global sort can't stream-flush).
-        self._disallow_block_splitting: bool = disallow_block_splitting
         self._coalesce_output: bool = coalesce_output
-        self._streaming_reduce: bool = streaming_reduce and not disallow_block_splitting
+        self._streaming_reduce: bool = streaming_reduce
         self._max_bytes_per_fetch: int = max_bytes_per_fetch
         self._reduce_prefetch_dir: Optional[str] = reduce_prefetch_dir
         self._reduce_num_cpus: float = (
@@ -194,7 +189,6 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
             num_partitions=self._num_partitions,
             reduce_fn=self._reduce_fn,
             streaming_reduce=self._streaming_reduce,
-            disallow_block_splitting=self._disallow_block_splitting,
             coalesce_output=self._coalesce_output,
             max_bytes_per_fetch=self._max_bytes_per_fetch,
             reduce_prefetch_dir=self._reduce_prefetch_dir,
@@ -234,11 +228,7 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
             # No mapper produced any handle, thus nothing to reduce.
             return
 
-        target_max_block_size = (
-            None
-            if self._disallow_block_splitting
-            else self.data_context.target_max_block_size
-        )
+        target_max_block_size = self.data_context.target_max_block_size
 
         # Bundle the full handle-ref list into ONE plasma object and pass that
         # single ref to every reducer, instead of passing all M handle ObjectRefs

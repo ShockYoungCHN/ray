@@ -124,9 +124,8 @@ def _plan_hash_shuffle_repartition_v3(
     ``logical_op.sort=True`` produces a **per-partition local sort** by the
     hash keys (mirrors v2's ``Repartition(sort=True)`` semantics). The
     reduce_fn must see all of a partition's shards before it can sort, so
-    we set ``streaming_reduce=False`` and ``disallow_block_splitting=True``
-    on the reduce op for this case — same as v2. ``sort=True`` without
-    keys is rejected (nothing to sort by).
+    we set ``streaming_reduce=False`` on the reduce op for this case.
+    ``sort=True`` without keys is rejected (nothing to sort by).
     """
     from ray.data._internal.arrow_ops.transform_pyarrow import hash_partition
     from ray.data._internal.execution.operators.hash_shuffle_v2 import (
@@ -165,11 +164,9 @@ def _plan_hash_shuffle_repartition_v3(
     if logical_op.sort:
         reduce_fn = _sort_reduce(list(key_cols))
         streaming_reduce = False
-        disallow_block_splitting = True
     else:
         reduce_fn = concat_reduce
         streaming_reduce = True
-        disallow_block_splitting = False
     # Honor the repartition(N) -> exactly N blocks contract by coalescing all
     # reduce_fn outputs into a single block per partition. Independent of the
     # input-side streaming flag.
@@ -196,7 +193,6 @@ def _plan_hash_shuffle_repartition_v3(
         num_partitions=num_partitions,
         reduce_fn=reduce_fn,
         streaming_reduce=streaming_reduce,
-        disallow_block_splitting=disallow_block_splitting,
         coalesce_output=coalesce_output,
     )
     return reduce_op
