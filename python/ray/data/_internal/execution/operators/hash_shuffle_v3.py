@@ -1020,6 +1020,10 @@ def v3_map_task(
     staging: Dict[int, List[pa.Table]] = {}
     staging_bytes: Dict[int, int] = {}
     peak_inflight = 0  # max bytes of partition output held at once (excludes input)
+    # Decoded (pre-compression, in-heap pa.Table) bytes per partition; surfaced
+    # in the returned handle and consumed by ShuffleReduceOpV3 to size each
+    # reducer's memory ask (mirrors v2's _partition_bytes path).
+    decoded_bytes_per_partition: Dict[int, int] = {}
 
     def _partition_units(blk):
         """Yield (pid, shard).
@@ -1049,6 +1053,12 @@ def v3_map_task(
                 if not shards:
                     return
                 tbl = pa.concat_tables(shards) if len(shards) > 1 else shards[0]
+                # ``tbl.nbytes`` is the decoded (pre-IPC, pre-compression) byte
+                # count of this shard -- same source v2 uses (shuffle_tasks.py's
+                # ``merged.nbytes``). This is what the reducer holds in heap.
+                decoded_bytes_per_partition[pid] = (
+                    decoded_bytes_per_partition.get(pid, 0) + tbl.nbytes
+                )
 
                 buf = _ipc_buffer(tbl, compression=compression)
                 off = f.tell()
@@ -1171,6 +1181,11 @@ def v3_map_task(
         # operator-level decisions (e.g. skip same-node mmap zero-copy path
         # when bytes are compressed and decode will copy anyway).
         "compression": compression,
+        # Per-partition decoded (pa.Table.nbytes, pre-IPC/compression) byte
+        # totals. ShuffleReduceOpV3 sums these across mappers to size each
+        # reducer's memory ask. Same physical quantity as v2's
+        # ``_partition_bytes`` (from ``shuffle_tasks.py``'s ``merged.nbytes``).
+        "decoded_bytes": decoded_bytes_per_partition,
     }
 
 

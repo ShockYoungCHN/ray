@@ -28,8 +28,10 @@ import logging
 import secrets
 import tempfile
 import typing
+from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
+import ray
 from ray.data._internal.execution.bundle_queue import (
     BaseBundleQueue,
     FIFOBundleQueue,
@@ -218,6 +220,11 @@ class ShuffleMapOpV3(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBa
         self._total_input_rows: int = 0
         self._total_input_bytes: int = 0
         self._map_blocks_stats: List[BlockStats] = []
+        # Per-partition decoded (pa.Table.nbytes, pre-compression) byte total,
+        # summed across all completed mappers. Sized for the reducer's
+        # per-task memory ask, mirroring v2's _partition_bytes path
+        # (shuffle_map_operator.py:134/303 + get_partition_bytes()).
+        self._partition_decoded_bytes: Dict[int, int] = defaultdict(int)
 
         # -- Sub-progress bar --
         self._map_bar: Optional["BaseProgressBar"] = None
@@ -398,6 +405,18 @@ class ShuffleMapOpV3(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBa
         assert requested is not None
         self._map_resource_usage = self._map_resource_usage.subtract(requested)
 
+        # Fold this mapper's per-partition decoded bytes into the op-level
+        # accumulator that ShuffleReduceOpV3 reads via ``get_partition_bytes``.
+        # The handle is local plasma here (the task just completed), so
+        # ``ray.get`` is a μs-level local read; best-effort, never break the
+        # pipeline if the field is absent (older mappers won't carry it).
+        try:
+            handle = ray.get(handle_ref)
+            for pid, nbytes in (handle.get("decoded_bytes") or {}).items():
+                self._partition_decoded_bytes[pid] += nbytes
+        except Exception:
+            pass
+
         # OpRuntimeMetrics.on_task_output_generated asserts every output block
         # carries exec_stats with wall_time_s AND block_ser_time_s set. The
         # handle isn't a real computed block, so we attach a minimal,
@@ -470,6 +489,15 @@ class ShuffleMapOpV3(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBa
 
     def get_active_tasks(self) -> List[OpTask]:
         return list(self._shuffle_map_tasks.values())
+
+    def get_partition_bytes(self) -> Dict[int, int]:
+        """Per-partition decoded byte totals summed across completed mappers.
+
+        Consumed by ``ShuffleReduceOpV3`` to size each reducer's memory ask.
+        Mirrors ``ShuffleMapOp.get_partition_bytes`` (v2). Returns a snapshot
+        copy; the underlying counter keeps growing as more mappers finish.
+        """
+        return dict(self._partition_decoded_bytes)
 
     def has_execution_finished(self) -> bool:
         if self._shuffle_map_tasks or self._output_queue.has_next():

@@ -47,6 +47,9 @@ from ray.data._internal.execution.operators.hash_shuffle_v3 import (
     ReduceFn,
     v3_reduce_task,
 )
+from ray.data._internal.execution.operators.shuffle_operators.shuffle_tasks import (
+    SHUFFLE_PEAK_MEMORY_MULTIPLIER,
+)
 from ray.data._internal.execution.operators.shuffle_operators.shuffle_map_operator_v3 import (  # noqa: E501
     ShuffleMapOpV3,
 )
@@ -248,11 +251,21 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
     def _dispatch_one_reducer(
         self, partition_id: int, target_max_block_size: Optional[int]
     ) -> None:
-        # Memory hint: 2× expected partition size if we had it; for MVP we
-        # leave it unset and let Ray's defaults apply. ``v3_reduce_task``
-        # already streams the fetch + decode, so per-task heap pressure is
-        # bounded by target_max_block_size in streaming mode.
+        # Per-partition memory ask: 2× the decoded byte total this reducer
+        # will see (bounds peak heap from accum + reshape carry). Same source
+        # as v2's path -- see ShuffleMapOpV3.get_partition_bytes / the
+        # mapper task's ``decoded_bytes`` field. If the upstream hasn't
+        # populated bytes yet (e.g. retry on a partition with no bytes
+        # recorded), fall back to leaving the hint unset so Ray's defaults
+        # apply.
+        upstream = self.input_dependencies[0]
+        assert isinstance(upstream, ShuffleMapOpV3)
+        estimated_bytes = upstream.get_partition_bytes().get(partition_id, 0)
         reduce_resources: Dict[str, Any] = {"num_cpus": self._reduce_num_cpus}
+        if estimated_bytes > 0:
+            reduce_resources["memory"] = int(
+                estimated_bytes * SHUFFLE_PEAK_MEMORY_MULTIPLIER
+            )
         reduce_options: Dict[str, Any] = {
             **reduce_resources,
             "scheduling_strategy": "SPREAD",
@@ -432,10 +445,24 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
         return usage
 
     def incremental_resource_usage(self) -> ExecutionResources:
-        # MVP: leave memory hint at 0 (target_max_block_size bounds peak
-        # reducer heap in streaming mode). A future iteration can derive
-        # per-partition byte estimates from the upstream handles.
-        return ExecutionResources(cpu=self._reduce_num_cpus, memory=0)
+        """Per-task resource ask for the framework's budget allocator.
+
+        Uses the upstream mapper op's per-partition decoded byte totals
+        (same source v2 uses, see shuffle_reduce_operator.py:311-324).
+        The avg-over-partitions estimate matches v2's policy: it's a
+        typical-case admission hint; per-task ``.options(memory=...)``
+        in ``_dispatch_one_reducer`` uses the *exact* per-partition bytes
+        so skewed partitions are sized correctly at Ray-core level.
+        """
+        upstream = self.input_dependencies[0]
+        assert isinstance(upstream, ShuffleMapOpV3)
+        partition_bytes = upstream.get_partition_bytes()
+        memory = 0
+        sizes = [b for b in partition_bytes.values() if b > 0]
+        if sizes:
+            avg_bytes = sum(sizes) / len(sizes)
+            memory = int(avg_bytes * SHUFFLE_PEAK_MEMORY_MULTIPLIER)
+        return ExecutionResources(cpu=self._reduce_num_cpus, memory=memory)
 
     def min_scheduling_resources(self) -> ExecutionResources:
         return self.incremental_resource_usage()
