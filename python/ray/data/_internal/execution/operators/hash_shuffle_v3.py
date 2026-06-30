@@ -244,6 +244,28 @@ def _sendfile_all(sock, in_fd: int, offset: int, count: int) -> None:
         sent += n
 
 
+# Linux-only; macOS lacks POSIX_FADV_DONTNEED. Probed once at import time so
+# the hot path is a constant-time attribute check, not a try/except per range.
+_HAS_FADV_DONTNEED = hasattr(os, "posix_fadvise") and hasattr(
+    os, "POSIX_FADV_DONTNEED"
+)
+
+
+def _drop_pagecache(fd: int, offset: int, length: int) -> None:
+    """Hint the kernel to drop ``[offset, offset+length)`` of ``fd`` from the
+    page cache. Called after sendfile to keep the server's page-cache footprint
+    bounded to in-flight bytes -- otherwise served file regions sit hot in
+    cache and contend with the reducer's ``prefetch.bin`` on the same node.
+    Best-effort: any failure is silently ignored (the file is read-only, so
+    the worst case is the kernel keeps the pages a bit longer)."""
+    if not _HAS_FADV_DONTNEED or length <= 0:
+        return
+    try:
+        os.posix_fadvise(fd, offset, length, os.POSIX_FADV_DONTNEED)
+    except OSError:
+        pass
+
+
 # ------------------------------------------------------ merge-on-read (§4.12)
 class _ScanReq:
     """One reducer's range request, parked while the coordinator pools it with
@@ -480,6 +502,13 @@ class _FetchHandler(socketserver.StreamRequestHandler):
                     for off, length in ranges:
                         sock.sendall(struct.pack(">I", length))
                         _sendfile_all(sock, fd, off, length)
+                        # Drop these pages from the page cache: hash-shuffle
+                        # ranges are typically read once per reducer, and same-
+                        # node reducers concurrently pwrite their own
+                        # ``prefetch.bin`` -- without this hint the just-served
+                        # (hot in LRU) ranges would evict the reducer's
+                        # incoming data. See _drop_pagecache.
+                        _drop_pagecache(fd, off, length)
                         srv.bytes_served += length
             finally:
                 for f in files:
