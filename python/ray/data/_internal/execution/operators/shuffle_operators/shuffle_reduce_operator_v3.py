@@ -80,6 +80,7 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
         reduce_fn: ReduceFn,
         streaming_reduce: bool = True,
         disallow_block_splitting: bool = False,
+        coalesce_output: bool = False,
         max_bytes_per_fetch: int = _DEFAULT_MAX_BYTES_PER_FETCH,
         reduce_prefetch_dir: Optional[str] = None,
         reduce_cpus: Optional[float] = None,
@@ -115,6 +116,7 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
         # entire partition to ``reduce_fn`` before emitting any output (e.g.
         # global sort can't stream-flush).
         self._disallow_block_splitting: bool = disallow_block_splitting
+        self._coalesce_output: bool = coalesce_output
         self._streaming_reduce: bool = streaming_reduce and not disallow_block_splitting
         self._max_bytes_per_fetch: int = max_bytes_per_fetch
         self._reduce_prefetch_dir: Optional[str] = reduce_prefetch_dir
@@ -277,6 +279,7 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
             self._downstream_map_transformer,
             self.name,
             self._downstream_map_task_kwargs,
+            self._coalesce_output,
         )
 
         data_task = DataOpTask(

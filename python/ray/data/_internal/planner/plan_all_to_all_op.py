@@ -170,6 +170,10 @@ def _plan_hash_shuffle_repartition_v3(
         reduce_fn = concat_reduce
         streaming_reduce = True
         disallow_block_splitting = False
+    # Honor the repartition(N) -> exactly N blocks contract by coalescing all
+    # reduce_fn outputs into a single block per partition. Independent of the
+    # input-side streaming flag.
+    coalesce_output = True
 
     # Compression: reuse the same DataContext field v2 uses
     # (hash_shuffle_compression). Both v2 and v3 are hash shuffles; the
@@ -193,6 +197,7 @@ def _plan_hash_shuffle_repartition_v3(
         reduce_fn=reduce_fn,
         streaming_reduce=streaming_reduce,
         disallow_block_splitting=disallow_block_splitting,
+        coalesce_output=coalesce_output,
     )
     return reduce_op
 

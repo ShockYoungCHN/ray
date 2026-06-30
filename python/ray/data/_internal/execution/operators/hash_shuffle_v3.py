@@ -1361,14 +1361,21 @@ def v3_reduce_task(
     downstream_map_transformer: Optional[Any] = None,
     reduce_op_name: str = "ShuffleReduceV3",
     downstream_map_task_kwargs: Optional[Dict[str, Any]] = None,
+    coalesce_output: bool = False,
 ) -> Generator[Union[Block, bytes], None, None]:
-    """Fetch one partition's shards, decode mmap'd prefetch file, stream
-    ``reduce_fn`` output as (block, pickled metadata) pairs.
+    """Fetch one partition's shards and stream ``reduce_fn`` output as
+    (block, pickled metadata) pairs. Bytes stay out of plasma (§4.6).
 
-    Phase 1 (single-threaded): per ShuffleManager node one keep-alive TCP
-    connection; one or more multi-source FETCHes bounded by
-    ``max_bytes_per_fetch``; all responses appended into one ``prefetch.bin``.
-    Phase 2: mmap that file and walk shards. Bytes stay out of Plasma (§4.6).
+    Pipelined fetch + decode (not two-phase). One thread pool (size
+    ``RAY_DATA_SHUFFLE_FETCH_THREADS``, default 32) opens one keep-alive
+    TCP connection per ShuffleManager and lock-free ``os.pwrite``s every
+    response frame into its pre-assigned region of ``prefetch.bin``. This
+    generator consumes ``as_completed`` futures: the instant a node's
+    region lands, its shards are mmap-decoded and fed into the streaming
+    accumulator. Fetch (network-bound) and decode (Arrow C++, GIL-free)
+    overlap, so task wall collapses toward ``max(fetch, decode)`` instead
+    of their sum. Decode arrives in completion order — fine, reduce is
+    input-order-agnostic.
 
     Streaming-generator protocol matches v2's ``_shuffle_reduce_task``:
         yield Block
@@ -1376,14 +1383,23 @@ def v3_reduce_task(
     So the operator wraps this in a ``DataOpTask`` and feeds each pair into
     its output queue with proper backpressure.
 
-    ``streaming=True``: flush incrementally — ``reduce_fn`` is invoked each
-    time accumulated input crosses ``target_max_block_size``. Bounds peak
-    accumulator memory but requires ``reduce_fn`` to produce valid output
-    from partial input (concat is fine; global sort/aggregate is NOT).
-    ``streaming=False``: accumulate everything then call ``reduce_fn`` once.
+    Reduce modes:
+    - ``streaming=True``: ``reduce_fn`` is invoked each time the accumulator
+      crosses ``target_max_block_size``. Bounds peak accumulator memory but
+      requires ``reduce_fn`` to produce valid output from partial input
+      (concat is fine; global sort/aggregate is NOT).
+    - ``streaming=False``: accumulate everything, call ``reduce_fn`` once at
+      end of task.
 
-    ``target_max_block_size=None`` skips reshape entirely — every block
-    ``reduce_fn`` produces is emitted as-is (partition = block contract).
+    Output shaping (mutually exclusive):
+    - Default (``coalesce_output=False``): a ``BlockOutputBuffer`` reshapes
+      ``reduce_fn`` output to ``target_max_block_size``-sized chunks; one
+      partition may emit multiple blocks. ``target_max_block_size=None``
+      bypasses reshape and emits blocks exactly as ``reduce_fn`` yields.
+    - ``coalesce_output=True``: every ``reduce_fn`` chunk is held in an
+      ``_OutputBlockCoalescer`` and concatenated into ONE block at end of
+      task. Honors the public "N partitions → N blocks" contract for
+      ``repartition`` / ``sort``; peak heap ≈ partition size.
 
     Args:
         prefetch_dir: optional staging directory. Unset → per-task tempdir.
@@ -1391,7 +1407,7 @@ def v3_reduce_task(
             response buffer); big partitions split across multiple FETCHes
             on the same connection. Default 256 MiB.
         target_max_block_size: output reshape target; also the streaming
-            flush threshold.
+            flush threshold. ``None`` disables reshape.
         streaming: incremental flush vs accumulate-then-reduce.
         downstream_map_transformer: when set, OperatorFusionRule has
             absorbed a downstream MapOperator (typically Write) into this
@@ -1400,6 +1416,10 @@ def v3_reduce_task(
         reduce_op_name: the live op name (possibly fused, e.g.
             "ShuffleReduceV3->Write") used to label the TaskContext we
             construct around downstream_map_transformer.
+        downstream_map_task_kwargs: kwargs threaded into the TaskContext
+            for the fused downstream map (e.g. Write target path).
+        coalesce_output: see "Output shaping" above. Enabled by the planner
+            for ops with an N-block contract (repartition, sort).
     """
     start_time_s = time.perf_counter()
 
@@ -1522,9 +1542,30 @@ def v3_reduce_task(
         accum_bytes: int = 0
         output_buffer: Optional[BlockOutputBuffer] = None
 
+        class _OutputBlockCoalescer:
+            def __init__(self):
+                self._blocks = []
+
+            def add(self, block):
+                if block.num_rows > 0:
+                    self._blocks.append(block)
+
+            def finalize(self):
+                if not self._blocks:
+                    return None
+                if len(self._blocks) == 1:
+                    return self._blocks[0]
+                return pa.concat_tables(self._blocks)
+
+        coalescer = _OutputBlockCoalescer() if coalesce_output else None
+
         def _flush(tables: List[pa.Table]):
             """Call reduce_fn on `tables` and yield reshaped output."""
             nonlocal output_buffer
+            if coalescer is not None:
+                for block in reduce_fn(partition_id, tables):
+                    coalescer.add(block)
+                return
             if output_buffer is None and target_max_block_size is not None:
                 output_buffer = BlockOutputBuffer(
                     OutputBlockSizeOption.of(
@@ -1634,8 +1675,12 @@ def v3_reduce_task(
             if accum_tables:
                 yield from _flush(accum_tables)
                 accum_tables = []
-            # Finalize the reshape buffer: emit any partial trailing block.
-            if output_buffer is not None:
+            if coalescer is not None:
+                final_block = coalescer.finalize()
+                if final_block is not None:
+                    yield from _emit(final_block)
+            elif output_buffer is not None:
+                # Finalize the reshape buffer: emit any partial trailing block.
                 output_buffer.finalize()
                 while output_buffer.has_next():
                     yield from _emit(output_buffer.next())
