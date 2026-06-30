@@ -1559,14 +1559,21 @@ def v3_reduce_task(
         try:
             if total_size > 0:
                 try:
+                    # posix_fallocate only works for linux (not on mac or windows)
                     os.posix_fallocate(fd, 0, total_size)
                 except (AttributeError, OSError):
                     os.ftruncate(fd, total_size)
-                # Read-only mmap over the fallocated file. A region is only read
-                # after its fetch future completes (happens-before), so reads see
-                # fully-written bytes even while other threads pwrite disjoint
-                # regions concurrently (page-cache coherent on Linux).
-                mmf = pa.memory_map(prefetch_file, "r")
+                # NOTE: must be opened in "r+" (read+write) mode, not "r".
+                # ``pa.memory_map(path, "r")`` uses MAP_PRIVATE semantics, and on
+                # macOS that means the mapping caches the file's initial (zero)
+                # content at open time and does not pick up concurrent pwrite()
+                # updates through other fds -- the decoder would walk a region
+                # of zeros and fail with "Tried reading schema message, was
+                # null or length 0". "r+" forces MAP_SHARED, which is page-cache
+                # coherent with pwrite() through the writer fd on both Linux
+                # and macOS. We never actually write through ``mmf``; the
+                # writable mode is only chosen for its mapping semantics.
+                mmf = pa.memory_map(prefetch_file, "r+")
 
             def _fetch_one(args):
                 base, size, (manager, token, members) = args
