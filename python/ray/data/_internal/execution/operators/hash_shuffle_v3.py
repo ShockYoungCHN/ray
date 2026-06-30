@@ -1024,6 +1024,12 @@ def v3_map_task(
     # in the returned handle and consumed by ShuffleReduceOpV3 to size each
     # reducer's memory ask (mirrors v2's _partition_bytes path).
     decoded_bytes_per_partition: Dict[int, int] = {}
+    # First non-None block schema this mapper sees; surfaced in the handle so
+    # the reducer can emit a typed empty block for partitions that received
+    # zero rows (the "N partitions -> N blocks" contract still demands one
+    # output block per partition, with the right schema -- see v2's
+    # ``_emit_empty_partition`` in shuffle_reduce_operator.py).
+    output_schema: Optional[pa.Schema] = None
 
     def _partition_units(blk):
         """Yield (pid, shard).
@@ -1091,6 +1097,10 @@ def v3_map_task(
             for blk in block_iter:
                 if transformer is not None:
                     blk = transformer(blk)
+                if output_schema is None:
+                    # Capture once. Used by the reducer to type empty-partition
+                    # blocks (see ShuffleHandle["schema"] consumer).
+                    output_schema = getattr(blk, "schema", None)
                 for pid, shard in _partition_units(blk):
                     if not shard.num_rows:
                         continue
@@ -1186,6 +1196,12 @@ def v3_map_task(
         # reducer's memory ask. Same physical quantity as v2's
         # ``_partition_bytes`` (from ``shuffle_tasks.py``'s ``merged.nbytes``).
         "decoded_bytes": decoded_bytes_per_partition,
+        # First non-None block schema this mapper saw. The reducer uses it to
+        # synthesize a 0-row, properly-typed block for empty partitions so the
+        # N-partitions -> N-blocks contract holds. ``None`` only for mappers
+        # that saw zero input blocks (in which case a peer mapper's handle
+        # provides the schema in the reducer).
+        "schema": output_schema,
     }
 
 
@@ -1439,10 +1455,16 @@ def v3_reduce_task(
     start_time_s = time.perf_counter()
 
     # Collect (manager, token, src_path, ranges) per source for this partition.
+    # While iterating handles, also pick up an output schema for the empty-
+    # partition path (so the N-block contract still emits a typed 0-row
+    # block when no mapper produced any data for this partition_id).
     jobs: List[Tuple["ray.actor.ActorHandle", str, str, List[Tuple[int, int]]]] = []
+    output_schema: Optional[pa.Schema] = None
     for h in handles:
         if not isinstance(h, dict):
             h = ray.get(h)
+        if output_schema is None:
+            output_schema = h.get("schema")
         ranges = h["index"].get(partition_id) or []
         if ranges:
             jobs.append((h["manager"], h["token"], h["path"], ranges))
@@ -1489,11 +1511,23 @@ def v3_reduce_task(
         ):
             yield from _yield_with_stats(out_block)
 
-    # Empty-input shortcut: still call reduce_fn (may produce empty block)
-    # and yield via the protocol so the operator gets the metadata.
+    # Empty-input shortcut. Two paths:
+    #  * coalesce_output: honor the "N partitions -> N blocks" contract by
+    #    emitting one 0-row block typed with the upstream schema (matches
+    #    v2's _emit_empty_partition path in shuffle_reduce_operator.py).
+    #    Skip the reduce_fn call entirely -- e.g. concat_reduce(pid, []) is
+    #    an empty generator, so going through reduce_fn would yield zero
+    #    blocks and silently violate the contract.
+    #  * non-coalesce: let reduce_fn decide (may legitimately yield nothing).
     if not jobs:
-        for block in reduce_fn(partition_id, []):
-            yield from _emit(block)
+        if coalesce_output:
+            if output_schema is not None:
+                yield from _emit(output_schema.empty_table())
+            # else: no schema available anywhere -> upstream produced zero
+            # mappers; nothing we can construct. Fall through to no-op.
+        else:
+            for block in reduce_fn(partition_id, []):
+                yield from _emit(block)
         return
 
     # Decide where the prefetch file lives, and whether we own the cleanup.
@@ -1558,21 +1592,35 @@ def v3_reduce_task(
         output_buffer: Optional[BlockOutputBuffer] = None
 
         class _OutputBlockCoalescer:
-            def __init__(self):
+            def __init__(self, fallback_schema):
                 self._blocks = []
+                # Seed from upstream handle so finalize can synthesize a
+                # typed 0-row block even if every reduce_fn output was empty.
+                self._schema = fallback_schema
 
             def add(self, block):
+                if self._schema is None:
+                    self._schema = getattr(block, "schema", None)
                 if block.num_rows > 0:
                     self._blocks.append(block)
 
             def finalize(self):
-                if not self._blocks:
-                    return None
-                if len(self._blocks) == 1:
-                    return self._blocks[0]
-                return pa.concat_tables(self._blocks)
+                if self._blocks:
+                    if len(self._blocks) == 1:
+                        return self._blocks[0]
+                    return pa.concat_tables(self._blocks)
+                # Honor the N-block contract: emit a 0-row block typed with
+                # whichever schema we saw. Returning None here would silently
+                # drop this partition from the output count.
+                if self._schema is not None:
+                    return self._schema.empty_table()
+                return None
 
-        coalescer = _OutputBlockCoalescer() if coalesce_output else None
+        coalescer = (
+            _OutputBlockCoalescer(fallback_schema=output_schema)
+            if coalesce_output
+            else None
+        )
 
         def _flush(tables: List[pa.Table]):
             """Call reduce_fn on `tables` and yield reshaped output."""
