@@ -323,9 +323,21 @@ class ShuffleMapOpV3(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBa
         # Memory ask: peak working set ≈ input resident + full partition output
         # ≈ 2× input (the v2 SHUFFLE_PEAK_MEMORY_MULTIPLIER). Sized from the
         # input estimate, NOT the pool budget (the default pool is unbounded;
-        # adding it would request 2^62 bytes and never schedule). When
-        # estimated_bytes is 0 (fused read: input bundle is ListFiles metadata),
-        # no memory ask is made and Ray packs by CPU — same as v2 in that case.
+        # adding it would request 2^62 bytes and never schedule).
+        #
+        # KNOWN HAZARD: with upstream fusion (this op absorbs a
+        # ReadFilesParquetV2 etc.), the input bundle is the ListFiles output
+        # -- a manifest of file paths, a few KB -- not the GBs the fused
+        # read will actually pull inside the task. ``estimated_bytes`` then
+        # ≈ 0 and no memory ask is emitted, so the ResourceManager packs
+        # concurrent map tasks by CPU alone and can OOM the node (observed:
+        # 8 fused maps × ~2.4 GB actual working set on a 30 GB node). v2
+        # does NOT have this bug because its ShuffleMapOp does not absorb
+        # upstream map transformers -- the read stays a separate op whose
+        # output bundle carries the real ~1 GB estimate. TODO: derive the
+        # working-set estimate from the manifest's file-size column (or
+        # apply a target_max_block_size-derived floor) when
+        # ``_upstream_map_transformer is not None``.
         resources: Dict[str, Any] = {"num_cpus": self._map_num_cpus}
         if estimated_bytes > 0:
             resources["memory"] = estimated_bytes * 2
