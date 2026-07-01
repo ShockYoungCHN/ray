@@ -427,13 +427,34 @@ class ShuffleMapOpV3(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBa
             for pid, nbytes in (handle.get("decoded_bytes") or {}).items():
                 self._partition_decoded_bytes[pid] += nbytes
         except Exception:
-            pass
+            # Best-effort (metrics only), but silence would hide a category
+            # of failures that empty this accumulator and collapse every
+            # reducer's memory ask to zero -- previously observed as 30×6GB
+            # reducers OOMing a node because an UnboundLocalError in the
+            # ``ray.get(handle_ref)`` call above was swallowed by a bare
+            # ``pass``. Log with full traceback so future breakage is loud.
+            logger.exception(
+                "ShuffleMapOpV3: failed to fold decoded_bytes for "
+                "map_id=%s; reducer memory ask will be under-counted",
+                map_id,
+            )
 
         # OpRuntimeMetrics.on_task_output_generated asserts every output block
         # carries exec_stats with wall_time_s AND block_ser_time_s set. The
         # handle isn't a real computed block, so we attach a minimal,
         # already-populated stats object (builder sets wall_time_s; we set the
         # serialization time to 0.0 so the assertion holds).
+        #
+        # NOTE: do NOT ``import ray`` locally in this function -- module-level
+        # ``import ray`` (top of file) already provides it. A function-local
+        # ``import ray`` (bare, not ``from ray.X import Y``) would make ``ray``
+        # a local for this whole method under Python scoping rules, turning
+        # the ``ray.get(handle_ref)`` above into UnboundLocalError before the
+        # local binding is assigned. The A/B on a 50GB/50-partition run: with
+        # the local import, n_nonzero(decoded_bytes) = 0 and reducer ask = 0;
+        # without it, n_nonzero = 50, total = 53.9 GB, reducer ask ≈ 2.15 GB.
+        # ``from ray.data.block import BlockExecStats`` below is fine -- it
+        # only binds ``BlockExecStats`` locally, not ``ray``.
         from ray.data.block import BlockExecStats
 
         # BlockExecStats is a frozen dataclass — pass block_ser_time_s through
