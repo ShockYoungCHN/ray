@@ -153,6 +153,15 @@ DEFAULT_HASH_SHUFFLE_REDUCE_BATCH_SIZE = env_integer(
     "RAY_DATA_HASH_SHUFFLE_REDUCE_BATCH_SIZE", 16
 )
 
+# Timeout (seconds) for each reduce-task shard ``ray.get()``. Bounds the wall
+# time a v2 reduce task will wait on any single upstream mapper output before
+# raising, so a stalled fetch surfaces as an operator-level error rather than
+# hanging the whole shuffle. Consumed by shuffle_tasks._get_shard_batch (synced
+# from upstream in the v2 alignment work).
+DEFAULT_HASH_SHUFFLE_REDUCE_GET_TIMEOUT_S = env_float(
+    "RAY_DATA_HASH_SHUFFLE_REDUCE_GET_TIMEOUT_S", 1800.0
+)
+
 DEFAULT_SCHEDULING_STRATEGY = "SPREAD"
 
 # This default enables locality-based scheduling in Ray for tasks where arg data
@@ -775,6 +784,10 @@ class DataContext:
 
     # Shard refs each v2 reduce task ray.get()'s per round.
     hash_shuffle_reduce_batch_size: int = DEFAULT_HASH_SHUFFLE_REDUCE_BATCH_SIZE
+
+    # Timeout (seconds) for each reduce-task shard ray.get(); a stalled fetch is
+    # promoted to an operator-level error instead of blocking the whole shuffle.
+    hash_shuffle_reduce_get_timeout_s: float = DEFAULT_HASH_SHUFFLE_REDUCE_GET_TIMEOUT_S
 
     # Max number of aggregators (actors) that could be provisioned
     # to perform aggregations on partitions produced during hash-shuffling
