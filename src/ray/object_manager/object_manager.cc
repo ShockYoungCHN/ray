@@ -550,8 +550,17 @@ void ObjectManager::PushObjectInternal(const ObjectID &object_id,
   // on the single main_service_ thread that serializes all PushManager state
   // updates.  Reported as bounce_lag_ms_total in `phase=object_pushed`;
   // bounce_lag_ms_total / network_recv_ms localizes the bottleneck inside
-  // drain_ms.  Skips the last chunk's bounce (which is in flight at emit
-  // time); for any non-trivial chunk count (N>>1) the omission is negligible.
+  // drain_ms.
+  //
+  // Accuracy under contention: the emit lambda is itself posted onto
+  // main_service_ after the last chunk's bounce lambda (asio io_context is
+  // FIFO: same-thread posts run in order), so by the time emit dispatches,
+  // every prior bounce fetch_add — including the last chunk's own — has
+  // completed. Reading `bounce_ns_total` there is authoritative, not a
+  // "skip the last chunk" approximation. This matters precisely in the
+  // regime we care about (main_service_ backlogged) where the earlier
+  // rpc_service_-side emit could omit an unbounded tail of unfired
+  // bounces.
   const auto bounce_ns_total = std::make_shared<std::atomic<int64_t>>(0);
   const auto object_size = chunk_reader->GetObject().GetObjectSize();
   const std::string dest_node_hex = node_id.Hex();
@@ -587,17 +596,40 @@ void ObjectManager::PushObjectInternal(const ObjectID &object_id,
                     // returns the pre-decrement value, so == 1 means we
                     // just drove the counter to 0.
                     if (chunks_remaining->fetch_sub(1) == 1) {
-                      EmitPullEvent(
-                          "phase=object_pushed object_id={} bytes={} "
-                          "push_wall_ms={} get_chunk_ms_total={} "
-                          "bounce_lag_ms_total={} from_disk={} dest_node={}",
-                          object_id_hex,
-                          object_size,
-                          absl::ToDoubleMilliseconds(absl::Now() - push_start_time),
-                          get_chunk_ns_total->load(std::memory_order_relaxed) / 1e6,
-                          bounce_ns_total->load(std::memory_order_relaxed) / 1e6,
-                          from_disk ? 1 : 0,
-                          dest_node_hex);
+                      // Freeze the "data on the wire" wall time now, on the
+                      // rpc_service_ thread, so push_wall_ms reflects
+                      // send-complete rather than emit-dispatch (which can
+                      // trail arbitrarily under main_service_ contention).
+                      const auto push_end_time = absl::Now();
+                      // Post emit onto main_service_ after the last chunk's
+                      // bounce lambda (which we just posted above). asio
+                      // io_context FIFO guarantees the emit runs strictly
+                      // after every bounce for this push, so
+                      // bounce_ns_total is authoritative when read here —
+                      // no more "skips the last chunk" undercount, and
+                      // under real main_service_ contention (the regime
+                      // this metric exists to detect) we no longer omit an
+                      // unbounded tail of unfired bounces.
+                      main_service_->post(
+                          [=]() {
+                            EmitPullEvent(
+                                "phase=object_pushed object_id={} bytes={} "
+                                "push_wall_ms={} get_chunk_ms_total={} "
+                                "bounce_lag_ms_total={} from_disk={} dest_node={}",
+                                object_id_hex,
+                                object_size,
+                                absl::ToDoubleMilliseconds(push_end_time -
+                                                           push_start_time),
+                                get_chunk_ns_total->load(
+                                    std::memory_order_relaxed) /
+                                    1e6,
+                                bounce_ns_total->load(
+                                    std::memory_order_relaxed) /
+                                    1e6,
+                                from_disk ? 1 : 0,
+                                dest_node_hex);
+                          },
+                          "ObjectManager.PushEmit");
                     }
                   },
                   chunk_reader,
