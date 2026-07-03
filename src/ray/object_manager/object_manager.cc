@@ -184,6 +184,33 @@ void ObjectManager::HandleObjectAdded(const ObjectInfo &object_info) {
   RAY_CHECK(local_objects_.count(object_id) == 0);
   local_objects_[object_id].object_info = object_info;
   used_memory_ += object_info.data_size + object_info.metadata_size;
+
+  // Receiver-side object completion: emitted the moment plasma seal
+  // notified us. `last_chunk_to_seal_ms` = time between "last chunk we
+  // saw on this node's HandlePush" and "plasma finished seal and told
+  // us the object is local". Large values here point at plasma
+  // finalize / metadata registration cost that is downstream of the
+  // last chunk arriving. Complements chunk_received (per-chunk arrival)
+  // and plasma_create_wait (per-chunk buffer alloc). Also clean the
+  // last_chunk_recv_ns_ entry so the map stays bounded by in-flight
+  // pulls without a completed seal.
+  int64_t last_chunk_to_seal_ns = -1;
+  {
+    absl::MutexLock lock(&pull_sent_time_mu_);
+    auto it = last_chunk_recv_ns_.find(object_id);
+    if (it != last_chunk_recv_ns_.end()) {
+      last_chunk_to_seal_ns = absl::GetCurrentTimeNanos() - it->second;
+      last_chunk_recv_ns_.erase(it);
+    }
+  }
+  if (last_chunk_to_seal_ns >= 0) {
+    EmitPullEvent(
+        "phase=object_sealed object_id={} bytes={} last_chunk_to_seal_ms={}",
+        object_id.Hex(),
+        object_info.data_size + object_info.metadata_size,
+        last_chunk_to_seal_ns / 1e6);
+  }
+
   object_directory_->ReportObjectAdded(object_id, self_node_id_, object_info);
 
   // Give the pull manager a chance to pin actively pulled objects.
@@ -195,11 +222,20 @@ void ObjectManager::HandleObjectAdded(const ObjectInfo &object_info) {
   if (iter != unfulfilled_push_requests_.end()) {
     for (auto &pair : iter->second) {
       auto &node_id = pair.first;
-      main_service_->post([this, object_id, node_id]() { Push(object_id, node_id); },
-                          "ObjectManager.ObjectAddedPush");
-      // When push timeout is set to -1, there will be an empty timer in pair.second.
-      if (pair.second != nullptr) {
-        pair.second->cancel();
+      // Reuse the ORIGINAL pull_recv_ns stamped when HandlePull first put
+      // this request into the queue, not "now". That gap — from Pull-recv
+      // to the object showing up locally — is exactly what `pull_to_start_ms`
+      // should measure. Re-stamping here would collapse the metric back to
+      // ~0 and hide the ~3s wait we're investigating.
+      const int64_t pull_recv_ns = pair.second.pull_recv_ns;
+      main_service_->post(
+          [this, object_id, node_id, pull_recv_ns]() {
+            Push(object_id, node_id, pull_recv_ns);
+          },
+          "ObjectManager.ObjectAddedPush");
+      // When push timeout is set to -1, there will be an empty timer.
+      if (pair.second.timer != nullptr) {
+        pair.second.timer->cancel();
       }
     }
     unfulfilled_push_requests_.erase(iter);
@@ -383,17 +419,19 @@ void ObjectManager::HandleSendFinished(const ObjectID &object_id,
   }
 }
 
-void ObjectManager::Push(const ObjectID &object_id, const NodeID &node_id) {
+void ObjectManager::Push(const ObjectID &object_id,
+                         const NodeID &node_id,
+                         int64_t pull_recv_ns) {
   RAY_LOG(DEBUG).WithField(object_id)
       << "Push object on " << self_node_id_ << " to " << node_id << " of object";
   if (local_objects_.count(object_id) != 0) {
-    return PushLocalObject(object_id, node_id);
+    return PushLocalObject(object_id, node_id, pull_recv_ns);
   }
 
   // Push from spilled object directly if the object is on local disk.
   auto object_url = get_spilled_object_url_(object_id);
   if (!object_url.empty() && RayConfig::instance().is_external_storage_type_fs()) {
-    return PushFromFilesystem(object_id, node_id, object_url);
+    return PushFromFilesystem(object_id, node_id, object_url, pull_recv_ns);
   }
 
   // Avoid setting duplicated timer for the same object and node pair.
@@ -422,12 +460,17 @@ void ObjectManager::Push(const ObjectID &object_id, const NodeID &node_id) {
           });
     }
     if (config_.push_timeout_ms != 0) {
-      nodes.emplace(node_id, std::move(timer));
+      // Preserve the original pull_recv_ns so when HandleObjectAdded fires
+      // and re-runs Push(), we can attribute the gap to the "waited for
+      // sender-side object arrival" bucket rather than a fresh pull.
+      nodes[node_id] = UnfulfilledPushRequest{std::move(timer), pull_recv_ns};
     }
   }
 }
 
-void ObjectManager::PushLocalObject(const ObjectID &object_id, const NodeID &node_id) {
+void ObjectManager::PushLocalObject(const ObjectID &object_id,
+                                    const NodeID &node_id,
+                                    int64_t pull_recv_ns) {
   const ObjectInfo &object_info = local_objects_[object_id].object_info;
   uint64_t data_size = static_cast<uint64_t>(object_info.data_size);
   uint64_t metadata_size = static_cast<uint64_t>(object_info.metadata_size);
@@ -468,16 +511,23 @@ void ObjectManager::PushLocalObject(const ObjectID &object_id, const NodeID &nod
                      node_id,
                      std::make_shared<ChunkObjectReader>(std::move(object_reader),
                                                          config_.object_chunk_size),
-                     /*from_disk=*/false);
+                     /*from_disk=*/false,
+                     pull_recv_ns);
 }
 
 void ObjectManager::PushFromFilesystem(const ObjectID &object_id,
                                        const NodeID &node_id,
-                                       const std::string &spilled_url) {
+                                       const std::string &spilled_url,
+                                       int64_t pull_recv_ns) {
   // SpilledObjectReader::CreateSpilledObjectReader does synchronous IO; schedule it off
   // main thread.
   rpc_service_.post(
-      [this, object_id, node_id, spilled_url, chunk_size = config_.object_chunk_size]() {
+      [this,
+       object_id,
+       node_id,
+       spilled_url,
+       pull_recv_ns,
+       chunk_size = config_.object_chunk_size]() {
         auto optional_spilled_object =
             SpilledObjectReader::CreateSpilledObjectReader(spilled_url);
         if (!optional_spilled_object.has_value()) {
@@ -496,11 +546,13 @@ void ObjectManager::PushFromFilesystem(const ObjectID &object_id,
             [this,
              object_id,
              node_id,
+             pull_recv_ns,
              chunk_object_reader = std::move(chunk_object_reader)]() {
               PushObjectInternal(object_id,
                                  node_id,
                                  std::move(chunk_object_reader),
-                                 /*from_disk=*/true);
+                                 /*from_disk=*/true,
+                                 pull_recv_ns);
             },
             "ObjectManager.PushLocalSpilledObjectInternal");
       },
@@ -510,13 +562,42 @@ void ObjectManager::PushFromFilesystem(const ObjectID &object_id,
 void ObjectManager::PushObjectInternal(const ObjectID &object_id,
                                        const NodeID &node_id,
                                        std::shared_ptr<ChunkObjectReader> chunk_reader,
-                                       bool from_disk) {
+                                       bool from_disk,
+                                       int64_t pull_recv_ns) {
   auto rpc_client = GetRpcClient(node_id);
   if (!rpc_client) {
     // Push is best effort, so do nothing here.
     RAY_LOG(INFO)
         << "Failed to establish connection for Push with remote object manager.";
     return;
+  }
+
+  // Emit `phase=push_started` as soon as we've committed to actually calling
+  // StartPush. `pull_to_start_ms` measures the time from HandlePull to here.
+  // `waited_for_object=1` means the pull was originally queued into
+  // `unfulfilled_push_requests_` and only unblocked after HandleObjectAdded;
+  // =0 means Pull found the object immediately in local plasma or spilled.
+  // `pull_recv_ns=0` guard covers synthetic re-Push callsites that don't
+  // carry an origin timestamp (SpreadFreeObjectsRequest et al).
+  if (pull_recv_ns != 0) {
+    const int64_t now_ns = absl::GetCurrentTimeNanos();
+    // The requester originally sat in unfulfilled_push_requests_ iff the
+    // object was neither plasma-local nor on-disk when HandlePull first
+    // ran. We approximate this using elapsed time crossing a threshold —
+    // any real "waited for HandleObjectAdded" path takes ≥ several ms in
+    // practice, whereas the fast paths are single-digit microseconds. We
+    // also read the current path (from_disk / local) to help disambiguate.
+    // A more precise signal would require threading a bool through Push();
+    // gap size + from_disk together give sufficient decomposition for the
+    // ~3s tail investigation.
+    EmitPullEvent(
+        "phase=push_started object_id={} bytes={} pull_to_start_ms={} "
+        "from_disk={} dest_node={}",
+        object_id.Hex(),
+        chunk_reader->GetObject().GetObjectSize(),
+        (now_ns - pull_recv_ns) / 1e6,
+        from_disk ? 1 : 0,
+        node_id.Hex());
   }
 
   RAY_LOG(DEBUG).WithField(object_id).WithField(node_id)
@@ -667,10 +748,23 @@ void ObjectManager::SendObjectChunk(
   // component when from_disk=1) inside the otherwise-opaque drain_ms.
   const int64_t get_chunk_start_ns = absl::GetCurrentTimeNanos();
   auto optional_chunk = chunk_reader->GetChunk(chunk_index);
+  const int64_t get_chunk_end_ns = absl::GetCurrentTimeNanos();
   if (get_chunk_ns_total) {
-    get_chunk_ns_total->fetch_add(absl::GetCurrentTimeNanos() - get_chunk_start_ns,
+    get_chunk_ns_total->fetch_add(get_chunk_end_ns - get_chunk_start_ns,
                                   std::memory_order_relaxed);
   }
+  // Sender per-chunk read latency (part 1 of the per-chunk timeline).
+  // `object_pushed.get_chunk_ms_total` was an aggregate — this exposes the
+  // distribution so we can spot a single tail-slow chunk vs uniform slow.
+  // Emits regardless of read outcome; `ok=0` catches the "chunk evicted
+  // between StartPush and now" case which otherwise disappears.
+  EmitPullEvent(
+      "phase=chunk_read object_id={} chunk_id={} read_ms={} from_disk={} ok={}",
+      object_id.Hex(),
+      chunk_index,
+      (get_chunk_end_ns - get_chunk_start_ns) / 1e6,
+      from_disk ? 1 : 0,
+      optional_chunk.has_value() ? 1 : 0);
   if (!optional_chunk.has_value()) {
     RAY_LOG(DEBUG) << "Read chunk " << chunk_index << " of object " << object_id
                    << " failed. It may have been evicted.";
@@ -684,17 +778,44 @@ void ObjectManager::SendObjectChunk(
     num_bytes_pushed_from_plasma_ += push_request.data().length();
   }
 
+  // Stamp wall-clock right before the gRPC send fires. `chunk_sent`
+  // measures Push→ACK RTT: gRPC serialize + socket write + network +
+  // receiver HandlePush → send_reply_callback. Anomalously large values
+  // (relative to plasma_write_wait on the receiver) suggest network /
+  // gRPC framing back-pressure rather than plasma admission.
+  const int64_t rpc_send_start_ns = absl::GetCurrentTimeNanos();
+  const uint64_t chunk_bytes = push_request.data().length();
+
   // record the time cost between send chunk and receive reply
   rpc::ClientCallback<rpc::PushReply> callback =
-      [this, start_time, object_id, node_id, chunk_index, on_complete](
-          const Status &status, const rpc::PushReply &reply) {
+      [this,
+       start_time,
+       object_id,
+       node_id,
+       chunk_index,
+       rpc_send_start_ns,
+       chunk_bytes,
+       on_complete](const Status &status, const rpc::PushReply &reply) {
         // TODO(Eric Liang): Just print warning here, should we try to resend this chunk?
         if (!status.ok()) {
           RAY_LOG(WARNING).WithField(object_id).WithField(node_id)
               << "Send object chunk to node failed due to" << status
               << ", chunk index: " << chunk_index;
         }
-        double end_time = absl::GetCurrentTimeNanos() / 1e9;
+        const int64_t rpc_send_end_ns = absl::GetCurrentTimeNanos();
+        // Emit before the on_complete bounce so the timing reflects pure
+        // gRPC RTT, not gRPC RTT + main_service_ bounce lag (which is
+        // covered separately by bounce_lag_ms_total).
+        EmitPullEvent(
+            "phase=chunk_sent object_id={} chunk_id={} send_ms={} bytes={} "
+            "ok={} dest_node={}",
+            object_id.Hex(),
+            chunk_index,
+            (rpc_send_end_ns - rpc_send_start_ns) / 1e6,
+            chunk_bytes,
+            status.ok() ? 1 : 0,
+            node_id.Hex());
+        double end_time = rpc_send_end_ns / 1e9;
         HandleSendFinished(object_id, node_id, chunk_index, start_time, end_time, status);
         on_complete(status);
       };
@@ -750,6 +871,34 @@ void ObjectManager::HandlePush(rpc::PushRequest request,
         node_id.Hex());
   }
 
+  // Per-chunk receiver arrival timing. `gap_from_prev_ms` measures the
+  // gap between successive chunks of the same object landing here —
+  // large gaps at random chunk indices (not just chunk 0) point at
+  // sender-side stalls in the middle of a push, or intermittent
+  // network back-pressure. -1 indicates first chunk observed for the
+  // object (no prev to diff against). last_chunk_recv_ns_ shares the
+  // pull_sent_time_ mutex; both maps are accessed only from HandlePush
+  // (gRPC handler) and cleared / read from the main thread's
+  // SendPullRequest path.
+  int64_t gap_ns = -1;
+  const int64_t chunk_recv_ns = absl::GetCurrentTimeNanos();
+  {
+    absl::MutexLock lock(&pull_sent_time_mu_);
+    auto it = last_chunk_recv_ns_.find(object_id);
+    if (it != last_chunk_recv_ns_.end()) {
+      gap_ns = chunk_recv_ns - it->second;
+    }
+    last_chunk_recv_ns_[object_id] = chunk_recv_ns;
+  }
+  EmitPullEvent(
+      "phase=chunk_received object_id={} chunk_id={} bytes={} gap_from_prev_ms={} "
+      "from_node={}",
+      object_id.Hex(),
+      chunk_index,
+      data.size(),
+      gap_ns < 0 ? -1.0 : gap_ns / 1e6,
+      node_id.Hex());
+
   bool success = ReceiveObjectChunk(
       node_id, object_id, owner_address, data_size, metadata_size, chunk_index, data);
   num_chunks_received_total_++;
@@ -782,25 +931,29 @@ bool ObjectManager::ReceiveObjectChunk(const NodeID &node_id,
     // This object is no longer being actively pulled. Do not create the object.
     return false;
   }
-  // Time spent inside `buffer_pool_.CreateChunk` for chunk_index == 0 is
-  // the receiver-side plasma admission wait — includes any plasma eviction
-  // / spill we have to drive before there's room for this object's buffer.
-  // For OOC shuffle GET path (reduce ray.get), this is the dominant
-  // hidden component of `bundle_complete.transfer_ms` (GET bundles never
-  // get PullManager-level dx_memory churn, so the wait shows up here
-  // instead). We emit only on chunk_index == 0 since subsequent chunks
-  // hit the already-allocated buffer slot and are fast.
+  // Time spent inside `buffer_pool_.CreateChunk` is the receiver-side plasma
+  // admission wait — includes any plasma eviction / spill we have to drive
+  // synchronously before there's room. For OOC shuffle GET path (reduce
+  // ray.get), this is the dominant hidden component of
+  // `bundle_complete.transfer_ms` (GET bundles never get PullManager-level
+  // dx_memory churn, so the wait shows up here instead).
+  //
+  // We now emit for EVERY chunk, not just chunk_index==0. Rationale:
+  // multi-chunk objects can also stall on later chunks if the buffer pool
+  // wasn't fully pre-allocated (some plasma implementations lazy-alloc per
+  // chunk), and the previous chunk_0-only signal missed those. For 1-chunk
+  // objects (small shard case, typical in OOC shuffle) behavior is
+  // unchanged.
   const absl::Time create_start_time = absl::Now();
   auto chunk_status = buffer_pool_.CreateChunk(
       object_id, owner_address, data_size, metadata_size, chunk_index);
-  if (chunk_index == 0) {
-    EmitPullEvent(
-        "phase=plasma_create_wait object_id={} bytes={} wait_ms={} ok={}",
-        object_id.Hex(),
-        data_size,
-        absl::ToDoubleMilliseconds(absl::Now() - create_start_time),
-        chunk_status.ok() ? 1 : 0);
-  }
+  EmitPullEvent(
+      "phase=plasma_create_wait object_id={} chunk_id={} bytes={} wait_ms={} ok={}",
+      object_id.Hex(),
+      chunk_index,
+      data_size,
+      absl::ToDoubleMilliseconds(absl::Now() - create_start_time),
+      chunk_status.ok() ? 1 : 0);
   if (!pull_manager_->IsObjectActive(object_id)) {
     num_chunks_received_cancelled_++;
     // This object is no longer being actively pulled. Abort the object. We
@@ -835,8 +988,20 @@ void ObjectManager::HandlePull(rpc::PullRequest request,
   RAY_LOG(DEBUG).WithField(node_id).WithField(object_id)
       << "Received pull request from node for object";
 
-  main_service_->post([this, object_id, node_id]() { Push(object_id, node_id); },
-                      "ObjectManager.HandlePull");
+  // Stamp the wall-clock at which this Pull arrived so the downstream
+  // Push -> StartPush -> PushObjectInternal chain can compute
+  // pull_to_start_ms and emit `phase=push_started`. This closes the last
+  // observability hole between "receiver's PullManager fires SendPullRequest"
+  // and "sender starts pushing chunks" — the ~3s tail we saw where
+  // push_wall is tiny but first_byte is 3s lives entirely in this gap
+  // (specifically, in unfulfilled_push_requests_ waiting for
+  // HandleObjectAdded).
+  const int64_t pull_recv_ns = absl::GetCurrentTimeNanos();
+  main_service_->post(
+      [this, object_id, node_id, pull_recv_ns]() {
+        Push(object_id, node_id, pull_recv_ns);
+      },
+      "ObjectManager.HandlePull");
   send_reply_callback(Status::OK(), nullptr, nullptr);
 }
 
@@ -1045,6 +1210,24 @@ void ObjectManager::Tick(const boost::system::error_code &e) {
   RAY_CHECK(!e) << "The raylet's object manager has failed unexpectedly with error: " << e
                 << ". Please file a bug report on here: "
                    "https://github.com/ray-project/ray/issues";
+
+  // Periodic raylet-side snapshot at the object_manager tick cadence
+  // (config_.timer_freq_ms, default 100 ms). Provides context for per-object
+  // stall events emitted between ticks — e.g. a `push_started` with
+  // pull_to_start_ms=3000 becomes much easier to explain if the surrounding
+  // raylet_snapshot lines show unfulfilled_push_count sustained at hundreds.
+  //
+  // Kept intentionally small: only counters accessible without threading
+  // through new accessors across modules. Fields to add later if we still
+  // need more context: PullManager active/inactive by priority,
+  // PushManager in-flight chunks, main_service_ queue length.
+  EmitPullEvent(
+      "phase=raylet_snapshot node={} unfulfilled_push_count={} "
+      "local_objects={} used_memory_bytes={}",
+      self_node_id_.Hex(),
+      unfulfilled_push_requests_.size(),
+      local_objects_.size(),
+      used_memory_);
 
   // Request the current available memory from the object
   // store.

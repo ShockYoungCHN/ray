@@ -228,7 +228,15 @@ class ObjectManager : public ObjectManagerInterface,
   ///
   /// \param object_id The object's object id.
   /// \param node_id The remote node's id.
-  void Push(const ObjectID &object_id, const NodeID &node_id);
+  /// `pull_recv_ns`: wall-clock (from absl::GetCurrentTimeNanos()) at which
+  /// this node's HandlePull received the Pull RPC for this object. Threads
+  /// through Push -> PushLocal/PushFromFilesystem -> PushObjectInternal so
+  /// the eventual `phase=push_started` line can report elapsed time
+  /// between Pull-recv and StartPush. `0` means "not measured / synthetic
+  /// re-Push" (e.g. the second Push that fires after HandleObjectAdded
+  /// picks the value up out of `unfulfilled_push_requests_` instead).
+  void Push(const ObjectID &object_id, const NodeID &node_id,
+            int64_t pull_recv_ns = 0);
 
   /// Pull a bundle of objects. This will attempt to make all objects in the
   /// bundle local until the request is canceled with the returned ID.
@@ -314,15 +322,21 @@ class ObjectManager : public ObjectManagerInterface,
   ///
   /// \param object_id The object's object id.
   /// \param node_id The remote node's id.
-  void PushLocalObject(const ObjectID &object_id, const NodeID &node_id);
+  /// \param pull_recv_ns See Push(); threaded through so PushObjectInternal
+  ///        can emit `phase=push_started pull_to_start_ms=...`.
+  void PushLocalObject(const ObjectID &object_id, const NodeID &node_id,
+                       int64_t pull_recv_ns = 0);
 
   /// Pushing a known spilled object to a remote object manager.
   /// \param object_id The object's object id.
   /// \param node_id The remote node's id.
   /// \param spilled_url The url of the spilled object.
+  /// \param pull_recv_ns See Push(); threaded through so PushObjectInternal
+  ///        can emit `phase=push_started pull_to_start_ms=...`.
   void PushFromFilesystem(const ObjectID &object_id,
                           const NodeID &node_id,
-                          const std::string &spilled_url);
+                          const std::string &spilled_url,
+                          int64_t pull_recv_ns = 0);
 
   /// The internal implementation of pushing an object.
   ///
@@ -335,7 +349,8 @@ class ObjectManager : public ObjectManagerInterface,
   void PushObjectInternal(const ObjectID &object_id,
                           const NodeID &node_id,
                           std::shared_ptr<ChunkObjectReader> chunk_reader,
-                          bool from_disk);
+                          bool from_disk,
+                          int64_t pull_recv_ns = 0);
 
   /// Send one chunk of the object to remote object manager
   ///
@@ -484,11 +499,25 @@ class ObjectManager : public ObjectManagerInterface,
   /// subscribe multiple times to the same object during Pull.
   UniqueID object_directory_pull_callback_id_ = UniqueID::FromRandom();
 
+  /// Value for `unfulfilled_push_requests_`. Carries both the cleanup
+  /// timer (unchanged behavior) and the wall-clock nanoseconds at which
+  /// HandlePull first observed this (object_id, requester) pair, so the
+  /// eventual `phase=push_started` line emitted when the object becomes
+  /// local can report `pull_to_start_ms` — the elapsed time between the
+  /// Pull RPC arriving on the sender and the first StartPush call for it.
+  /// This gap is invisible in every existing metric (push_wall_ms starts
+  /// at StartPush; bundle_locate is on the receiver side), and it's the
+  /// primary suspect for the ~3s tail observed in top-1% object latencies
+  /// where push_wall is small but first_byte is ≈3s.
+  struct UnfulfilledPushRequest {
+    std::unique_ptr<boost::asio::deadline_timer> timer;
+    int64_t pull_recv_ns = 0;
+  };
+
   /// Maintains a map of push requests that have not been fulfilled due to an object not
   /// being local. Objects are removed from this map after push_timeout_ms have elapsed.
-  absl::flat_hash_map<
-      ObjectID,
-      absl::flat_hash_map<NodeID, std::unique_ptr<boost::asio::deadline_timer>>>
+  absl::flat_hash_map<ObjectID,
+                      absl::flat_hash_map<NodeID, UnfulfilledPushRequest>>
       unfulfilled_push_requests_;
 
   /// The gPRC server.
@@ -553,6 +582,15 @@ class ObjectManager : public ObjectManagerInterface,
   /// with the unique-object-id count over raylet lifetime; bounded in
   /// practice by the number of distinct objects this node ever pulled.
   absl::flat_hash_map<ObjectID, int64_t> pull_attempt_count_
+      ABSL_GUARDED_BY(pull_sent_time_mu_);
+
+  /// Wall-clock (ns) at which the receiver last saw ANY chunk of a given
+  /// object arrive. Used to emit `chunk_received.gap_from_prev_ms` so we
+  /// can distinguish "sender pushed all chunks together, network stalled
+  /// on one" from "sender is trickling chunks out slowly". Erased when
+  /// the last chunk arrives (buffer_pool marks the object sealed).
+  /// Accessed on the gRPC HandlePush thread — same lock as pull_sent_time_.
+  absl::flat_hash_map<ObjectID, int64_t> last_chunk_recv_ns_
       ABSL_GUARDED_BY(pull_sent_time_mu_);
 
   /// Running total of received chunks.

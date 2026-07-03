@@ -10,13 +10,23 @@ Receiver-side per-bundle phases (joined by ``(node_ip, req_id)``):
   - phase=bundle_active   (T1 -> T2): plasma-quota wait before activation
   - phase=bundle_complete (T0 -> T3): full end-to-end fetch wall time
   - phase=bundle_terminal             at CancelPull, captures dx/reax churn
-  - phase=object_first_byte           first chunk arrival, attempt counter
-  - phase=plasma_create_wait          receiver-side admission wait
+
+Receiver-side per-object / per-chunk phases:
+  - phase=object_first_byte           Pull sent -> first chunk arrived
+  - phase=chunk_received              per-chunk arrival with gap-from-prev
+  - phase=plasma_create_wait          per-chunk plasma admission (all chunks)
+  - phase=object_sealed               last chunk -> plasma seal notification
 
 Sender-side per-push phases (joined by ``(node_ip, object_id, dest_node)``):
-  - phase=push_queued     (T0 -> T1): wait inside PushManager for window
-  - phase=push_dispatched (T1 -> T2): time to feed all chunks into network
+  - phase=push_started    (T-1 -> T0): HandlePull -> first StartPush gap
+  - phase=push_queued     (T0 -> T1):  wait inside PushManager for window
+  - phase=push_dispatched (T1 -> T2):  time to feed all chunks into network
+  - phase=chunk_read                   per-chunk chunk_reader->GetChunk
+  - phase=chunk_sent                   per-chunk gRPC Push RPC RTT
   - phase=object_pushed   (T-1 -> T3): full sender-side push wall time
+
+Per-node gauge (100 ms tick):
+  - phase=raylet_snapshot             unfulfilled_push_count / plasma stats
   (drain_ms = wall - queue - dispatch is computed by this script.)
 
 This script:
@@ -289,6 +299,32 @@ def _summarize(per_node: List[Dict[str, Any]]) -> Dict[str, Any]:
     first_attempt_bytes = 0
     plasma_create_wait_ms: List[float] = []
     plasma_create_wait_fail_count = 0
+    # push_started: sender-side HandlePull -> first StartPush gap. The ~3s
+    # tail investigation localized 74% of top-1% slow objects to this gap
+    # (sender waited for object arrival in unfulfilled_push_requests_ /
+    # HandleObjectAdded). Splitting from_disk lets us tell if the eventual
+    # source path affects the gap (it should NOT — the wait happens
+    # entirely before the from_disk/local decision).
+    push_started_ms_local: List[float] = []
+    push_started_ms_from_disk: List[float] = []
+    # Sender per-chunk read latency. Sum should match object_pushed's
+    # get_chunk_ms_total per push; the distribution answers "one slow
+    # chunk vs uniform slow".
+    chunk_read_ms_disk: List[float] = []
+    chunk_read_ms_plasma: List[float] = []
+    chunk_read_fail_count = 0
+    # Sender per-chunk gRPC RTT.
+    chunk_sent_ms: List[float] = []
+    chunk_sent_fail_count = 0
+    # Receiver per-chunk arrival gap. `-1` sentinel (first chunk of an
+    # object) is filtered out — it carries no gap signal.
+    chunk_received_gap_ms: List[float] = []
+    # Receiver object seal tail (last chunk -> HandleObjectAdded).
+    object_sealed_last_chunk_to_seal_ms: List[float] = []
+    # Global gauge time-series. Kept as raw (ts_ns, count) tuples so the
+    # user can plot backlog over time. We also compute peak / average as
+    # summary numbers.
+    unfulfilled_push_series: List[int] = []
     for n in per_node:
         for ev in n["events"]:
             phase = ev.get("phase")
@@ -311,6 +347,55 @@ def _summarize(per_node: List[Dict[str, Any]]) -> Dict[str, Any]:
                     plasma_create_wait_ms.append(float(ev["wait_ms"]))
                     if ev.get("ok") != "1":
                         plasma_create_wait_fail_count += 1
+                except (KeyError, ValueError):
+                    pass
+            elif phase == "push_started":
+                try:
+                    ms = float(ev["pull_to_start_ms"])
+                except (KeyError, ValueError):
+                    continue
+                if ev.get("from_disk") == "1":
+                    push_started_ms_from_disk.append(ms)
+                else:
+                    push_started_ms_local.append(ms)
+            elif phase == "chunk_read":
+                try:
+                    ms = float(ev["read_ms"])
+                except (KeyError, ValueError):
+                    continue
+                if ev.get("ok") != "1":
+                    chunk_read_fail_count += 1
+                    continue
+                if ev.get("from_disk") == "1":
+                    chunk_read_ms_disk.append(ms)
+                else:
+                    chunk_read_ms_plasma.append(ms)
+            elif phase == "chunk_sent":
+                try:
+                    ms = float(ev["send_ms"])
+                except (KeyError, ValueError):
+                    continue
+                if ev.get("ok") != "1":
+                    chunk_sent_fail_count += 1
+                    continue
+                chunk_sent_ms.append(ms)
+            elif phase == "chunk_received":
+                try:
+                    gap = float(ev["gap_from_prev_ms"])
+                except (KeyError, ValueError):
+                    continue
+                if gap >= 0:  # -1 = first chunk of this object, no gap
+                    chunk_received_gap_ms.append(gap)
+            elif phase == "object_sealed":
+                try:
+                    object_sealed_last_chunk_to_seal_ms.append(
+                        float(ev["last_chunk_to_seal_ms"])
+                    )
+                except (KeyError, ValueError):
+                    pass
+            elif phase == "raylet_snapshot":
+                try:
+                    unfulfilled_push_series.append(int(ev["unfulfilled_push_count"]))
                 except (KeyError, ValueError):
                     pass
 
@@ -620,6 +705,61 @@ def _summarize(per_node: List[Dict[str, Any]]) -> Dict[str, Any]:
             "event_count": len(plasma_create_wait_ms),
             "failed_count": plasma_create_wait_fail_count,
             "wait_ms_distribution": _summarize_distribution(plasma_create_wait_ms),
+        },
+        # Sender-side HandlePull -> first StartPush gap. `from_disk`
+        # buckets are structural: they both cover the SAME wait (arrival
+        # of the object into sender's local state) and should be similar
+        # in distribution. A large delta between the two buckets would
+        # be surprising and worth investigating.
+        "push_started": {
+            "local_ms": _summarize_distribution(push_started_ms_local),
+            "from_disk_ms": _summarize_distribution(push_started_ms_from_disk),
+        },
+        # Per-chunk sender read (chunk_reader->GetChunk). from_disk=1 is
+        # spill file pread; from_disk=0 is plasma read (should be ~0).
+        # If disk p99 is dominated by outliers, that's a tell for the
+        # SpilledObjectReader path (fd contention / slow media).
+        "chunk_read": {
+            "disk_read_ms": _summarize_distribution(chunk_read_ms_disk),
+            "plasma_read_ms": _summarize_distribution(chunk_read_ms_plasma),
+            "failed_count": chunk_read_fail_count,
+        },
+        # Per-chunk gRPC RTT. Should approximate chunk_received.recv_ms
+        # on the peer for the same (object_id, chunk_id).
+        "chunk_sent": {
+            "rtt_ms": _summarize_distribution(chunk_sent_ms),
+            "failed_count": chunk_sent_fail_count,
+        },
+        # Receiver per-chunk arrival gap. Excludes -1 sentinels (first
+        # chunk of each object). Large p99 relative to chunk_sent.rtt_ms
+        # on the sender points at mid-push stalls (sender interrupted /
+        # network hiccups between chunks).
+        "chunk_received": {
+            "gap_from_prev_ms": _summarize_distribution(chunk_received_gap_ms),
+        },
+        # Receiver seal tail. Large last_chunk_to_seal_ms is plasma
+        # finalize / metadata registration cost — check if it correlates
+        # with used_memory_bytes from raylet_snapshot.
+        "object_sealed": {
+            "last_chunk_to_seal_ms": _summarize_distribution(
+                object_sealed_last_chunk_to_seal_ms
+            ),
+        },
+        # Sender-side backlog gauge sampled every ~100 ms. Peak and mean
+        # help set expectations for push_started.pull_to_start_ms: a
+        # sustained non-zero unfulfilled_push_count IS the ~3s tail
+        # mechanism (Pulls landing on objects still in HandleObjectAdded
+        # waiting queue).
+        "raylet_snapshot": {
+            "unfulfilled_push_count_samples": len(unfulfilled_push_series),
+            "unfulfilled_push_count_peak": max(unfulfilled_push_series)
+            if unfulfilled_push_series
+            else 0,
+            "unfulfilled_push_count_mean": (
+                sum(unfulfilled_push_series) / len(unfulfilled_push_series)
+                if unfulfilled_push_series
+                else 0.0
+            ),
         },
     }
 

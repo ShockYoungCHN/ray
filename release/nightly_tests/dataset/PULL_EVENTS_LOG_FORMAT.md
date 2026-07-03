@@ -95,12 +95,21 @@ key, prefix with `node_ip` (the aggregator does this).
 **Per-object (sender-side, ObjectManager + PushManager)**:
 
 ```
+phase=push_started          ← HandlePull -> first StartPush (gap = unfulfilled_push_requests_ wait)
 phase=push_queued           ← PushManager dequeued this push for first send
 phase=push_dispatched       ← all chunks handed to chunk_send_fn_ (in flight)
+phase=chunk_read            ← one line per chunk: chunk_reader->GetChunk (spill disk / plasma read)
+phase=chunk_sent            ← one line per chunk: gRPC Push RPC RTT (send + receiver ACK)
 phase=object_pushed         ← one line per object after all chunks ACKed
 ```
 
 Emitted by the node that *served* an object to a remote requester.
+
+`phase=push_started` closes the gap between "receiver's PullManager
+fired SendPullRequest" and "sender started actually pushing". If the
+object was not local on the sender when Pull arrived, it sits in
+`unfulfilled_push_requests_` until `HandleObjectAdded` fires — that
+wait is entirely inside `pull_to_start_ms`. See §3.8.
 
 `phase=object_pushed` carries the wall-clock for the sender side of the
 cross-node transfer and a `from_disk` flag separating spill-served
@@ -110,26 +119,49 @@ surface where cross-node spill IO is measurable — `restored_*` in
 `raylet_spill_events.out` does NOT cover this path. See §3.5.
 
 `phase=push_queued` and `phase=push_dispatched` decompose `push_wall_ms`
-into PushManager-internal phases — see §3.8. Join all three lines by
+into PushManager-internal phases — see §3.9. Join by
 `(node_ip, object_id, dest_node)` to derive
 `drain_ms = push_wall_ms - queue_ms - dispatch_ms` (the network ack tail).
+
+`phase=chunk_read` and `phase=chunk_sent` further decompose that drain
+into per-chunk distributions (§3.10 / §3.11) — critical when you need
+to distinguish "one chunk stalled" from "all chunks uniformly slow".
 
 **Per-object (receiver-side, ObjectManager)**:
 
 ```
 phase=object_first_byte     ← Pull RPC sent -> first chunk arrived
-phase=plasma_create_wait    ← chunk_index=0 plasma alloc wall time
+phase=chunk_received        ← one line per chunk arrival, includes gap-from-prev-chunk
+phase=plasma_create_wait    ← per-chunk plasma buffer_pool_.CreateChunk wait (all chunks, not just 0)
+phase=object_sealed         ← last chunk arrival -> plasma seal notification
 ```
 
-Both are emitted on the *receiving* node by `HandlePush` / `ReceiveObjectChunk`.
-`object_first_byte` is `send_pull_request -> first chunk received`,
-covering remote dispatch + remote first IO + network one-way + local
-dispatch. `plasma_create_wait` is the time `buffer_pool_.CreateChunk` blocks
-to allocate a plasma buffer for chunk 0, including any plasma eviction /
-spill we have to drive synchronously. Both fire for any inbound chunk
-regardless of which PullManager priority triggered it (GET / WAIT /
-TASK_ARGS — there is no other path that lands chunks in ObjectManager).
-See §3.6 and §3.7.
+Emitted on the *receiving* node. `object_first_byte` is
+`send_pull_request -> first chunk received`, covering remote dispatch +
+remote first IO + network one-way + local dispatch. `chunk_received`
+per-chunk arrival timing exposes inter-chunk gaps (sender stall vs
+uniform slow). `plasma_create_wait` is the time `buffer_pool_.CreateChunk`
+blocks for the receive buffer — includes synchronous plasma eviction /
+spill. Fires for every chunk (up from chunk_0 only in earlier builds),
+so multi-chunk objects with late-chunk admission stalls are now visible.
+`object_sealed` is `last_chunk_arrival -> plasma seal notification`,
+catching finalize / metadata-registration cost downstream of the last
+chunk. See §3.6–§3.13.
+
+All receiver events fire for any inbound chunk regardless of which
+PullManager priority triggered it (GET / WAIT / TASK_ARGS — there is
+no other path that lands chunks in ObjectManager).
+
+**Per-node global gauge**:
+
+```
+phase=raylet_snapshot       ← 100 ms tick, sender-side backlog counters
+```
+
+Snapshots small counters that provide context for per-object stalls —
+e.g. a `push_started.pull_to_start_ms=3000` is much easier to explain
+against a `raylet_snapshot.unfulfilled_push_count=147` line at the same
+timestamp. See §3.14.
 
 ### 3.1 `phase=bundle_locate` (T0 → T1)
 
@@ -343,20 +375,24 @@ in-flight pulls without a first chunk; typically small (sub-thousand).
 
 ### 3.7 `phase=plasma_create_wait` (receiver-side, plasma admission)
 
-Emitted by `ObjectManager::ReceiveObjectChunk` when `chunk_index == 0`,
-timing the wall-clock spent inside `buffer_pool_.CreateChunk`. That call
-allocates the plasma buffer for the inbound object — and if plasma is
-full, it must drive eviction / spill synchronously to free room.
+Emitted by `ObjectManager::ReceiveObjectChunk` for **every** inbound
+chunk, timing the wall-clock spent inside `buffer_pool_.CreateChunk`.
+That call allocates the plasma buffer slot for that chunk index — and
+if plasma is full, it must drive eviction / spill synchronously to
+free room. Previously emitted only on `chunk_index == 0`; the current
+build emits on every chunk to catch late-chunk stalls in multi-chunk
+objects.
 
 ```
-1780900100.345678 phase=plasma_create_wait object_id=<hex32> bytes=<int> wait_ms=<float> ok=<0|1>
+1780900100.345678 phase=plasma_create_wait object_id=<hex32> chunk_id=<int> bytes=<int> wait_ms=<float> ok=<0|1>
 ```
 
 | Field | Type | Notes |
 |---|---|---|
 | `object_id` | hex32 | Ray ObjectID |
-| `bytes` | int | Object size being allocated |
-| `wait_ms` | float | Wall clock inside `buffer_pool_.CreateChunk` for chunk 0 |
+| `chunk_id` | int | Chunk index within this object |
+| `bytes` | int | Total object size being allocated (not chunk size) |
+| `wait_ms` | float | Wall clock inside `buffer_pool_.CreateChunk` for this chunk |
 | `ok` | 0/1 | `1` = allocation succeeded; `0` = failed (plasma full or out of disk after spill) |
 
 **Why this matters for OOC GET path**: reduce-task `ray.get` bundles are
@@ -374,11 +410,42 @@ spill attempt, or duplicate / cancelled — see the loops in
 producing duplicate `plasma_create_wait` lines for the same object_id on
 subsequent attempts.
 
-Only emitted on chunk 0 (one line per object per pull attempt). Later
-chunks reuse the already-allocated buffer slot and are fast — instrumenting
-them would multiply line volume without adding signal.
+### 3.8 `phase=push_started` (sender-side, HandlePull → first StartPush)
 
-### 3.8 `phase=push_queued` / `phase=push_dispatched` (sender-side, PushManager internals)
+Emitted by `ObjectManager::PushObjectInternal` right before it calls
+`push_manager_->StartPush`. `pull_to_start_ms` is the elapsed time
+between the sender's `HandlePull` receiving the Pull RPC and the sender
+actually starting to push chunks — a gap that is **invisible to every
+other metric** (`push_wall_ms` starts at `StartPush`, `push_queued`
+starts inside PushManager after StartPush, `bundle_locate` is on the
+receiver side entirely).
+
+```
+1780900100.111000 phase=push_started object_id=<hex32> bytes=<int> pull_to_start_ms=<float> from_disk=<0|1> dest_node=<hex>
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `object_id` | hex32 | Object being served |
+| `bytes` | int | Total object size |
+| `pull_to_start_ms` | float | HandlePull wall-clock → first StartPush call for this (object, dest) |
+| `from_disk` | 0/1 | `1` = eventually served via `PushFromFilesystem`; `0` = plasma-local at StartPush time |
+| `dest_node` | hex | Requesting NodeID |
+
+**Why this exists**: if the sender receives a Pull RPC for an object it
+does not yet have locally (neither in plasma nor spilled), the request
+sits in `unfulfilled_push_requests_` until `HandleObjectAdded` fires
+for that object. That wait can be arbitrarily long — in the 512 GB
+run investigation, 74 % of top-1% tail objects showed
+`pull_to_start_ms ≈ 3000` while `push_wall_ms` was under 15 ms,
+localizing the tail to this gap and pointing at owner-side location
+staleness / syncer broadcast delay as the likely root cause.
+
+**Not emitted** for synthetic re-Push callsites (e.g. resend paths that
+don't originate from a fresh Pull RPC and thus don't carry an origin
+timestamp).
+
+### 3.9 `phase=push_queued` / `phase=push_dispatched` (sender-side, PushManager internals)
 
 Emitted by `PushManager` directly (not `ObjectManager`). Together with
 `phase=object_pushed` they decompose `push_wall_ms` into three phases per
@@ -431,10 +498,126 @@ T3 = last  OnChunkComplete ← phase=object_pushed     push_wall_ms ≈ T3 - T0
    "num_chunks_to_send_ == 0" path, so `push_dispatched` is NOT emitted
    for them. The aggregator counts these as `queue_only_count`.
 
-### 3.9 What's NOT in this file (yet)
+### 3.10 `phase=chunk_read` (sender-side, per-chunk read)
+
+Emitted by `ObjectManager::SendObjectChunk` — one line per chunk,
+timing the wall-clock inside `chunk_reader->GetChunk(chunk_index)`.
+This is the disk-read latency for `from_disk=1` pushes and the
+plasma-read latency for `from_disk=0`. `object_pushed.get_chunk_ms_total`
+is the sum of these values; this line exposes the per-chunk distribution
+so a single slow chunk vs uniform slow can be told apart.
+
+```
+1780900100.121000 phase=chunk_read object_id=<hex32> chunk_id=<int> read_ms=<float> from_disk=<0|1> ok=<0|1>
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `chunk_id` | int | Chunk index within this object |
+| `read_ms` | float | Wall clock inside `chunk_reader->GetChunk` |
+| `from_disk` | 0/1 | `1` = spill file (`SpilledObjectReader`); `0` = plasma (`MemoryObjectReader`) |
+| `ok` | 0/1 | `0` = chunk was evicted between StartPush and this attempt (spill file gone / plasma object freed). Rare but useful to spot |
+
+### 3.11 `phase=chunk_sent` (sender-side, per-chunk gRPC RTT)
+
+Emitted by `SendObjectChunk`'s gRPC completion callback — one line per
+chunk, timing wall-clock between `rpc_client->Push()` call and the
+callback firing. Covers gRPC serialize + socket write + network one-way
++ receiver `HandlePush` + `send_reply_callback` + return network + gRPC
+deserialize. Does NOT include the subsequent `main_service_` bounce
+(that's `bounce_lag_ms_total` in `object_pushed`).
+
+```
+1780900100.131000 phase=chunk_sent object_id=<hex32> chunk_id=<int> send_ms=<float> bytes=<int> ok=<0|1> dest_node=<hex>
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `chunk_id` | int | Chunk index |
+| `send_ms` | float | gRPC RTT for this chunk |
+| `bytes` | int | Chunk payload size |
+| `ok` | 0/1 | gRPC-level status |
+| `dest_node` | hex | Requesting NodeID |
+
+**Correlation with receiver**: `chunk_sent.send_ms` on sender should
+approximate `chunk_received.recv_ms` on receiver (for the same
+object_id / chunk_id pair) — cross-node clock skew aside. Large
+divergence points at gRPC framing / TCP retransmission.
+
+### 3.12 `phase=chunk_received` (receiver-side, per-chunk arrival)
+
+Emitted by `ObjectManager::HandlePush` — one line per inbound chunk.
+`gap_from_prev_ms` is the interval since the last chunk of the same
+object arrived on this node. Large gaps at random chunk indices (not
+just chunk 0) indicate mid-push stalls: sender was interrupted, or
+the network had a hiccup between chunks.
+
+```
+1780900100.132000 phase=chunk_received object_id=<hex32> chunk_id=<int> bytes=<int> gap_from_prev_ms=<float> from_node=<hex>
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `chunk_id` | int | Chunk index |
+| `bytes` | int | Chunk payload size |
+| `gap_from_prev_ms` | float | Time since the previous chunk of this object arrived; `-1.0` for the first chunk (no previous) |
+| `from_node` | hex | Sender NodeID |
+
+### 3.13 `phase=object_sealed` (receiver-side, plasma seal notification)
+
+Emitted by `ObjectManager::HandleObjectAdded` — the moment plasma
+finished sealing the object and told us it's now local.
+`last_chunk_to_seal_ms` measures the tail: from the last observed
+chunk arrival to plasma sending the added-object notification. Large
+values indicate plasma finalize / metadata registration cost.
+
+```
+1780900100.145000 phase=object_sealed object_id=<hex32> bytes=<int> last_chunk_to_seal_ms=<float>
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `bytes` | int | Total object size (data + metadata) |
+| `last_chunk_to_seal_ms` | float | `HandleObjectAdded` wall-clock − last `chunk_received` wall-clock for this object |
+
+Only emitted for objects that were remotely pulled (locally-produced
+objects have no `chunk_received` timeline, so `last_chunk_recv_ns_` is
+absent and the line is skipped).
+
+### 3.14 `phase=raylet_snapshot` (per-node global gauge, ~100 ms tick)
+
+Emitted by `ObjectManager::Tick` — one line per raylet per timer tick
+(default `object_manager_timer_freq_ms = 100`). Provides context for
+per-object stall events, so `push_started.pull_to_start_ms = 3000` can
+be correlated with sustained backlog by looking at the snapshot lines
+straddling that timestamp.
+
+```
+1780900100.100000 phase=raylet_snapshot node=<hex> unfulfilled_push_count=<int> local_objects=<int> used_memory_bytes=<int>
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `node` | hex | This raylet's NodeID |
+| `unfulfilled_push_count` | int | `unfulfilled_push_requests_.size()` — count of (object_id, dest) pairs waiting for `HandleObjectAdded` |
+| `local_objects` | int | Objects currently in this node's plasma |
+| `used_memory_bytes` | int | Sum of data+metadata bytes for local objects |
+
+Intentionally minimal. Fields to add later if we still need more
+context: PullManager active/inactive by priority, PushManager in-flight
+chunks, `main_service_` queue length. Those all require plumbing new
+accessors across modules.
+
+### 3.15 What's NOT in this file (yet)
 
 These would be useful additions but are not implemented:
 
+- **Sender-side syncer / object_directory broadcast timing** (`phase=syncer_broadcast`
+  / `phase=object_directory_notify`): the ~3s tail investigation
+  strongly implicates owner-side location broadcast, but capturing it
+  requires cross-module instrumentation into `src/ray/ray_syncer` and
+  `src/ray/object_manager/ownership_object_directory.cc`. Held until
+  data from the current instrumentation set justifies the reach.
 - **`phase=spill_restore`**: per-object disk read timing on the
   *local-restore* path (`AsyncRestoreSpilledObject`). Currently only
   cumulative bytes/objects via the `restored_*` counters in spill
