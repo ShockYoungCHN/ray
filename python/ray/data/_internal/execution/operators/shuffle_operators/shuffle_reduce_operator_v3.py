@@ -153,16 +153,15 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
     def supports_fusion(self) -> bool:
         return True
 
-    # NOTE: ``absorbs_downstream_map_transformer`` / ``fuse_with_downstream_map_transformer``
-    # were removed when V3 downstream fusion was temporarily disabled. The
-    # generic emitter pass in ``operator_fusion.py`` has been replaced by a
-    # dedicated V2-only pass (upstream PR #64302). The ``_downstream_map_transformer``
-    # and ``_downstream_map_task_kwargs`` ctor params and fields are kept so
-    # downstream code and manual construction paths still work; only automatic
-    # fusion is off. To re-enable automatic V3 downstream fusion, extend the
-    # ``_fuse_map_into_shuffle_reduce_in_dag`` pass to also match
-    # ``isinstance(upstream, ShuffleReduceOpV3)`` and construct V3 in
-    # ``_get_fused_map_into_shuffle_reduce_operator``.
+    # NOTE: ``absorbs_downstream_map_transformer`` /
+    # ``fuse_with_downstream_map_transformer`` were removed when the generic
+    # emitter pass was retired in favor of upstream's dedicated pass
+    # ``_fuse_map_into_shuffle_reduce_in_dag`` (operator_fusion.py). That
+    # pass now type-branches on ``(ShuffleReduceOp | ShuffleReduceOpV3)``
+    # and constructs the fused replacement itself, so V3 no longer needs
+    # op-side capability methods. ``_downstream_map_transformer`` and
+    # ``_downstream_map_task_kwargs`` ctor params + fields stay because
+    # v3_reduce_task consumes them and the fusion pass populates them.
 
     def _add_input_inner(self, refs: RefBundle, input_index: int) -> None:
         """Each upstream bundle is one mapper's ShuffleHandle ref. Just
