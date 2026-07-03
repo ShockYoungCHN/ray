@@ -31,7 +31,6 @@ from collections import deque
 from typing import Any, Dict, List, Optional
 
 import ray
-
 from ray.data._internal.execution.interfaces import (
     ExecutionResources,
     PhysicalOperator,
@@ -47,11 +46,11 @@ from ray.data._internal.execution.operators.hash_shuffle_v3 import (
     ReduceFn,
     v3_reduce_task,
 )
-from ray.data._internal.execution.operators.shuffle_operators.shuffle_tasks import (
-    SHUFFLE_PEAK_MEMORY_MULTIPLIER,
-)
 from ray.data._internal.execution.operators.shuffle_operators.shuffle_map_operator_v3 import (  # noqa: E501
     ShuffleMapOpV3,
+)
+from ray.data._internal.execution.operators.shuffle_operators.shuffle_tasks import (
+    SHUFFLE_PEAK_MEMORY_MULTIPLIER,
 )
 from ray.data._internal.execution.operators.sub_progress import (
     SubProgressBarMixin,
@@ -103,9 +102,9 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
         # to each emitted block before yielding, so the downstream task
         # never has to run -- output of this op IS the downstream's output
         # (e.g., the write-stats blocks Write would have produced).
-        self._downstream_map_transformer: Optional["MapTransformer"] = (
-            downstream_map_transformer
-        )
+        self._downstream_map_transformer: Optional[
+            "MapTransformer"
+        ] = downstream_map_transformer
         # map_task_kwargs the absorbed downstream MapOperator would have
         # received via its scheduler (e.g. Write's ``{"write_uuid": ...}``).
         # v3_reduce_task threads this into the TaskContext it builds around

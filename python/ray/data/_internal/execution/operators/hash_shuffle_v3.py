@@ -246,9 +246,7 @@ def _sendfile_all(sock, in_fd: int, offset: int, count: int) -> None:
 
 # Linux-only; macOS lacks POSIX_FADV_DONTNEED. Probed once at import time so
 # the hot path is a constant-time attribute check, not a try/except per range.
-_HAS_FADV_DONTNEED = hasattr(os, "posix_fadvise") and hasattr(
-    os, "POSIX_FADV_DONTNEED"
-)
+_HAS_FADV_DONTNEED = hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED")
 
 
 def _drop_pagecache(fd: int, offset: int, length: int) -> None:
@@ -1175,10 +1173,8 @@ def v3_map_task(
         "index": index,
         # ActorHandle to this node's ShuffleManager. Reducer calls
         # ``ray.get(manager.endpoint.remote())`` at fetch time to get the
-        # CURRENT (host, port) — survives actor restart on a new port.
-        # Embedding the handle also makes Ray ref-count the actor for us:
-        # when the last ShuffleHandle ref is dropped, the actor dies, which
-        # is the natural end-of-shuffle signal.
+        # CURRENT (host, port), which survives actor restart on a new port.
+        # Embedding the handle also makes Ray ref-count the actor
         "manager": manager,
         "token": token,
         "num_partitions": num_partitions,

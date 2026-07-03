@@ -175,9 +175,9 @@ class ShuffleMapOpV3(InternalQueueOperatorMixin, PhysicalOperator, SubProgressBa
         # partitioning, so the read/map chain runs inline in the shuffle
         # map ray task with no plasma round-trip for the intermediate
         # blocks. None means standard non-fused dispatch.
-        self._upstream_map_transformer: Optional["MapTransformer"] = (
-            upstream_map_transformer
-        )
+        self._upstream_map_transformer: Optional[
+            "MapTransformer"
+        ] = upstream_map_transformer
 
         # -- Map task config --
         self._map_num_cpus: float = map_cpus
