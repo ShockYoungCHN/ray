@@ -239,16 +239,25 @@ duration that the sender node spent serving one object to a remote node
 `PushFromFilesystem`) and chunked gRPC send time.
 
 ```
-1780900100.456789 phase=object_pushed object_id=<hex32> bytes=<int> push_wall_ms=<float> from_disk=<0|1> dest_node=<hex>
+1780900100.456789 phase=object_pushed object_id=<hex32> bytes=<int> push_wall_ms=<float> get_chunk_ms_total=<float> bounce_lag_ms_total=<float> from_disk=<0|1> dest_node=<hex>
 ```
 
 | Field | Type | Notes |
 |---|---|---|
 | `object_id` | hex32 | Ray ObjectID being pushed |
 | `bytes` | int | Total object size |
-| `push_wall_ms` | float | Wall clock between StartPush and the final chunk's send-completion callback |
+| `push_wall_ms` | float | Wall clock from `StartPush` to the last chunk's send-completion callback fires on rpc_service_. Frozen on rpc_service_ before the emit is posted to main_service_, so it reflects "data on the wire" and is NOT inflated by emit queue latency |
+| `get_chunk_ms_total` | float | Sum across all chunks of the time spent inside `chunk_reader->GetChunk`, i.e. reading the payload out of plasma (from_disk=0) or off the spill file (from_disk=1). `push_wall_ms - get_chunk_ms_total` is the network + receiver share (plus any rpc_service_ scheduling slack) |
+| `bounce_lag_ms_total` | float | Sum across all chunks of the wait time between "rpc_service_ posted `OnChunkComplete` to main_service_" and "main_service_ actually ran that lambda". Measures contention on the single main_service_ thread that serializes all PushManager state updates. **Authoritative** — the emit is itself posted onto main_service_ after every chunk's bounce lambda (asio io_context is FIFO), so all fetch_add's have completed by the time it reads this value |
 | `from_disk` | 0/1 | `1` = `PushFromFilesystem` (read from this node's spill file), `0` = `PushLocalObject` (read from local plasma) |
 | `dest_node` | hex | NodeID of the requester. Always different from self_node_id |
+
+**Reading `bounce_lag_ms_total`**: `bounce_lag_ms_total / push_wall_ms`
+is the fraction of push wall time attributable to main_service_
+scheduling contention (not network, not disk). Elevated values —
+especially co-occurring with high `bundle_terminal.dx_total_ms` or
+long `plasma_create_wait.wait_ms` on the receiver — point at the
+single-threaded main_service_ as the raylet-wide bottleneck.
 
 **Why this lives in pull_events (and not spill_events)**:
 
@@ -496,10 +505,10 @@ python aggregate_pull_events.py --output pull_events_summary.json
 
 1780900002.001000 phase=push_queued     object_id=abc123 dest_node=node-B-hex chunks=64 queue_ms=12.0
 1780900002.008000 phase=push_dispatched object_id=abc123 dest_node=node-B-hex chunks=64 dispatch_ms=7.0
-1780900002.012300 phase=object_pushed   object_id=abc123 bytes=33554432 push_wall_ms=128.4 from_disk=1 dest_node=node-B-hex
+1780900002.012300 phase=object_pushed   object_id=abc123 bytes=33554432 push_wall_ms=128.4 get_chunk_ms_total=48.2 bounce_lag_ms_total=6.1 from_disk=1 dest_node=node-B-hex
 1780900002.011500 phase=push_queued     object_id=def456 dest_node=node-B-hex chunks=64 queue_ms=0.3
 1780900002.012100 phase=push_dispatched object_id=def456 dest_node=node-B-hex chunks=64 dispatch_ms=0.6
-1780900002.012800 phase=object_pushed   object_id=def456 bytes=33554432 push_wall_ms=4.2 from_disk=0 dest_node=node-B-hex
+1780900002.012800 phase=object_pushed   object_id=def456 bytes=33554432 push_wall_ms=4.2 get_chunk_ms_total=0.5 bounce_lag_ms_total=0.3 from_disk=0 dest_node=node-B-hex
 ```
 
 Interpretation:
@@ -519,13 +528,18 @@ Interpretation:
 - The two object pushes (sender-side from a third node serving objects
   to node-B) decompose cleanly:
   - `abc123` (`from_disk=1`, 32 MiB in 128.4 ms ≈ 250 MB/s effective): 12 ms
-    of queue, 7 ms to dispatch all 64 chunks, **109 ms of drain** —
-    suggests receiver-side plasma admission or spill-disk read is the
-    binder (cross-check with `plasma_create_wait.wait_ms` on node-B).
+    of queue, 7 ms to dispatch all 64 chunks, **109 ms of drain**; of that
+    drain, 48 ms is `get_chunk_ms_total` (spill-file read pulling payload
+    off disk) and 6 ms is `bounce_lag_ms_total` (main_service_ contention
+    on OnChunkComplete). The remaining ~55 ms is network + receiver
+    plasma admission (cross-check with `plasma_create_wait.wait_ms` on
+    node-B).
   - `def456` (`from_disk=0`, 32 MiB in 4.2 ms ≈ 8 GB/s): 0.3 ms queue,
-    0.6 ms dispatch, **3.3 ms drain** — clean plasma→network path. Orders
-    of magnitude faster, illustrating exactly why mixing the two paths
-    into `bundle_complete.transfer_ms` is so opaque.
+    0.6 ms dispatch, **3.3 ms drain** — 0.5 ms `get_chunk_ms_total` +
+    0.3 ms `bounce_lag_ms_total`, remainder pure network. Clean
+    plasma→network path, orders of magnitude faster, illustrating
+    exactly why mixing these paths into `bundle_complete.transfer_ms`
+    is so opaque.
 
 ---
 
