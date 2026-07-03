@@ -1,6 +1,6 @@
 import itertools
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 from ray.data._internal.compute import (
     ActorPoolStrategy,
@@ -14,19 +14,26 @@ from ray.data._internal.execution.interfaces import (
 from ray.data._internal.execution.operators.actor_pool_map_operator import (
     ActorPoolMapOperator,
 )
+from ray.data._internal.execution.operators.limit_operator import LimitOperator
 from ray.data._internal.execution.operators.map_operator import MapOperator
+from ray.data._internal.execution.operators.shuffle_operators.shuffle_reduce_operator import (  # noqa: E501
+    ShuffleReduceOp,
+)
 from ray.data._internal.execution.operators.task_pool_map_operator import (
     TaskPoolMapOperator,
 )
 from ray.data._internal.logical.interfaces import PhysicalPlan, Rule
 from ray.data._internal.logical.operators import (
+    AbstractAllToAll,
     AbstractMap,
     AbstractUDFMap,
     MapBatches,
     RandomShuffle,
     Repartition,
     StreamingRepartition,
+    Write,
 )
+from ray.data.datasource.file_datasink import _FileDatasink
 from ray.util.annotations import DeveloperAPI
 
 __all__ = [
@@ -61,11 +68,13 @@ class FuseOperators(Rule):
         # absorber side.
         fused_dag = self._fuse_absorber_operators_in_dag(fused_dag)
 
-        # Mirror pass: emitter -> MapOperator pairs. An emitter is any op
-        # that advertises absorbs_downstream_map_transformer(). The fused
-        # op runs the downstream Map's transformer inside its own task
-        # body before yielding (e.g., ShuffleReduceOpV3 absorbs Write).
-        fused_dag = self._fuse_emitter_operators_in_dag(fused_dag)
+        # Fuse a downstream task-pool map into the V2 hash-shuffle reduce.
+        # This is the upstream (PR #64302) approach: a dedicated pass keyed on
+        # ``isinstance(upstream, ShuffleReduceOp)`` instead of a generic
+        # emitter capability. V3's ShuffleReduceOpV3 does NOT participate here
+        # (different class); downstream fusion for V3 is temporarily disabled
+        # while the two paths are consolidated.
+        fused_dag = self._fuse_map_into_shuffle_reduce_in_dag(fused_dag)
 
         # Update output dependencies after fusion.
         # TODO(hchen): Instead of updating the depdencies manually,
@@ -229,63 +238,110 @@ class FuseOperators(Rule):
             )
         return down_logical_op
 
-    def _fuse_emitter_operators_in_dag(self, dag: PhysicalOperator) -> PhysicalOperator:
-        """Traverse up the DAG fusing emitter -> downstream MapOperator pairs.
+    def _fuse_map_into_shuffle_reduce_in_dag(
+        self, dag: PhysicalOperator, has_downstream_limit: bool = False
+    ) -> PhysicalOperator:
+        """Starting at the given operator, traverses up the DAG and fuses a
+        task-pool map sitting directly downstream of a V2 hash-shuffle reduce
+        into the reduce (a ``ShuffleReduceOp -> TaskPoolMapOperator`` pair).
 
-        Mirror of _fuse_absorber_operators_in_dag for the opposite direction:
-        the upstream op (e.g., ShuffleReduceOpV3) advertises
-        absorbs_downstream_map_transformer() and folds the downstream
-        MapOperator's transformer into its own task body. The downstream
-        MapOperator is removed from the DAG; the new op takes its place
-        with the upstream's input_dependency unchanged.
+        Ported from upstream PR #64302. V3's ``ShuffleReduceOpV3`` is a
+        distinct class and does not match the ``isinstance`` check below, so
+        downstream fusion for V3 is not exercised by this pass.
+
+        Returns the current (root) operator after completing upstream fusions.
         """
-        upstream_ops = dag.input_dependencies
-        if (
-            len(upstream_ops) == 1
-            and isinstance(dag, MapOperator)
-            and upstream_ops[0].absorbs_downstream_map_transformer()
-            and self._can_fuse(dag, upstream_ops[0])
-        ):
-            # Absorb dag (the downstream Map) into the upstream emitter.
-            dag = self._get_fused_emitter_operator(upstream_ops[0], dag)
-            upstream_ops = dag.input_dependencies
+        if self._can_fuse_map_into_shuffle_reduce(dag, has_downstream_limit):
+            dag = self._get_fused_map_into_shuffle_reduce_operator(
+                dag, dag.input_dependencies[0]
+            )
 
+        has_downstream_limit = has_downstream_limit or isinstance(dag, LimitOperator)
         dag._input_dependencies = [
-            self._fuse_emitter_operators_in_dag(upstream_op)
-            for upstream_op in upstream_ops
+            self._fuse_map_into_shuffle_reduce_in_dag(upstream_op, has_downstream_limit)
+            for upstream_op in dag.input_dependencies
         ]
         return dag
 
-    def _get_fused_emitter_operator(
-        self,
-        emitter_op: PhysicalOperator,
-        down_map_op: "MapOperator",
-    ) -> PhysicalOperator:
-        """Build the fused replacement for an emitter -> MapOperator edge.
-
-        emitter_op builds the new physical op via
-        fuse_with_downstream_map_transformer; this method handles DAG-level
-        bookkeeping (logical-op mapping in _op_map) and renames the op so
-        the absorbed Map is visible in stats.
+    def _can_fuse_map_into_shuffle_reduce(
+        self, dag: PhysicalOperator, has_downstream_limit: bool
+    ) -> bool:
+        """Whether ``dag`` is a task-pool map that can be fused into the V2
+        hash-shuffle reduce immediately upstream of it.
         """
-        new_op = emitter_op.fuse_with_downstream_map_transformer(
-            down_map_op.get_map_transformer(),
-            down_map_op.get_map_task_kwargs(),
+        # `dag` must be a fusable task-pool map.
+        if not (isinstance(dag, TaskPoolMapOperator) and dag.supports_fusion()):
+            return False
+
+        # Don't fuse a map with a `concurrency=` cap: the reduce runs one task
+        # per partition with no concurrency cap, so fusing would silently
+        # ignore the limit.
+        if dag.get_max_concurrency_limit() is not None:
+            return False
+
+        # Don't fuse under a downstream limit. A standalone map is throttled
+        # at task admission, but a fused reduce task runs the map over its
+        # whole partition before the limit can stop it — this could
+        # materialize far more than requested.
+        if has_downstream_limit:
+            return False
+
+        # A non-file-datasink write defers ``on_write_start`` to the map op
+        # (e.g. Iceberg schema evolution), which the fused reduce never runs.
+        # File datasinks run it driver-side in ``Dataset.write_datasink``, so
+        # they're safe; non-write maps have no such hook.
+        # TODO: support non-file-datasink writes by running the map's
+        # ``on_start`` hook in the fused reduce op.
+        logical_op = self._op_map.get(dag)
+        if isinstance(logical_op, Write) and not isinstance(
+            logical_op.datasink_or_legacy_datasource, _FileDatasink
+        ):
+            return False
+
+        # The sole upstream must be a V2 reduce that hasn't already fused
+        # with a map. V3's ``ShuffleReduceOpV3`` (different class) is
+        # intentionally excluded from this pass.
+        upstream_ops = dag.input_dependencies
+        if len(upstream_ops) != 1 or not isinstance(upstream_ops[0], ShuffleReduceOp):
+            return False
+        reduce_op = upstream_ops[0]
+        if reduce_op._fused_output_map_transformer is not None:
+            return False
+
+        return are_op_remote_args_compatible(self._op_map[reduce_op], self._op_map[dag])
+
+    def _get_fused_map_into_shuffle_reduce_operator(
+        self, down_op: TaskPoolMapOperator, up_op: ShuffleReduceOp
+    ) -> ShuffleReduceOp:
+        """Build the fused replacement for a ``ShuffleReduceOp ->
+        TaskPoolMapOperator`` edge. Constructs a new ``ShuffleReduceOp`` with
+        the downstream map's transformer / kwargs / target-block-size
+        override plumbed into the reduce task body.
+        """
+        name = up_op.name + "->" + down_op.name
+
+        up_logical_op = self._op_map.pop(up_op)
+        self._op_map.pop(down_op)
+
+        fused_op = ShuffleReduceOp(
+            up_op.input_dependencies[0],
+            up_op.data_context,
+            num_partitions=up_op._num_partitions,
+            reduce_fn=up_op._reduce_fn,
+            disallow_block_splitting=up_op._disallow_block_splitting,
+            reduce_cpus=up_op._shuffle_reduce_task_num_cpus,
+            name=name,
+            fused_output_map_transformer=down_op.get_map_transformer(),
+            fused_output_map_task_kwargs=down_op.get_map_task_kwargs(),
+            fused_output_map_target_max_block_size_override=(
+                down_op.target_max_block_size_override
+            ),
         )
-        # Carry the downstream Map's name into the fused op so progress
-        # bars / stats reflect what got absorbed.
-        new_op._name = f"{emitter_op.name}->{down_map_op.name}"
-        # _op_map: the fused op takes the downstream Map's logical position
-        # (the rebuilt RandomShuffle/Repartition would still be there if
-        # also fused with upstream Map, but here we only swap in down's slot
-        # so consumers walking the logical plan still see the Write/Map op
-        # they were expecting).
-        if down_map_op in self._op_map:
-            self._op_map[new_op] = self._op_map[down_map_op]
-            self._op_map.pop(down_map_op)
-        if emitter_op in self._op_map:
-            self._op_map.pop(emitter_op)
-        return new_op
+        fused_op.set_logical_operators(
+            *up_op._logical_operators, *down_op._logical_operators
+        )
+        self._op_map[fused_op] = up_logical_op
+        return fused_op
 
     def _can_fuse(self, down_op: PhysicalOperator, up_op: PhysicalOperator) -> bool:
         """Whether the given downstream op can be fused with the upstream op.
@@ -308,9 +364,10 @@ class FuseOperators(Rule):
         # - TaskPoolMapOperator -> any op that opts in via
         #   absorbs_upstream_map_transformer(); the down op constructs
         #   its own fused replacement.
-        # - any op that opts in via absorbs_downstream_map_transformer() ->
-        #   TaskPoolMapOperator/ActorPoolMapOperator (emitter direction:
-        #   the up op constructs its own fused replacement).
+        # NOTE: the emitter direction (up-op absorbing downstream Map) used
+        # to live here too, but has been consolidated into the dedicated
+        # ``_fuse_map_into_shuffle_reduce_in_dag`` pass (V2 only for now;
+        # V3's downstream fusion is temporarily disabled).
         if not (
             (
                 isinstance(up_op, TaskPoolMapOperator)
@@ -319,10 +376,6 @@ class FuseOperators(Rule):
             or (
                 isinstance(up_op, TaskPoolMapOperator)
                 and down_op.absorbs_upstream_map_transformer()
-            )
-            or (
-                up_op.absorbs_downstream_map_transformer()
-                and isinstance(down_op, (TaskPoolMapOperator, ActorPoolMapOperator))
             )
         ):
             return False
@@ -370,21 +423,6 @@ class FuseOperators(Rule):
                     down_logical_op.shuffle
                     or down_op.absorbs_upstream_map_transformer()
                 )
-            )
-            # Emitter direction: upstream non-Map sink absorbs downstream
-            # MapOperator. Mirror of the absorber branches above (note the
-            # swapped up/down). Used by ShuffleReduceOpV3 (a Repartition
-            # absorber on the v3 path) to fold a downstream Write into
-            # its own task body.
-            or (
-                isinstance(down_logical_op, AbstractMap)
-                and isinstance(up_logical_op, RandomShuffle)
-                and up_op.absorbs_downstream_map_transformer()
-            )
-            or (
-                isinstance(down_logical_op, AbstractMap)
-                and isinstance(up_logical_op, Repartition)
-                and up_op.absorbs_downstream_map_transformer()
             )
         ):
             return False
@@ -795,6 +833,30 @@ class FuseOperators(Rule):
             return False
 
         return True
+
+
+def are_op_remote_args_compatible(
+    up_logical_op: Union[AbstractMap, AbstractAllToAll],
+    down_logical_op: Union[AbstractMap, AbstractAllToAll],
+) -> bool:
+    """Check whether two logical ops can be fused based on their Ray remote args.
+
+    Two ops are compatible only if their ``ray_remote_args`` are mergeable and
+    neither op specifies a ``ray_remote_args_fn``, since the args it generates
+    are not known ahead of time.
+    """
+    # Do not fuse if either op specifies a `ray_remote_args_fn`,
+    # since it is not known whether the generated args will be compatible.
+    # Only `AbstractMap` ops carry a `ray_remote_args_fn`.
+    for logical_op in (up_logical_op, down_logical_op):
+        if isinstance(logical_op, AbstractMap) and logical_op.ray_remote_args_fn:
+            return False
+
+    # Only fuse if the ops' remote arguments are compatible.
+    return are_remote_args_compatible(
+        up_logical_op.ray_remote_args,
+        down_logical_op.ray_remote_args,
+    )
 
 
 @DeveloperAPI

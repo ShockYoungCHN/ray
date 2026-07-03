@@ -153,52 +153,16 @@ class ShuffleReduceOpV3(PhysicalOperator, SubProgressBarMixin):
     def supports_fusion(self) -> bool:
         return True
 
-    def absorbs_downstream_map_transformer(self) -> bool:
-        return True
-
-    def fuse_with_downstream_map_transformer(
-        self,
-        downstream_map_transformer,
-        downstream_map_task_kwargs: Optional[Dict[str, Any]] = None,
-    ) -> "ShuffleReduceOpV3":
-        """Return a new ShuffleReduceOpV3 that runs downstream_map_transformer
-        on each emitted block. The downstream MapOperator is dropped from
-        the DAG; the new op inherits our input_dependency and produces
-        whatever the downstream transformer produced.
-
-        Composes with any previously-absorbed downstream transformer (so
-        chained Reduce -> Map -> ... -> Write collapses across fusion-rule
-        waves into one op carrying the full transform chain). The caller
-        (fusion rule) is responsible for renaming via _name to reflect the
-        absorbed downstream op.
-
-        downstream_map_task_kwargs (the absorbed op's get_map_task_kwargs())
-        is merged with any previously-absorbed kwargs and threaded into the
-        TaskContext v3_reduce_task builds around the transformer.
-        """
-        existing = self._downstream_map_transformer
-        if existing is not None:
-            combined = existing.fuse(downstream_map_transformer)
-        else:
-            combined = downstream_map_transformer
-        merged_kwargs = {
-            **self._downstream_map_task_kwargs,
-            **(downstream_map_task_kwargs or {}),
-        }
-        return ShuffleReduceOpV3(
-            input_op=self.input_dependencies[0],
-            data_context=self.data_context,
-            num_partitions=self._num_partitions,
-            reduce_fn=self._reduce_fn,
-            streaming_reduce=self._streaming_reduce,
-            coalesce_output=self._coalesce_output,
-            max_bytes_per_fetch=self._max_bytes_per_fetch,
-            reduce_prefetch_dir=self._reduce_prefetch_dir,
-            reduce_cpus=self._reduce_num_cpus,
-            name=self.name,
-            downstream_map_transformer=combined,
-            downstream_map_task_kwargs=merged_kwargs,
-        )
+    # NOTE: ``absorbs_downstream_map_transformer`` / ``fuse_with_downstream_map_transformer``
+    # were removed when V3 downstream fusion was temporarily disabled. The
+    # generic emitter pass in ``operator_fusion.py`` has been replaced by a
+    # dedicated V2-only pass (upstream PR #64302). The ``_downstream_map_transformer``
+    # and ``_downstream_map_task_kwargs`` ctor params and fields are kept so
+    # downstream code and manual construction paths still work; only automatic
+    # fusion is off. To re-enable automatic V3 downstream fusion, extend the
+    # ``_fuse_map_into_shuffle_reduce_in_dag`` pass to also match
+    # ``isinstance(upstream, ShuffleReduceOpV3)`` and construct V3 in
+    # ``_get_fused_map_into_shuffle_reduce_operator``.
 
     def _add_input_inner(self, refs: RefBundle, input_index: int) -> None:
         """Each upstream bundle is one mapper's ShuffleHandle ref. Just
