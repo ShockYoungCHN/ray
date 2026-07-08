@@ -114,6 +114,31 @@ def test_max_call_tasks(ray_start_regular):
     wait_for_pid_to_exit(pid1)
 
 
+def test_max_call_task_returning_detached_actor_handle_exits(shutdown_only):
+    """Regression: a max_calls=1 task that returns a detached actor handle
+    must still exit cleanly, and the driver must still be able to call the
+    actor through that handle."""
+    ray.init(num_cpus=1, namespace="mc-detached-ret")
+
+    @ray.remote(num_cpus=0)
+    class Mgr:
+        def ping(self):
+            return os.getpid()
+
+    @ray.remote(max_calls=1)
+    def creator():
+        m = Mgr.options(
+            name="mgr", get_if_exists=True, lifetime="detached", num_cpus=0
+        ).remote()
+        return {"handle": m, "pid": os.getpid()}
+
+    result = ray.get(creator.remote())
+
+    wait_for_pid_to_exit(result["pid"])
+    assert ray.get(result["handle"].ping.remote()) > 0
+    ray.kill(result["handle"])
+
+
 def test_max_call_set_for_gpu_tasks(shutdown_only):
     ray.init(num_cpus=1, num_gpus=1)
 
