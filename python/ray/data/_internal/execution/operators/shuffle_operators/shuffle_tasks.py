@@ -2,6 +2,7 @@
 
 import logging
 import math
+import os
 import time
 import typing
 from dataclasses import replace
@@ -160,6 +161,13 @@ def _read_partition_ipc(buf: pa.Buffer) -> Optional[pa.Table]:
 # Warn once a shard fetch has stalled for this fraction of the fail timeout
 _REDUCE_GET_WARN_AT_FRACTION = 1 / 3
 
+# When ``RAY_DATA_SHUFFLE_REDUCE_GET_PROFILE=1`` is set, every reduce-side
+# ``ray.get`` of input shards logs its wall-clock latency (grep ``REDUCE_GET``
+# and aggregate).  This exposes the real reduce-side pull-latency distribution
+# for the object-store shuffle without touching the metrics/stats machinery.
+# Read once at import; the flag check on the hot path is a cheap bool test.
+_REDUCE_GET_PROFILE = os.environ.get("RAY_DATA_SHUFFLE_REDUCE_GET_PROFILE") == "1"
+
 
 def _get_shard_batch(
     batch: List[ObjectRef],
@@ -184,29 +192,41 @@ def _get_shard_batch(
     Raises:
         GetTimeoutError: If the shards are not available within ``timeout_s``.
     """
-    if timeout_s <= 0:
-        return ray.get(batch)
-
-    wait_start_s = time.perf_counter()
-    warn_timeout_s = timeout_s * _REDUCE_GET_WARN_AT_FRACTION
+    fetch_start_s = time.perf_counter()
     try:
-        return ray.get(batch, timeout=warn_timeout_s)
-    except GetTimeoutError:
-        logger.warning(
-            f"Shuffle reduce task for partition {partition_id} has waited "
-            f"{time.perf_counter() - wait_start_s:.0f}s for {len(batch)} "
-            f"shard(s) in batch {batch_index + 1}/{num_batches}."
-        )
+        if timeout_s <= 0:
+            return ray.get(batch)
 
-    try:
-        return ray.get(batch, timeout=timeout_s - warn_timeout_s)
-    except GetTimeoutError:
-        logger.error(
-            f"Shuffle reduce task for partition {partition_id} timed out after "
-            f"{time.perf_counter() - wait_start_s:.0f}s waiting for {len(batch)} "
-            f"shard(s) in batch {batch_index + 1}/{num_batches}."
-        )
-        raise
+        warn_timeout_s = timeout_s * _REDUCE_GET_WARN_AT_FRACTION
+        try:
+            return ray.get(batch, timeout=warn_timeout_s)
+        except GetTimeoutError:
+            logger.warning(
+                f"Shuffle reduce task for partition {partition_id} has waited "
+                f"{time.perf_counter() - fetch_start_s:.0f}s for {len(batch)} "
+                f"shard(s) in batch {batch_index + 1}/{num_batches}."
+            )
+
+        try:
+            return ray.get(batch, timeout=timeout_s - warn_timeout_s)
+        except GetTimeoutError:
+            logger.error(
+                f"Shuffle reduce task for partition {partition_id} timed out after "
+                f"{time.perf_counter() - fetch_start_s:.0f}s waiting for {len(batch)} "
+                f"shard(s) in batch {batch_index + 1}/{num_batches}."
+            )
+            raise
+    finally:
+        if _REDUCE_GET_PROFILE:
+            # print() rather than logger: reduce tasks run on workers, whose
+            # logger output lands in per-node ray-data log files that don't
+            # surface in the aggregated job/driver logs.  Ray forwards task
+            # stdout to the driver, so print(flush=True) is greppable there.
+            print(
+                f"REDUCE_GET p={partition_id} b={batch_index + 1}/{num_batches} "
+                f"n={len(batch)} get_ms={(time.perf_counter() - fetch_start_s) * 1e3:.1f}",
+                flush=True,
+            )
 
 
 @ray.remote(max_calls=1)
