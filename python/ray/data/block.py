@@ -191,6 +191,21 @@ def to_stats(metas: List["BlockMetadata"]) -> List["BlockStats"]:
 
 @DeveloperAPI
 @dataclass(frozen=True)
+class CustomOpStats:
+    """Base for operator-specific, worker-reported per-task stats.
+
+    A generic extension slot carried by :class:`TaskExecWorkerStats`. Operators
+    that want to report extra per-task stats to the driver subclass this; it
+    cannot be instantiated directly.
+    """
+
+    def __post_init__(self):
+        if type(self) is CustomOpStats:
+            raise TypeError("CustomOpStats cannot be instantiated directly")
+
+
+@DeveloperAPI
+@dataclass(frozen=True)
 class TaskExecWorkerStats:
     """Task's execution stats reported from the executing worker"""
 
@@ -201,14 +216,10 @@ class TaskExecWorkerStats:
     # or None if USS measurement is unavailable (e.g., non-Linux platforms).
     max_uss_bytes: Optional[int] = None
 
-    # Total wall-clock time spent inside ``ray.get`` while fetching input shard
-    # refs, for reducer tasks in v2 hash shuffle.  None on non-reducer tasks
-    # (no shard-ref fetch happens).  Subset of ``task_wall_time_s``; the
-    # remainder is reduce_fn + block flush + serialization.  A large ratio of
-    # reduce_get_time_s / task_wall_time_s on OOC runs identifies pulls
-    # (network / spill restore on the producer) as the bottleneck rather than
-    # CPU-bound reduce work.
-    reduce_get_time_s: Optional[float] = None
+    # Operator-specific worker-reported stats: one CustomOpStats entry per
+    # reporting transform (fused transforms each contribute one). Empty for
+    # operators that do not report any extra stats.
+    custom_op_stats: List[CustomOpStats] = field(default_factory=list)
 
 
 @DeveloperAPI

@@ -167,7 +167,7 @@ void InitPullEventLogger(const std::string &fallback_log_dir) {
 PullManager::PullManager(
     NodeID self_node_id,
     std::function<bool(const ObjectID &)> object_is_local,
-    std::function<void(const ObjectID &, const NodeID &)> send_pull_request,
+    std::function<void(const std::vector<ObjectID> &, const NodeID &)> send_pull_request,
     std::function<void(const ObjectID &)> cancel_pull_request,
     std::function<void(const ObjectID &, rpc::ErrorType)> fail_pull_request,
     RestoreSpilledObjectCallback restore_spilled_object,
@@ -536,11 +536,14 @@ void PullManager::UpdatePullsBasedOnAvailableMemory(int64_t num_bytes_available)
 
   {
     absl::MutexLock lock(&active_objects_mu_);
+    std::vector<ObjectID> to_pull_filtered;
+    to_pull_filtered.reserve(objects_to_pull.size());
     for (const auto &obj_id : objects_to_pull) {
       if (object_ids_to_cancel.count(obj_id) == 0) {
-        TryToMakeObjectLocal(obj_id);
+        to_pull_filtered.push_back(obj_id);
       }
     }
+    TryToMakeObjectsLocal(to_pull_filtered);
   }
 }
 
@@ -624,6 +627,26 @@ void PullManager::OnLocationChange(const ObjectID &object_id,
   auto it = object_pull_requests_.find(object_id);
   if (it == object_pull_requests_.end()) {
     return;
+  }
+
+  // Split bundle_locate into (a) owner responsiveness and (b) pending/size
+  // gating: on the FIRST callback per object, log how long the owner took to
+  // first respond and what state it reported. If first-cb delay is the tail =>
+  // owner slow to serve locations (busy/contended). If first-cb is fast but the
+  // object still isn't pullable (pending=1 or size=0) => reconstruction/size
+  // gating drives the tail instead.
+  if (it->second.first_cb_time_us == 0) {
+    const int64_t now_us = current_time_ns() / 1e3;
+    it->second.first_cb_time_us = now_us;
+    EmitPullEvent(
+        "phase=first_loc_cb object_id={} delay_ms={} pending={} size_set={} "
+        "nloc={} has_url={}",
+        object_id.Hex(),
+        (now_us - it->second.request_start_time_ms) / 1e3,
+        pending_creation ? 1 : 0,
+        object_size > 0 ? 1 : 0,
+        client_ids.size(),
+        spilled_url.empty() ? 0 : 1);
   }
 
   const bool was_pullable_before = it->second.IsPullable();
@@ -746,35 +769,12 @@ void PullManager::OnLocationChange(const ObjectID &object_id,
 
   {
     absl::MutexLock lock(&active_objects_mu_);
-    TryToMakeObjectLocal(object_id);
+    TryToMakeObjectsLocal({object_id});
   }
 }
 
-void PullManager::TryToMakeObjectLocal(const ObjectID &object_id) {
-  // The object is already local; abort.
-  if (object_is_local_(object_id)) {
-    return;
-  }
-
-  // The object is no longer needed; abort.
-  if (active_object_pull_requests_.count(object_id) == 0) {
-    return;
-  }
-
-  // The object waiting for local pull retry; abort.
-  auto &request = map_find_or_die(object_pull_requests_, object_id);
-  if (request.next_pull_time > get_time_seconds_()) {
-    return;
-  }
-
-  // Try to pull the object from a remote node. If the object is spilled on the local
-  // disk of the remote node, it will be restored by PushManager prior to pushing.
-  bool did_pull = PullFromRandomLocation(object_id);
-  if (did_pull) {
-    UpdateRetryTimer(request, object_id);
-    return;
-  }
-
+void PullManager::RestoreFromLocalOrTimeout(const ObjectID &object_id,
+                                            ObjectPullRequest &request) {
   // check if we can restore the object directly in the current raylet.
   // first check local spilled objects
   std::string direct_restore_url = get_locally_spilled_object_url_(object_id);
@@ -802,6 +802,14 @@ void PullManager::TryToMakeObjectLocal(const ObjectID &object_id) {
   }
 
   RAY_CHECK(!request.pending_object_creation);
+  // Reached only when PickRandomPullLocation found NO location: client_locations
+  // empty AND spilled_node_id nil AND no local spill URL. i.e. the directory has
+  // no location for this object at pull time -> the puller is stuck until a
+  // location update arrives or the 10s timer re-rolls. This is the "no location"
+  // smoking gun for the tail objects.
+  EmitPullEvent("phase=no_location object_id={} num_retries={}",
+                object_id.Hex(),
+                request.num_retries);
   if (request.expiration_time_seconds == 0) {
     RAY_LOG(WARNING) << "Object neither in memory nor external storage "
                      << object_id.Hex();
@@ -815,10 +823,10 @@ void PullManager::TryToMakeObjectLocal(const ObjectID &object_id) {
   }
 }
 
-bool PullManager::PullFromRandomLocation(const ObjectID &object_id) {
+std::optional<NodeID> PullManager::PickRandomPullLocation(const ObjectID &object_id) {
   auto it = object_pull_requests_.find(object_id);
   if (it == object_pull_requests_.end()) {
-    return false;
+    return std::nullopt;
   }
 
   auto &node_vector = it->second.client_locations;
@@ -830,11 +838,10 @@ bool PullManager::PullFromRandomLocation(const ObjectID &object_id) {
       RAY_LOG(DEBUG).WithField(object_id)
           << "Sending pull request from " << self_node_id_ << " to spilled location at "
           << spilled_node_id;
-      send_pull_request_(object_id, spilled_node_id);
-      return true;
+      return spilled_node_id;
     }
     // The timer should never fire if there are no expected client locations.
-    return false;
+    return std::nullopt;
   }
 
   RAY_CHECK(!object_is_local_(object_id));
@@ -847,8 +854,47 @@ bool PullManager::PullFromRandomLocation(const ObjectID &object_id) {
   RAY_CHECK(node_id != self_node_id_);
   RAY_LOG(DEBUG).WithField(object_id) << "Sending pull request from " << self_node_id_
                                       << " to in-memory location at " << node_id;
-  send_pull_request_(object_id, node_id);
-  return true;
+  return node_id;
+}
+
+void PullManager::TryToMakeObjectsLocal(const std::vector<ObjectID> &object_ids) {
+  absl::flat_hash_map<NodeID, std::vector<ObjectID>> batch_by_node;
+
+  const double now = get_time_seconds_();
+  for (const auto &object_id : object_ids) {
+    if (object_is_local_(object_id)) {
+      continue;
+    }
+    if (active_object_pull_requests_.count(object_id) == 0) {
+      continue;
+    }
+    ObjectPullRequest &request = map_find_or_die(object_pull_requests_, object_id);
+    if (request.next_pull_time > now) {
+      continue;
+    }
+    if (std::optional<NodeID> node_id = PickRandomPullLocation(object_id);
+        node_id.has_value()) {
+      // Real re-pull: no chunk had arrived (being_received=0), so the timer fired
+      // and we re-issued the pull. num_locations=1 + has_spilled_loc=1 means the
+      // object has a single home (its producer's spill file) — the re-pull can only
+      // go back there, so this is slow-first-byte (disk restore), not stale-location.
+      EmitPullEvent(
+          "phase=repull object_id={} num_retries={} being_received=0 "
+          "action=pull num_locations={} has_spilled_loc={}",
+          object_id.Hex(),
+          request.num_retries,
+          request.client_locations.size(),
+          request.spilled_node_id.IsNil() ? 0 : 1);
+      batch_by_node[*node_id].push_back(object_id);
+      UpdateRetryTimer(request, object_id);
+    } else {
+      RestoreFromLocalOrTimeout(object_id, request);
+    }
+  }
+
+  for (const auto &[node_id, oids] : batch_by_node) {
+    send_pull_request_(oids, node_id);
+  }
 }
 
 void PullManager::ResetRetryTimer(const ObjectID &object_id) {
@@ -884,10 +930,12 @@ void PullManager::UpdateRetryTimer(ObjectPullRequest &request,
 
 void PullManager::Tick() {
   absl::MutexLock lock(&active_objects_mu_);
-  for (auto &pair : active_object_pull_requests_) {
-    const auto &object_id = pair.first;
-    TryToMakeObjectLocal(object_id);
+  std::vector<ObjectID> active_objects;
+  active_objects.reserve(active_object_pull_requests_.size());
+  for (const auto &pair : active_object_pull_requests_) {
+    active_objects.push_back(pair.first);
   }
+  TryToMakeObjectsLocal(active_objects);
 }
 
 void PullManager::PinNewObjectIfNeeded(const ObjectID &object_id) {

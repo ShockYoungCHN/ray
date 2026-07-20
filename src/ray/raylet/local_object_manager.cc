@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "absl/strings/str_format.h"
+#include "absl/time/clock.h"
 #include "ray/asio/instrumented_io_context.h"
 #include "ray/common/filter_local_objects_util.h"
 #include "ray/stats/tag_defs.h"
@@ -119,47 +120,7 @@ void LocalObjectManager::PinObjectsAndWaitForFree(
             << " from the original " << original_worker_id << ". Object " << object_id
             << " may get freed while the new owner still has the object in scope.";
       }
-      continue;
     }
-
-    // Create a object eviction subscription message.
-    rpc::WorkerObjectEvictionSubMessage wait_request;
-    wait_request.set_object_id(object_id.Binary());
-    wait_request.set_intended_worker_id(owner_address.worker_id());
-    if (!generator_id.IsNil()) {
-      wait_request.set_generator_id(generator_id.Binary());
-    }
-    rpc::Address subscriber_address;
-    subscriber_address.set_node_id(self_node_id_.Binary());
-    subscriber_address.set_ip_address(self_node_address_);
-    subscriber_address.set_port(self_node_port_);
-    *wait_request.mutable_subscriber_address() = std::move(subscriber_address);
-
-    // If the subscription succeeds, register the subscription callback.
-    // Callback is invoked when the owner publishes the object to evict.
-    auto subscription_callback = [this, owner_address](const rpc::PubMessage &msg) {
-      RAY_CHECK(msg.has_worker_object_eviction_message());
-      const auto &object_eviction_msg = msg.worker_object_eviction_message();
-      const auto obj_id = ObjectID::FromBinary(object_eviction_msg.object_id());
-      core_worker_subscriber_->Unsubscribe(
-          rpc::ChannelType::WORKER_OBJECT_EVICTION, owner_address, obj_id.Binary());
-    };
-
-    // Callback that is invoked when the owner of the object id is dead.
-    // TODO(#63181) will delete pubsub and update testing
-    auto owner_dead_callback = [owner_address](const std::string &object_id_binary,
-                                               const Status &) {};
-
-    auto sub_message = std::make_unique<rpc::SubMessage>();
-    *sub_message->mutable_worker_object_eviction_message() = std::move(wait_request);
-
-    core_worker_subscriber_->Subscribe(std::move(sub_message),
-                                       rpc::ChannelType::WORKER_OBJECT_EVICTION,
-                                       owner_address,
-                                       object_id.Binary(),
-                                       /*subscribe_done_callback=*/nullptr,
-                                       subscription_callback,
-                                       owner_dead_callback);
   }
 }
 
@@ -239,7 +200,12 @@ bool LocalObjectManager::ObjectPendingDeletion(const ObjectID &object_id) {
   return objects_pending_deletion_.find(object_id) != objects_pending_deletion_.end();
 }
 
-void LocalObjectManager::SpillObjectUptoMaxThroughput(SpillTrigger trigger) {
+void LocalObjectManager::SpillObjectUptoMaxThroughput() {
+  // The interface entry point carries no trigger (its signature is fixed by
+  // LocalObjectManagerInterface, which is not modified here). This path is the
+  // plasma out-of-space eviction callback, so label it kEvictionOnCreate and
+  // thread it through the private spill methods.
+  const SpillTrigger trigger = SpillTrigger::kEvictionOnCreate;
   EmitSpillEvent("fn=SpillObjectUptoMaxThroughput trigger={}",
                  SpillTriggerToString(trigger));
   if (RayConfig::instance().object_spilling_config().empty()) {
@@ -313,9 +279,9 @@ bool LocalObjectManager::TryToSpillObjects(SpillTrigger trigger) {
   SpillObjectsInternal(
       objects_to_spill,
       [this, bytes_to_spill, objects_to_spill, start_time](const Status &status) {
-        // NOTE: this is the throughput/log callback; the per-object metric emission
-        // happens inside SpillObjectsInternal → OnObjectSpilled which already has
-        // access to the trigger.
+        // NOTE: this is the throughput/log callback; the per-object event
+        // emission happens inside SpillObjectsInternal → OnObjectSpilled which
+        // already has access to the trigger.
         if (!status.ok()) {
           RAY_LOG(DEBUG) << "Failed to spill objects: " << status.ToString();
         } else {
@@ -402,8 +368,8 @@ void LocalObjectManager::SpillObjectsInternal(
       pinned_objects_size_ -= object_size;
       pinned_objects_.erase(it);
 
-      // Stamp the trigger on LocalObjectInfo so OnObjectSpilled (size metric)
-      // and ProcessSpilledObjectsDeleteQueue (duration metric) both see a
+      // Stamp the trigger on LocalObjectInfo so OnObjectSpilled (size event)
+      // and ProcessSpilledObjectsDeleteQueue (duration event) both see a
       // consistent source label.
       auto info_it = local_objects_.find(id);
       if (info_it != local_objects_.end()) {
@@ -522,6 +488,12 @@ void LocalObjectManager::OnObjectSpilled(const std::vector<ObjectID> &object_ids
 
     // Mark that the object is spilled and unpin the pending requests.
     spilled_objects_url_.emplace(object_id, object_url);
+    // The spill URL is now registered -> the object is servable from disk via
+    // PushFromFilesystem. Rescue any push requests that were queued while it was
+    // mid-spill (otherwise they wait for a HandleObjectAdded that never comes).
+    if (on_object_spilled_) {
+      on_object_spilled_(object_id);
+    }
     RAY_LOG(DEBUG) << "Unpinning pending spill object " << object_id;
     auto it = objects_pending_spill_.find(object_id);
     RAY_CHECK(it != objects_pending_spill_.end());
@@ -538,7 +510,6 @@ void LocalObjectManager::OnObjectSpilled(const std::vector<ObjectID> &object_ids
     // creator_type comes from LocalObjectInfo (Phase 1: always kUnknown until
     // CoreWorker plumbs the real value). Lookups can miss if the object was
     // already freed during the spill — fall back to kUnknown.
-    // todo: how about secondary copy?
     auto freed_it = local_objects_.find(object_id);
     ObjectCreatorType creator_type = ObjectCreatorType::kUnknown;
     if (freed_it != local_objects_.end()) {
@@ -546,9 +517,7 @@ void LocalObjectManager::OnObjectSpilled(const std::vector<ObjectID> &object_ids
       freed_it->second.last_spill_trigger_ = trigger;
       creator_type = freed_it->second.creator_type_;
     }
-    // Aggregated post-run by scanning `raylet_spill_events.out` across nodes —
-    // the OTel-Histogram→Prometheus path was unreliable, this file is the
-    // authoritative source for spill analytics.
+    // Aggregated post-run by scanning `raylet_spill_events.out` across nodes.
     EmitSpillEvent("phase=spilled object_id={} size={} trigger={} creator={}",
                    object_id.Hex(),
                    object_size,
@@ -556,6 +525,13 @@ void LocalObjectManager::OnObjectSpilled(const std::vector<ObjectID> &object_ids
                    ObjectCreatorTypeToString(creator_type));
 
     // Asynchronously Update the spilled URL.
+    const bool spill_missing = (freed_it == local_objects_.end());
+    const bool spill_freed = (!spill_missing && freed_it->second.is_freed_);
+    EmitSpillEvent("phase=spill_path object_id={} missing={} is_freed={} action={}",
+                   object_id.Hex(),
+                   spill_missing ? 1 : 0,
+                   spill_freed ? 1 : 0,
+                   (spill_missing || spill_freed) ? "SKIP_REPORT" : "REPORT");
     if (freed_it == local_objects_.end() || freed_it->second.is_freed_) {
       RAY_LOG(DEBUG) << "Spilled object already freed, skipping send of spilled URL to "
                         "object directory for object "
@@ -688,6 +664,9 @@ void LocalObjectManager::ProcessSpilledObjectsDeleteQueue(uint32_t max_batch_siz
                        << " is deleted because the references are out of scope.";
         object_urls_to_delete.emplace_back(object_url);
       }
+      EmitSpillEvent("phase=url_erased object_id={} deleted_file={}",
+                     object_id.Hex(),
+                     (url_ref_count_it->second == 0) ? 1 : 0);
       spilled_objects_url_.erase(spilled_objects_url_it);
 
       // Update current spilled objects metrics
@@ -774,7 +753,6 @@ void LocalObjectManager::FillObjectStoreStats(rpc::GetNodeStatsReply *reply) con
 void LocalObjectManager::RecordMetrics() const {
   /// Record Metrics.
   if (spilled_bytes_total_ != 0 && spill_time_total_s_ != 0) {
-
     spill_manager_metrics_.spill_manager_throughput_mb_gauge.Record(
         spilled_bytes_total_ / 1024 / 1024 / spill_time_total_s_, {{"Type", "Spilled"}});
   }

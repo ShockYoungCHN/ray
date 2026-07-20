@@ -24,14 +24,14 @@
 #include <utility>
 #include <vector>
 
+#include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
-#include "ray/asio/asio_util.h"
 #include "ray/common/filter_local_objects_util.h"
 #include "ray/common/protobuf_utils.h"
 #include "ray/object_manager/plasma/store_runner.h"
 #include "ray/object_manager/spilled_object_reader.h"
-#include "ray/util/exponential_backoff.h"
+#include "ray/util/container_util.h"
 #include "ray/util/network_util.h"
 #include "ray/util/time.h"
 
@@ -116,8 +116,9 @@ ObjectManager::ObjectManager(
   auto object_is_local = [this](const ObjectID &object_id) {
     return local_objects_.count(object_id) != 0;
   };
-  auto send_pull_request = [this](const ObjectID &object_id, const NodeID &client_id) {
-    SendPullRequest(object_id, client_id);
+  auto send_pull_request = [this](const std::vector<ObjectID> &object_ids,
+                                  const NodeID &client_id) {
+    SendPullRequest(object_ids, client_id);
   };
   auto cancel_pull_request = [this](const ObjectID &object_id) {
     // We must abort this object because it may have only been partially
@@ -249,11 +250,58 @@ void ObjectManager::HandleObjectDeleted(const ObjectID &object_id) {
   local_objects_.erase(it);
   used_memory_ -= object_info.data_size + object_info.metadata_size;
   RAY_CHECK(!local_objects_.empty() || used_memory_ == 0);
+  // Object left this node's plasma (e.g. spilled to disk) -> tell the owner
+  // directory we no longer hold the in-memory copy. Paired with SPILL_PATH:
+  // if the spill also skips ReportObjectSpilled (is_freed), the directory ends
+  // up with NO location at all for this object.
+  EmitPullEvent("phase=loc_removed object_id={}", object_id.Hex());
   object_directory_->ReportObjectRemoved(object_id, self_node_id_, object_info);
 
   // Ask the pull manager to fetch this object again as soon as possible, if
   // it was needed by an active pull request.
   pull_manager_->ResetRetryTimer(object_id);
+}
+
+void ObjectManager::OnObjectSpilled(const ObjectID &object_id) {
+  // The object just became servable from its local spill file (URL now
+  // registered). Drain any push requests that were queued while it was
+  // mid-spill (neither in plasma nor with a spill URL). Same rescue as
+  // HandleObjectAdded, but triggered by spill completion instead of plasma
+  // add. Post to main_service_ so the unfulfilled_push_requests_ access is on
+  // the same single thread that HandlePull / HandleObjectAdded touch it on,
+  // regardless of which thread the spill-completion callback runs on.
+  main_service_->post(
+      [this, object_id]() {
+        // Diagnostic: did the spill-completion callback fire, and for which
+        // objects, on the node that queued the push?
+        EmitPullEvent("phase=spill_cb object_id={}", object_id.Hex());
+        auto iter = unfulfilled_push_requests_.find(object_id);
+        if (iter == unfulfilled_push_requests_.end()) {
+          return;
+        }
+        // Diagnostic: a queued push was actually found and rescued. Its
+        // timestamp vs the pull tells whether the rescue beat the
+        // pull_timeout or fired too late.
+        EmitPullEvent("phase=spill_rescue object_id={} n={}",
+                      object_id.Hex(),
+                      iter->second.size());
+        for (auto &pair : iter->second) {
+          const auto &node_id = pair.first;
+          // Reuse the ORIGINAL pull_recv_ns so pull_to_start_ms reflects the
+          // full HandlePull-to-serve gap (matches HandleObjectAdded).
+          const int64_t pull_recv_ns = pair.second.pull_recv_ns;
+          main_service_->post(
+              [this, object_id, node_id, pull_recv_ns]() {
+                Push(object_id, node_id, pull_recv_ns);
+              },
+              "ObjectManager.SpilledPush");
+          if (pair.second.timer != nullptr) {
+            pair.second.timer->cancel();
+          }
+        }
+        unfulfilled_push_requests_.erase(iter);
+      },
+      "ObjectManager.OnObjectSpilled");
 }
 
 uint64_t ObjectManager::Pull(const std::vector<rpc::ObjectReference> &object_refs,
@@ -334,8 +382,25 @@ void ObjectManager::MarkObjectFailed(const ObjectID &object_id,
   }
 }
 
-void ObjectManager::SendPullRequest(const ObjectID &object_id, const NodeID &client_id) {
+void ObjectManager::SendPullRequest(const std::vector<ObjectID> &object_ids,
+                                    const NodeID &client_id) {
+  if (object_ids.empty()) {
+    return;
+  }
   auto rpc_client = GetRpcClient(client_id);
+  // Did the pull actually go out? PullFromRandomLocation returns true (and the
+  // retry timer is armed) even when GetRpcClient is null and this no-ops.
+  // With batching, one Pull RPC carries N object_ids — emit one pull_sent
+  // event per object so downstream aggregation stays per-object.
+  {
+    const int sent_flag = rpc_client ? 1 : 0;
+    for (const auto &oid : object_ids) {
+      EmitPullEvent("phase=pull_sent object_id={} dest={} sent={}",
+                    oid.Hex(),
+                    client_id.Hex(),
+                    sent_flag);
+    }
+  }
   if (rpc_client) {
     // T0 for `phase=object_first_byte`: stamp the wall-clock here so that
     // when the first chunk arrives in HandlePush we can compute send-to-
@@ -353,23 +418,41 @@ void ObjectManager::SendPullRequest(const ObjectID &object_id, const NodeID &cli
     // across the whole run.
     {
       absl::MutexLock lock(&pull_sent_time_mu_);
-      pull_sent_time_[object_id] = absl::Now();
-      ++pull_attempt_count_[object_id];
+      const auto now = absl::Now();
+      for (const auto &oid : object_ids) {
+        pull_sent_time_[oid] = now;
+        ++pull_attempt_count_[oid];
+      }
     }
-    // Try pulling from the client.
     rpc_service_.post(
-        [this, object_id, client_id, rpc_client]() {
+        [this, object_ids, client_id, rpc_client]() {
           rpc::PullRequest pull_request;
-          pull_request.set_object_id(object_id.Binary());
           pull_request.set_node_id(self_node_id_.Binary());
+          for (const auto &oid : object_ids) {
+            pull_request.add_object_ids(oid.Binary());
+          }
+          // The callback needs the full object_ids list to emit a
+          // per-object pull_result event, so copy it in. batch_size and
+          // first_id are cheap derived views on the same vector.
+          const size_t batch_size = object_ids.size();
+          const ObjectID first_id = object_ids.front();
 
           rpc_client->Pull(
               pull_request,
-              [object_id, client_id](const Status &status, const rpc::PullReply &reply) {
+              [object_ids, batch_size, first_id, client_id](
+                  const Status &status, const rpc::PullReply &reply) {
+                const int ok_flag = status.ok() ? 1 : 0;
+                for (const auto &oid : object_ids) {
+                  EmitPullEvent("phase=pull_result object_id={} dest={} ok={}",
+                                oid.Hex(),
+                                client_id.Hex(),
+                                ok_flag);
+                }
                 if (!status.ok()) {
                   RAY_LOG_EVERY_N_OR_DEBUG(INFO, 100)
-                      << "Send pull " << object_id << " request to client " << client_id
-                      << " failed due to " << status;
+                      << "Send pull (batch of " << batch_size
+                      << ", first=" << first_id << ") request to client "
+                      << client_id << " failed due to " << status;
                 }
               });
         },
@@ -377,7 +460,8 @@ void ObjectManager::SendPullRequest(const ObjectID &object_id, const NodeID &cli
   } else {
     RAY_LOG_EVERY_N_OR_DEBUG(INFO, 100)
         << "Couldn't send pull request from " << self_node_id_ << " to " << client_id
-        << " of object " << object_id << " , setup rpc connection failed.";
+        << " for " << object_ids.size() << " object(s) (first=" << object_ids.front()
+        << "), setup rpc connection failed.";
   }
 }
 
@@ -424,12 +508,35 @@ void ObjectManager::Push(const ObjectID &object_id,
                          int64_t pull_recv_ns) {
   RAY_LOG(DEBUG).WithField(object_id)
       << "Push object on " << self_node_id_ << " to " << node_id << " of object";
-  if (local_objects_.count(object_id) != 0) {
+  // THE choke point: time from when the pull was received (HandlePull stamped
+  // pull_recv_ns and posted this Push onto the single main_service_ thread) to
+  // when this Push actually starts executing. A large queue_ms == the raylet
+  // main_service_ event loop was backlogged and didn't run the posted Push in
+  // time; the receiver's 10s pull_timeout then fires and re-pulls. Fires for
+  // every executed Push regardless of branch (unlike push_started, which only
+  // fires for servable objects — the stalled ones never reach it on attempt 1).
+  if (pull_recv_ns != 0) {
+    EmitPullEvent("phase=push_dispatch object_id={} dest={} queue_ms={}",
+                  object_id.Hex(),
+                  node_id.Hex(),
+                  (absl::GetCurrentTimeNanos() - pull_recv_ns) / 1e6);
+  }
+  const bool in_plasma = (local_objects_.count(object_id) != 0);
+  // Producer-local servability at the moment the pull is handled: is the object
+  // in this node's plasma, and/or does it have a local spill URL? Both empty ->
+  // the object is momentarily not servable here -> unfulfilled branch. This is
+  // the decisive check for the tail (pull raced spill/evict on the producer).
+  auto object_url = get_spilled_object_url_(object_id);
+  EmitPullEvent("phase=serve_check object_id={} dest={} in_plasma={} has_url={}",
+                object_id.Hex(),
+                node_id.Hex(),
+                in_plasma ? 1 : 0,
+                object_url.empty() ? 0 : 1);
+  if (in_plasma) {
     return PushLocalObject(object_id, node_id, pull_recv_ns);
   }
 
   // Push from spilled object directly if the object is on local disk.
-  auto object_url = get_spilled_object_url_(object_id);
   if (!object_url.empty() && RayConfig::instance().is_external_storage_type_fs()) {
     return PushFromFilesystem(object_id, node_id, object_url, pull_recv_ns);
   }
@@ -485,6 +592,21 @@ void ObjectManager::PushLocalObject(const ObjectID &object_id,
       buffer_pool_.CreateObjectReader(object_id, owner_address);
   Status status = reader_status.second;
   if (!status.ok()) {
+    // We took the PushLocalObject branch because local_objects_ (the raylet's
+    // in-plasma mirror) said this object is in plasma, but reading it failed.
+    // This mirror lags plasma: spilling evicts the primary copy from plasma
+    // (spill protocol step 5) and only afterwards posts the delete notification
+    // that updates local_objects_ on the main thread. A pull that lands inside
+    // that window reads a stale mirror and fails here. A non-empty local spill
+    // URL is authoritative proof that the object was spilled to this node's disk
+    // (reported in step 4, before the step-5 evict), so serve it from the spill
+    // file instead of silently dropping the push -- which would strand the puller
+    // until its 10s pull_timeout fires and re-pulls. If there is no spill URL,
+    // this is a genuine unavailable read; keep the original behavior.
+    auto spill_url = get_spilled_object_url_(object_id);
+    if (!spill_url.empty() && RayConfig::instance().is_external_storage_type_fs()) {
+      return PushFromFilesystem(object_id, node_id, spill_url, pull_recv_ns);
+    }
     RAY_LOG_EVERY_N_OR_DEBUG(INFO, 100)
         << "Ignoring stale read request for already deleted object: " << object_id;
     return;
@@ -983,11 +1105,7 @@ bool ObjectManager::ReceiveObjectChunk(const NodeID &node_id,
 void ObjectManager::HandlePull(rpc::PullRequest request,
                                rpc::PullReply *reply,
                                rpc::SendReplyCallback send_reply_callback) {
-  ObjectID object_id = ObjectID::FromBinary(request.object_id());
   NodeID node_id = NodeID::FromBinary(request.node_id());
-  RAY_LOG(DEBUG).WithField(node_id).WithField(object_id)
-      << "Received pull request from node for object";
-
   // Stamp the wall-clock at which this Pull arrived so the downstream
   // Push -> StartPush -> PushObjectInternal chain can compute
   // pull_to_start_ms and emit `phase=push_started`. This closes the last
@@ -995,103 +1113,24 @@ void ObjectManager::HandlePull(rpc::PullRequest request,
   // and "sender starts pushing chunks" — the ~3s tail we saw where
   // push_wall is tiny but first_byte is 3s lives entirely in this gap
   // (specifically, in unfulfilled_push_requests_ waiting for
-  // HandleObjectAdded).
+  // HandleObjectAdded). All objects in a batched Pull share the same
+  // arrival stamp.
   const int64_t pull_recv_ns = absl::GetCurrentTimeNanos();
-  main_service_->post(
-      [this, object_id, node_id, pull_recv_ns]() {
-        Push(object_id, node_id, pull_recv_ns);
-      },
-      "ObjectManager.HandlePull");
-  send_reply_callback(Status::OK(), nullptr, nullptr);
-}
-
-void ObjectManager::HandleFreeObjects(rpc::FreeObjectsRequest request,
-                                      rpc::FreeObjectsReply *reply,
-                                      rpc::SendReplyCallback send_reply_callback) {
-  std::vector<ObjectID> object_ids;
-  for (const auto &e : request.object_ids()) {
-    object_ids.emplace_back(ObjectID::FromBinary(e));
-  }
-  FreeObjects(object_ids, /* local_only */ true);
-  send_reply_callback(Status::OK(), nullptr, nullptr);
-}
-
-// TODO(#63213) will delete local_only=false and related dead code
-void ObjectManager::FreeObjects(const std::vector<ObjectID> &object_ids,
-                                bool local_only) {
-  buffer_pool_.FreeObjects(object_ids);
-  if (!local_only) {
-    std::vector<std::pair<NodeID, std::shared_ptr<rpc::ObjectManagerClientInterface>>>
-        rpc_clients;
-    // TODO(#56414): optimize this so we don't have to send a free objects request for
-    // every object to every node
-    const auto &node_info_map = gcs_client_.Nodes().GetAllNodeAddressAndLiveness();
-    for (const auto &[node_id, _] : node_info_map) {
-      if (node_id == self_node_id_) {
-        continue;
-      }
-      auto rpc_client = GetRpcClient(node_id);
-      if (rpc_client != nullptr) {
-        rpc_clients.emplace_back(node_id, std::move(rpc_client));
-      }
-    }
-    rpc_service_.post(
-        [this, object_ids, rpc_clients = std::move(rpc_clients)]() {
-          SpreadFreeObjectsRequest(object_ids, rpc_clients);
+  for (const auto &binary : request.object_ids()) {
+    ObjectID object_id = ObjectID::FromBinary(binary);
+    RAY_LOG(DEBUG).WithField(node_id).WithField(object_id)
+        << "Received pull request from node for object";
+    main_service_->post(
+        [this, object_id, node_id, pull_recv_ns]() {
+          Push(object_id, node_id, pull_recv_ns);
         },
-        "ObjectManager.FreeObjects");
+        "ObjectManager.HandlePull");
   }
+  send_reply_callback(Status::OK(), nullptr, nullptr);
 }
 
-void ObjectManager::SpreadFreeObjectsRequest(
-    const std::vector<ObjectID> &object_ids,
-    const std::vector<
-        std::pair<NodeID, std::shared_ptr<rpc::ObjectManagerClientInterface>>>
-        &rpc_clients) {
-  // This code path should be called from node manager.
-  rpc::FreeObjectsRequest free_objects_request;
-  for (const auto &e : object_ids) {
-    free_objects_request.add_object_ids(e.Binary());
-  }
-  for (const auto &entry : rpc_clients) {
-    // NOTE: The callback for FreeObjects is posted back onto the main_service_ since
-    // RetryFreeObjects accesses remote_object_manager_clients_ which is not thread safe.
-    entry.second->FreeObjects(
-        free_objects_request,
-        [this, node_id = entry.first, free_objects_request](
-            const Status &status, const rpc::FreeObjectsReply &reply) {
-          if (!status.ok()) {
-            RetryFreeObjects(node_id, 0, free_objects_request);
-          }
-        });
-  }
-}
-
-void ObjectManager::RetryFreeObjects(
-    const NodeID &node_id,
-    uint32_t attempt_number,
-    const rpc::FreeObjectsRequest &free_objects_request) {
-  if (!remote_object_manager_clients_.contains(node_id)) {
-    return;
-  }
-  auto delay_ms = ExponentialBackoff::GetBackoffMs(attempt_number, 1000);
-  execute_after(
-      *main_service_,
-      [this, node_id, attempt_number, free_objects_request] {
-        auto it = remote_object_manager_clients_.find(node_id);
-        if (it == remote_object_manager_clients_.end()) {
-          return;
-        }
-        it->second->FreeObjects(
-            free_objects_request,
-            [this, node_id, attempt_number, free_objects_request](
-                const Status &status, const rpc::FreeObjectsReply &reply) {
-              if (!status.ok()) {
-                RetryFreeObjects(node_id, attempt_number + 1, free_objects_request);
-              }
-            });
-      },
-      std::chrono::milliseconds(delay_ms));
+void ObjectManager::FreeObjects(const std::vector<ObjectID> &object_ids) {
+  buffer_pool_.FreeObjects(object_ids);
 }
 
 std::shared_ptr<rpc::ObjectManagerClientInterface> ObjectManager::GetRpcClient(

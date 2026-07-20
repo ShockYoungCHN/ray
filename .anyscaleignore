@@ -1,9 +1,0 @@
-# Intentionally empty.
-#
-# Benchmark results, spill logs, and cloudsort are deliberately KEPT in
-# workspace snapshots, so they are NOT excluded here. They are excluded only
-# from ray.init / runtime_env uploads via /home/ray/default/.rayignore.
-#
-# Add a pattern here only if you want it dropped from Anyscale workspace
-# snapshots too. Note: patterns are matched with Path.glob and must be
-# RELATIVE (no leading "/"), e.g. "foo/" not "/foo/".

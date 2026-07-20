@@ -210,31 +210,6 @@ struct PlasmaObjectHeader {
   Status CheckHasError() const;
 };
 
-/// Identifies what kind of caller created an object. Surfaced as a Prometheus
-/// label on spill-related histograms so we can attribute spill IO to its source
-/// (e.g., shuffle intermediates vs. ray.put payloads vs. task return values).
-///
-/// Phase 1: only kUnknown is populated by construction sites; kTaskReturn and
-/// kRayPut will be filled in once CoreWorker plumbs the value through
-/// PinObjectsAndWaitForFree.
-enum class ObjectCreatorType : uint8_t {
-  kUnknown = 0,
-  kTaskReturn = 1,
-  kRayPut = 2,
-};
-
-inline const char *ObjectCreatorTypeToString(ObjectCreatorType t) {
-  switch (t) {
-  case ObjectCreatorType::kUnknown:
-    return "Unknown";
-  case ObjectCreatorType::kTaskReturn:
-    return "TaskReturn";
-  case ObjectCreatorType::kRayPut:
-    return "RayPut";
-  }
-  return "Unknown";
-}
-
 /// A struct that includes info about the object.
 struct ObjectInfo {
   ObjectID object_id;
@@ -249,8 +224,6 @@ struct ObjectInfo {
   int owner_port;
   /// Owner's worker ID.
   WorkerID owner_worker_id;
-  /// What kind of caller created this object. See ObjectCreatorType.
-  ObjectCreatorType creator_type = ObjectCreatorType::kUnknown;
 
   int64_t GetObjectSize() const {
     return data_size + metadata_size + (is_mutable ? sizeof(PlasmaObjectHeader) : 0);
@@ -262,8 +235,7 @@ struct ObjectInfo {
             (owner_node_id == other.owner_node_id) &&
             (owner_ip_address == other.owner_ip_address) &&
             (owner_port == other.owner_port) &&
-            (owner_worker_id == other.owner_worker_id) &&
-            (creator_type == other.creator_type));
+            (owner_worker_id == other.owner_worker_id));
   }
 };
 

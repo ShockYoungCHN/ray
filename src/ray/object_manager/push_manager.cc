@@ -72,17 +72,6 @@ void PushManager::ScheduleRemainingPushes() {
       push_state.SendOneChunk();
       chunks_in_flight_ += 1;
       if (push_state.num_chunks_to_send_ == 0) {
-        // T1 -> T2: every chunk for this push is now in flight (handed
-        // to chunk_send_fn_). The remaining wall time until the receiver
-        // sees the last chunk is "network drain" and shows up as the
-        // tail of `phase=object_pushed` in ObjectManager.
-        EmitPullEvent(
-            "phase=push_dispatched object_id={} dest_node={} chunks={} "
-            "dispatch_ms={}",
-            push_state.object_id_.Hex(),
-            push_state.node_id_.Hex(),
-            push_state.num_chunks_,
-            absl::ToDoubleMilliseconds(absl::Now() - push_state.first_sent_at_));
         auto push_state_map_iter = push_state_map_.find(push_state.node_id_);
         RAY_CHECK(push_state_map_iter != push_state_map_.end());
 

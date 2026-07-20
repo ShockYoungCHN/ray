@@ -19,11 +19,8 @@
 #include <utility>
 
 #include "absl/container/flat_hash_map.h"
-#include "absl/time/clock.h"
-#include "absl/time/time.h"
 #include "ray/common/id.h"
 #include "ray/object_manager/metrics.h"
-#include "ray/object_manager/pull_manager.h"
 
 namespace ray {
 
@@ -94,16 +91,6 @@ class PushManager {
     int64_t next_chunk_id_ = 0;
     /// The number of chunks remaining to send.
     int64_t num_chunks_to_send_;
-    /// T0: when this push entered ``push_requests_with_chunks_to_send_``.
-    /// Captured at construction. Used to compute the queueing delay emitted
-    /// by ``phase=push_queued`` on the first ``SendOneChunk`` call.
-    absl::Time enqueued_at_ = absl::Now();
-    /// T1: when the first chunk for this push was handed to chunk_send_fn_.
-    /// Stamped on the first ``SendOneChunk`` call. ``InfinitePast()`` means
-    /// no chunk has been dispatched yet — used as the "first" sentinel so
-    /// we don't depend on next_chunk_id_/num_chunks_to_send_ counters that
-    /// also change on resend.
-    absl::Time first_sent_at_ = absl::InfinitePast();
 
     PushState(NodeID node_id,
               ObjectID object_id,
@@ -126,19 +113,6 @@ class PushManager {
     /// Send one chunk. Return true if a new chunk is sent, false if no more chunk to
     /// send.
     void SendOneChunk() {
-      if (first_sent_at_ == absl::InfinitePast()) {
-        first_sent_at_ = absl::Now();
-        // T0 -> T1: time spent queued in ``push_requests_with_chunks_to_send_``
-        // waiting for the chunks_in_flight window to open up. Fires exactly
-        // once per push; resends keep first_sent_at_ stamped so a flapping
-        // re-Pull doesn't emit duplicate queued lines.
-        EmitPullEvent(
-            "phase=push_queued object_id={} dest_node={} chunks={} queue_ms={}",
-            object_id_.Hex(),
-            node_id_.Hex(),
-            num_chunks_,
-            absl::ToDoubleMilliseconds(first_sent_at_ - enqueued_at_));
-      }
       num_chunks_to_send_--;
       // Send the next chunk for this push.
       chunk_send_fn_(next_chunk_id_);

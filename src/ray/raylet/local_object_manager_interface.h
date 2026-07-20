@@ -27,34 +27,6 @@ namespace ray {
 
 namespace raylet {
 
-/// Identifies which trigger path initiated a spill. Surfaced as a Prometheus
-/// label on spill-related metrics so we can tell apart the three production
-/// trigger paths into LocalObjectManager.
-enum class SpillTrigger : uint8_t {
-  /// Plasma store ran out of space while creating a new object; the
-  /// `spill_objects_callback` registered from `main.cc` fired this spill.
-  kEvictionOnCreate = 0,
-  /// `NodeManager::SpillIfOverPrimaryObjectsThreshold` (periodic) found primary
-  /// usage above `object_spilling_threshold` and triggered a preemptive spill.
-  kThresholdMonitor = 1,
-  /// Explicit caller of `LocalObjectManager::SpillObjects(ids, cb)`. Currently
-  /// only exercised by unit tests, but reserved for future proactive-spilling
-  /// APIs that bypass the throttle/fusion heuristics.
-  kExplicitApi = 2,
-};
-
-inline const char *SpillTriggerToString(SpillTrigger t) {
-  switch (t) {
-  case SpillTrigger::kEvictionOnCreate:
-    return "EvictionOnCreate";
-  case SpillTrigger::kThresholdMonitor:
-    return "ThresholdMonitor";
-  case SpillTrigger::kExplicitApi:
-    return "ExplicitApi";
-  }
-  return "Unknown";
-}
-
 class LocalObjectManagerInterface {
  public:
   virtual ~LocalObjectManagerInterface() = default;
@@ -64,7 +36,7 @@ class LocalObjectManagerInterface {
                                         const rpc::Address &,
                                         const ObjectID & = ObjectID::Nil()) = 0;
 
-  virtual void SpillObjectUptoMaxThroughput(SpillTrigger trigger) = 0;
+  virtual void SpillObjectUptoMaxThroughput() = 0;
 
   /// TODO(dayshah): This function is only used for testing, we should remove and just
   /// keep SpillObjectsInternal.
