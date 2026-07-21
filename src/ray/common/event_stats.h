@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <limits>
 
 #include "absl/container/flat_hash_map.h"
@@ -148,6 +149,14 @@ class EventTracker {
   /// \return A snapshot view of the global handler stats.
   GlobalStats get_global_stats() const;
 
+  /// Cumulative time (ns) spent actually EXECUTING handlers on the loop thread
+  /// (summed inside RecordExecution around fn()). Unlike cum_execution_time, this
+  /// EXCLUDES client-call round-trip time recorded via RecordEnd, so a per-window
+  /// delta divided by wall time is true single-loop CPU utilization.
+  int64_t loop_dispatch_ns() const {
+    return loop_dispatch_ns_.load(std::memory_order_relaxed);
+  }
+
   /// Returns a snapshot view of the count, queueing, and execution statistics for the
   /// provided event type.
   ///
@@ -182,6 +191,9 @@ class EventTracker {
 
   /// Global stats, across all handlers.
   std::shared_ptr<GuardedGlobalStats> global_stats_;
+
+  /// Cumulative on-loop handler execution time (ns), fed only by RecordExecution.
+  std::atomic<int64_t> loop_dispatch_ns_{0};
 
   /// Table of per-handler post stats.
   /// We use a std::shared_ptr value in order to ensure pointer stability.

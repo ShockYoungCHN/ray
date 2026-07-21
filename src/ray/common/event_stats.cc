@@ -113,6 +113,9 @@ void EventTracker::RecordExecution(const std::function<void()> &fn,
   int64_t end_execution = ray::current_time_ns();
   // Update execution time stats.
   const auto execution_time_ns = end_execution - start_execution;
+  // True on-loop CPU: only the time spent inside fn() here (never client
+  // round-trips, which go through RecordEnd). Delta/wall = loop utilization.
+  loop_dispatch_ns_.fetch_add(execution_time_ns, std::memory_order_relaxed);
   int64_t curr_count;
   const auto queue_time_ns = start_execution - handle->start_time;
   {

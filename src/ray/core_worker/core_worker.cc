@@ -540,6 +540,13 @@ CoreWorker::CoreWorker(
     auto last_psup = std::make_shared<int64_t>(0);
     auto last_free_obj = std::make_shared<int64_t>(0);
     auto last_free_rpc = std::make_shared<int64_t>(0);
+    // Service-time / utilization accumulators (needs RAY_event_stats=1): Σ handler
+    // exec-time last window, wall time of last dump, and per-name cum exec/count
+    // to delta against for per-handler mean service time.
+    auto last_busy_ns = std::make_shared<int64_t>(0);
+    auto last_dump_ns = std::make_shared<int64_t>(start_ns);
+    auto prev_exec = std::make_shared<std::unordered_map<std::string, int64_t>>();
+    auto prev_cnt = std::make_shared<std::unordered_map<std::string, int64_t>>();
     periodical_runner_->RunFnPeriodically(
         [=] {
           const int64_t now = absl::GetCurrentTimeNanos();
@@ -564,6 +571,34 @@ CoreWorker::CoreWorker(
             // mean us spent per publish this window (per-op publish cost) + the
             // reference-table size (does per-op cost grow with table size?).
             const double pub_us = dpub > 0 ? (pubns - *last_pubns) / 1e3 / dpub : 0.0;
+            // Loop utilization + per-handler service time from event_stats
+            // (populated only when RAY_event_stats=1). util = fraction of this
+            // window the single loop spent EXECUTING handlers; svc = per-name
+            // exec-time delta this window (answers "who ate the loop").
+            struct SvcRow {
+              int64_t dexec_ns;
+              int64_t dcnt;
+              std::string name;
+            };
+            const int64_t win_wall_ns = now - *last_dump_ns;
+            // True loop CPU: only on-loop dispatch time (RecordExecution), NOT the
+            // client-call round-trips that pollute cum_execution_time via RecordEnd.
+            const int64_t total_exec_ns = io_service_.stats()->loop_dispatch_ns();
+            std::vector<SvcRow> svc;
+            {
+              auto ev = io_service_.stats()->get_event_stats();
+              for (auto &kv : ev) {
+                const int64_t de = kv.second.cum_execution_time - (*prev_exec)[kv.first];
+                const int64_t dc = kv.second.cum_count - (*prev_cnt)[kv.first];
+                (*prev_exec)[kv.first] = kv.second.cum_execution_time;
+                (*prev_cnt)[kv.first] = kv.second.cum_count;
+                if (de > 0) svc.push_back({de, dc, kv.first});
+              }
+            }
+            const int64_t busy_ns = total_exec_ns - *last_busy_ns;
+            const double util = win_wall_ns > 0 ? (double)busy_ns / win_wall_ns : 0.0;
+            std::sort(svc.begin(), svc.end(),
+                      [](const SvcRow &a, const SvcRow &b) { return a.dexec_ns > b.dexec_ns; });
             IoServiceEventLog()
                 << "phase=hbucket wt=" << (is_driver ? "D" : "W")
                 << " t_ms=" << (now - start_ns) / 1e6
@@ -576,8 +611,23 @@ CoreWorker::CoreWorker(
                 << (g_pub_suppressed.load(std::memory_order_relaxed) - *last_psup)
                 << " d_free=" << (fo - *last_free_obj)
                 << " d_freerpc=" << (fr - *last_free_rpc)
+                << " util=" << util << " busy_ms=" << (busy_ns / 1e6)
                 << " lag_ms=" << *win_max_lag << "\n";
+            // Top handlers by exec-time this window (per-handler service time).
+            {
+              auto &os = IoServiceEventLog();
+              os << "phase=svc t_ms=" << (now - start_ns) / 1e6;
+              const size_t topn = std::min<size_t>(8, svc.size());
+              for (size_t k = 0; k < topn; ++k) {
+                os << " | " << svc[k].name << " exec_ms=" << (svc[k].dexec_ns / 1e6)
+                   << " n=" << svc[k].dcnt << " mean_us="
+                   << (svc[k].dcnt > 0 ? svc[k].dexec_ns / 1e3 / svc[k].dcnt : 0.0);
+              }
+              os << "\n";
+            }
             IoServiceEventLog().flush();
+            *last_busy_ns = total_exec_ns;
+            *last_dump_ns = now;
             *last_upd = u;
             *last_pub = p;
             *last_sub = s;
