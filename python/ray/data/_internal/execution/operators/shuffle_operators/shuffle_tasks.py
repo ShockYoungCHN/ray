@@ -290,6 +290,10 @@ def _shuffle_reduce_task(
     start_time_s = time.perf_counter()
 
     output_buffer: Optional[BlockOutputBuffer] = None
+    # Accumulated wall-clock inside _gather_input_shards (ray.get + IPC read) for
+    # this reduce task; reported via reduce_get_time_s on the output metadata.
+    # List box so nested closures can mutate it without `nonlocal`.
+    get_time_total_s: List[float] = [0.0]
 
     def _yield_with_stats(block: Block):
         """Yield a block then its pickled metadata (streaming-gen protocol)."""
@@ -302,6 +306,7 @@ def _shuffle_reduce_task(
                 block_exec_stats=exec_stats.build(block_ser_time_s=block_ser_time_s),
                 task_exec_stats=TaskExecWorkerStats(
                     task_wall_time_s=time.perf_counter() - start_time_s,
+                    reduce_get_time_s=get_time_total_s[0],
                 ),
             )
 
@@ -325,10 +330,15 @@ def _shuffle_reduce_task(
         # Gather every input's full shard list, then call reduce_fn exactly once
         # with all inputs together (no streaming: a multi-input reducer needs
         # every input's shards, and single-input reducers run blocking too).
-        tables_by_input = [
-            _gather_input_shards(shard_refs, partition_id, batch_size, get_timeout_s)
-            for shard_refs in shard_refs_by_input
-        ]
+        tables_by_input = []
+        for shard_refs in shard_refs_by_input:
+            _get_start_s = time.perf_counter()
+            tables_by_input.append(
+                _gather_input_shards(
+                    shard_refs, partition_id, batch_size, get_timeout_s
+                )
+            )
+            get_time_total_s[0] += time.perf_counter() - _get_start_s
         if any(tables_by_input):
             yield from _flush(tables_by_input)
 

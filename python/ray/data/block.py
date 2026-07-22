@@ -216,6 +216,13 @@ class TaskExecWorkerStats:
     # or None if USS measurement is unavailable (e.g., non-Linux platforms).
     max_uss_bytes: Optional[int] = None
 
+    # Total wall-clock time spent fetching input shard refs (ray.get + IPC read)
+    # for reducer tasks in v2 hash shuffle. None on non-reducer tasks. Subset of
+    # ``task_wall_time_s``; the remainder is reduce_fn + block flush. A large
+    # ratio of reduce_get_time_s / task_wall_time_s on OOC runs points at input
+    # fetch (network / spill restore) rather than CPU-bound reduce work.
+    reduce_get_time_s: Optional[float] = None
+
     # Operator-specific worker-reported stats: one CustomOpStats entry per
     # reporting transform (fused transforms each contribute one). Empty for
     # operators that do not report any extra stats.

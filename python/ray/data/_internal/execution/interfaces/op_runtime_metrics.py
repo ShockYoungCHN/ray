@@ -425,6 +425,17 @@ class OpRuntimeMetrics(metaclass=OpRuntimesMetricsMeta):
         description="Time spent running tasks to completion, as measured by the *workers*. This is a cumulative sum of all tasks' completion times.",
         metrics_group=MetricsGroup.TASKS,
     )
+    reduce_get_time_s: float = metric_field(
+        default=0,
+        description=(
+            "Cumulative wall-clock time across all reduce tasks of this "
+            "operator spent fetching input shard refs (ray.get + IPC read). "
+            "Only non-zero for v2 hash-shuffle reduce operators; zero on map / "
+            "non-shuffle ops. Compare against task_worker_completion_time_s to "
+            "see what fraction of reducer wall time was input-fetch."
+        ),
+        metrics_group=MetricsGroup.TASKS,
+    )
     task_scheduling_time_s: float = metric_field(
         default=0,
         description=(
@@ -1158,6 +1169,8 @@ class OpRuntimeMetrics(metaclass=OpRuntimesMetricsMeta):
         #       the workers executing the task
         if task_exec_stats is not None:
             self.task_worker_completion_time_s += task_exec_stats.task_wall_time_s
+            if task_exec_stats.reduce_get_time_s is not None:
+                self.reduce_get_time_s += task_exec_stats.reduce_get_time_s
 
         # NOTE: This is used for Issue Detection
         self._op_task_duration_stats.add_sample(task_wall_time_s)
