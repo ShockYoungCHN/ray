@@ -141,6 +141,7 @@ class _PartitionSpillWriter:
         "_ipc_write_options",
         "_staging",
         "_staging_bytes",
+        "_staging_total",
         "_index",
         "_decoded_bytes_per_partition",
         "_peak_inflight",
@@ -159,12 +160,13 @@ class _PartitionSpillWriter:
         self._ipc_write_options = _ipc_write_options(compression)
         self._staging: Dict[int, List[pa.Table]] = {}
         self._staging_bytes: Dict[int, int] = {}
+        self._staging_total = 0  # running sum -> _pool_size is O(1)
         self._index: Dict[int, List[Tuple[int, int]]] = {}
         self._decoded_bytes_per_partition: Dict[int, int] = {}
         self._peak_inflight = 0
 
     def _pool_size(self) -> int:
-        return sum(self._staging_bytes.values())
+        return self._staging_total
 
     def _flush(self, pid: int) -> None:
         shards = self._staging.get(pid)
@@ -188,6 +190,7 @@ class _PartitionSpillWriter:
         self._f.write(memoryview(buf))
         self._index.setdefault(pid, []).append((off, buf.size))
         self._staging[pid] = []
+        self._staging_total -= self._staging_bytes[pid]
         self._staging_bytes[pid] = 0
 
     def add_shard(self, pid: int, shard: pa.Table) -> None:
@@ -195,6 +198,7 @@ class _PartitionSpillWriter:
             return
         self._staging.setdefault(pid, []).append(shard)
         self._staging_bytes[pid] = self._staging_bytes.get(pid, 0) + shard.nbytes
+        self._staging_total += shard.nbytes
         self._peak_inflight = max(self._peak_inflight, self._pool_size())
         # Spill LARGEST bucket(s) on overflow so total staging stays
         # bounded by ``pool_budget_bytes``.
