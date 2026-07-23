@@ -391,20 +391,6 @@ RAY_CONFIG(int, object_manager_push_timeout_ms, 10000)
 /// NOTE(ekl): this has been raised to lower broadcast overheads.
 RAY_CONFIG(uint64_t, object_manager_default_chunk_size, 5 * 1024 * 1024)
 
-/// When true, raylet initializes a dedicated pull-events logger that writes
-/// structured object-transfer telemetry (one line per event) to
-/// <log_dir>/raylet_pull_events.out. When false (default), the logger is left
-/// uninitialized and EmitPullEvent is a no-op — call sites pay only a single
-/// nullptr check.
-RAY_CONFIG(bool, pull_manager_event_log_enabled, false)
-
-/// Sibling of pull_manager_event_log_enabled for the spill-event logger.
-/// When true, raylet initializes the spill-event logger that writes structured
-/// spill telemetry (one line per event) to <log_dir>/raylet_spill_events.out.
-/// When false (default), the logger is left uninitialized and EmitSpillEvent is
-/// a no-op — call sites pay only a single nullptr check.
-RAY_CONFIG(bool, spill_manager_event_log_enabled, false)
-
 /// The maximum number of outbound bytes to allow to be outstanding. This avoids
 /// excessive memory usage during object broadcast to many receivers.
 RAY_CONFIG(uint64_t,

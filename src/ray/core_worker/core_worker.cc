@@ -15,9 +15,6 @@
 #include "ray/core_worker/core_worker.h"
 
 #include <algorithm>
-#include <atomic>
-#include <cstdlib>
-#include <fstream>
 #include <future>
 #include <memory>
 #include <string>
@@ -25,8 +22,6 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
-
-#include "absl/time/clock.h"
 
 #include "ray/core_worker/core_worker_shutdown_executor.h"
 #include "ray/core_worker/shutdown_coordinator.h"
@@ -59,43 +54,7 @@ using MessageType = ray::protocol::MessageType;
 
 namespace ray::core {
 
-// Clean phase-tagged handler counters (external linkage; incremented from the
-// three handler sites, dumped per-second by the io_service heartbeat). These
-// replace the unreliable event_stats exec-time totals (which conflate CPU with
-// in-flight queueing). Counts only — no timing.
-std::atomic<int64_t> g_upd_loc_count{0};  // UpdateObjectLocationBatch (reports IN)
-std::atomic<int64_t> g_pub_loc_count{0};  // WORKER_OBJECT_LOCATIONS publishes OUT (total)
-std::atomic<int64_t> g_sub_count{0};      // object-location subscribes IN
-// Publishes split BY TRIGGER, to explain what a publish burst actually is:
-std::atomic<int64_t> g_pub_add{0};    // triggered by AddObjectLocation (restored/created)
-std::atomic<int64_t> g_pub_rem{0};    // triggered by RemoveObjectLocation (evicted from a node)
-std::atomic<int64_t> g_pub_spill{0};  // triggered by HandleObjectSpilled
-std::atomic<int64_t> g_pub_ns{0};     // cumulative ns spent inside the publish call (per-op cost)
-std::atomic<int64_t> g_pub_suppressed{0};  // publishes skipped by suppress-local-spill-churn fix
-// The deletion wave: owner-driven FreeLocalObjects sends (previously invisible,
-// only inferrable from reftab decline). g_free_obj = objects freed by the owner;
-// g_free_rpc = FreeLocalObjects RPCs actually sent (= sum of per-object locations).
-// The gap between them is the headroom for batch-per-node FreeLocalObjects.
-std::atomic<int64_t> g_free_obj{0};   // objects freed at FreeObjectOnNodesAsync entry
-std::atomic<int64_t> g_free_rpc{0};   // FreeLocalObjects RPCs sent (one per location today)
-
 namespace {
-// Diagnostic (gated by env RAY_refcnt_lockwait_log): appends io_service_
-// scheduling lag to /tmp/raylet_ioservice_events.out (bench.agg picks it up).
-// HandlePubsubCommandBatch — the location-subscribe serving RPC — runs on
-// io_service_; if this lags ~= the first_loc_cb tail, io_service saturation
-// (not lock contention) is the proven cause.
-std::ofstream &IoServiceEventLog() {
-  static std::ofstream stream = [] {
-    std::ofstream s;
-    if (std::getenv("RAY_refcnt_lockwait_log") != nullptr) {
-      s.open("/tmp/raylet_ioservice_events.out", std::ios::app);
-    }
-    return s;
-  }();
-  return stream;
-}
-
 // Default capacity for serialization caches.
 constexpr size_t kDefaultSerializationCacheCap = 500;
 
@@ -518,131 +477,6 @@ CoreWorker::CoreWorker(
         [this] { ExitIfParentRayletDies(); },
         RayConfig::instance().raylet_death_check_interval_milliseconds(),
         "CoreWorker.ExitIfParentRayletDies");
-  }
-
-  // Diagnostic: io_service_ scheduling-lag heartbeat. Runs on io_service_ (same
-  // service as HandlePubsubCommandBatch). A fire scheduled every 20ms that
-  // actually arrives late means io_service_ is saturated -> location-subscribe
-  // serving is starved -> that is the reduce-get first_loc_cb tail.
-  if (std::getenv("RAY_refcnt_lockwait_log") != nullptr) {
-    const bool is_driver = options_.worker_type == WorkerType::DRIVER;
-    const int64_t start_ns = absl::GetCurrentTimeNanos();
-    auto last_ns = std::make_shared<int64_t>(start_ns);
-    auto tick = std::make_shared<int64_t>(0);
-    auto win_max_lag = std::make_shared<double>(0.0);
-    auto last_upd = std::make_shared<int64_t>(0);
-    auto last_pub = std::make_shared<int64_t>(0);
-    auto last_sub = std::make_shared<int64_t>(0);
-    auto last_padd = std::make_shared<int64_t>(0);
-    auto last_prem = std::make_shared<int64_t>(0);
-    auto last_pspill = std::make_shared<int64_t>(0);
-    auto last_pubns = std::make_shared<int64_t>(0);
-    auto last_psup = std::make_shared<int64_t>(0);
-    auto last_free_obj = std::make_shared<int64_t>(0);
-    auto last_free_rpc = std::make_shared<int64_t>(0);
-    // Service-time / utilization accumulators (needs RAY_event_stats=1): Σ handler
-    // exec-time last window, wall time of last dump, and per-name cum exec/count
-    // to delta against for per-handler mean service time.
-    auto last_busy_ns = std::make_shared<int64_t>(0);
-    auto last_dump_ns = std::make_shared<int64_t>(start_ns);
-    auto prev_exec = std::make_shared<std::unordered_map<std::string, int64_t>>();
-    auto prev_cnt = std::make_shared<std::unordered_map<std::string, int64_t>>();
-    periodical_runner_->RunFnPeriodically(
-        [=] {
-          const int64_t now = absl::GetCurrentTimeNanos();
-          const double lag_ms = (now - *last_ns) / 1e6 - 20.0;  // expected 20ms
-          *last_ns = now;
-          if (lag_ms > *win_max_lag) *win_max_lag = lag_ms;
-          // Every ~1s emit a CLEAN phase-bucket line: elapsed time, per-handler
-          // DELTA counts this window, and the worst io_service lag this window.
-          // Counts are plain atomics (trustworthy); overlay app phase boundaries
-          // (creation-end / pull-start) to see WHICH phase saturates the loop.
-          if ((++*tick % 50) == 0 && IoServiceEventLog().is_open()) {
-            const int64_t u = g_upd_loc_count.load(std::memory_order_relaxed);
-            const int64_t p = g_pub_loc_count.load(std::memory_order_relaxed);
-            const int64_t s = g_sub_count.load(std::memory_order_relaxed);
-            const int64_t pa = g_pub_add.load(std::memory_order_relaxed);
-            const int64_t pr = g_pub_rem.load(std::memory_order_relaxed);
-            const int64_t ps = g_pub_spill.load(std::memory_order_relaxed);
-            const int64_t fo = g_free_obj.load(std::memory_order_relaxed);
-            const int64_t fr = g_free_rpc.load(std::memory_order_relaxed);
-            const int64_t pubns = g_pub_ns.load(std::memory_order_relaxed);
-            const int64_t dpub = p - *last_pub;
-            // mean us spent per publish this window (per-op publish cost) + the
-            // reference-table size (does per-op cost grow with table size?).
-            const double pub_us = dpub > 0 ? (pubns - *last_pubns) / 1e3 / dpub : 0.0;
-            // Loop utilization + per-handler service time from event_stats
-            // (populated only when RAY_event_stats=1). util = fraction of this
-            // window the single loop spent EXECUTING handlers; svc = per-name
-            // exec-time delta this window (answers "who ate the loop").
-            struct SvcRow {
-              int64_t dexec_ns;
-              int64_t dcnt;
-              std::string name;
-            };
-            const int64_t win_wall_ns = now - *last_dump_ns;
-            // True loop CPU: only on-loop dispatch time (RecordExecution), NOT the
-            // client-call round-trips that pollute cum_execution_time via RecordEnd.
-            const int64_t total_exec_ns = io_service_.stats()->loop_dispatch_ns();
-            std::vector<SvcRow> svc;
-            {
-              auto ev = io_service_.stats()->get_event_stats();
-              for (auto &kv : ev) {
-                const int64_t de = kv.second.cum_execution_time - (*prev_exec)[kv.first];
-                const int64_t dc = kv.second.cum_count - (*prev_cnt)[kv.first];
-                (*prev_exec)[kv.first] = kv.second.cum_execution_time;
-                (*prev_cnt)[kv.first] = kv.second.cum_count;
-                if (de > 0) svc.push_back({de, dc, kv.first});
-              }
-            }
-            const int64_t busy_ns = total_exec_ns - *last_busy_ns;
-            const double util = win_wall_ns > 0 ? (double)busy_ns / win_wall_ns : 0.0;
-            std::sort(svc.begin(), svc.end(),
-                      [](const SvcRow &a, const SvcRow &b) { return a.dexec_ns > b.dexec_ns; });
-            IoServiceEventLog()
-                << "phase=hbucket wt=" << (is_driver ? "D" : "W")
-                << " t_ms=" << (now - start_ns) / 1e6
-                << " d_upd=" << (u - *last_upd) << " d_pub=" << dpub
-                << " d_sub=" << (s - *last_sub)
-                << " d_padd=" << (pa - *last_padd) << " d_prem=" << (pr - *last_prem)
-                << " d_pspill=" << (ps - *last_pspill)
-                << " pub_us=" << pub_us << " reftab=" << reference_counter_->Size()
-                << " d_psup="
-                << (g_pub_suppressed.load(std::memory_order_relaxed) - *last_psup)
-                << " d_free=" << (fo - *last_free_obj)
-                << " d_freerpc=" << (fr - *last_free_rpc)
-                << " util=" << util << " busy_ms=" << (busy_ns / 1e6)
-                << " lag_ms=" << *win_max_lag << "\n";
-            // Top handlers by exec-time this window (per-handler service time).
-            {
-              auto &os = IoServiceEventLog();
-              os << "phase=svc t_ms=" << (now - start_ns) / 1e6;
-              const size_t topn = std::min<size_t>(8, svc.size());
-              for (size_t k = 0; k < topn; ++k) {
-                os << " | " << svc[k].name << " exec_ms=" << (svc[k].dexec_ns / 1e6)
-                   << " n=" << svc[k].dcnt << " mean_us="
-                   << (svc[k].dcnt > 0 ? svc[k].dexec_ns / 1e3 / svc[k].dcnt : 0.0);
-              }
-              os << "\n";
-            }
-            IoServiceEventLog().flush();
-            *last_busy_ns = total_exec_ns;
-            *last_dump_ns = now;
-            *last_upd = u;
-            *last_pub = p;
-            *last_sub = s;
-            *last_padd = pa;
-            *last_prem = pr;
-            *last_pspill = ps;
-            *last_pubns = pubns;
-            *last_psup = g_pub_suppressed.load(std::memory_order_relaxed);
-            *last_free_obj = fo;
-            *last_free_rpc = fr;
-            *win_max_lag = 0.0;
-          }
-        },
-        20,
-        "CoreWorker.IoServiceLagProbe");
   }
 
   /// If periodic asio stats print is enabled, it will print it.
@@ -4135,7 +3969,6 @@ void CoreWorker::HandleUpdateObjectLocationBatch(
     rpc::UpdateObjectLocationBatchRequest request,
     rpc::UpdateObjectLocationBatchReply *reply,
     rpc::SendReplyCallback send_reply_callback) {
-  g_upd_loc_count.fetch_add(1, std::memory_order_relaxed);
   const auto &worker_id = request.intended_worker_id();
   if (HandleWrongRecipient(WorkerID::FromBinary(worker_id), send_reply_callback)) {
     return;
@@ -4251,7 +4084,6 @@ void CoreWorker::RemoveObjectLocationOwner(const ObjectID &object_id,
 
 void CoreWorker::ProcessSubscribeObjectLocations(
     const rpc::WorkerObjectLocationsSubMessage &message) {
-  g_sub_count.fetch_add(1, std::memory_order_relaxed);
   const auto intended_worker_id = WorkerID::FromBinary(message.intended_worker_id());
   const auto object_id = ObjectID::FromBinary(message.object_id());
 
@@ -5054,13 +4886,11 @@ void CoreWorker::FreeObjectOnNodesAsync(const ObjectID &object_id,
   rpc::FreeLocalObjectsRequest request;
   request.add_object_ids(object_id.Binary());
 
-  g_free_obj.fetch_add(1, std::memory_order_relaxed);
   for (const auto &node_id : locations) {
     auto client = GetRayletRpcClient(node_id);
     if (client == nullptr) {
       continue;
     }
-    g_free_rpc.fetch_add(1, std::memory_order_relaxed);
     client->FreeLocalObjects(request);
   }
 }

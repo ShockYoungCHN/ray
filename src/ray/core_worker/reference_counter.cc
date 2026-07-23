@@ -14,9 +14,6 @@
 
 #include "ray/core_worker/reference_counter.h"
 
-#include <atomic>
-#include <cstdlib>
-#include <fstream>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -24,7 +21,6 @@
 #include <utility>
 #include <vector>
 
-#include "absl/time/clock.h"
 #include "ray/util/logging.h"
 #include "ray/util/network_util.h"
 
@@ -33,38 +29,6 @@
 
 namespace ray {
 namespace core {
-
-// Defined in core_worker.cc; counts WORKER_OBJECT_LOCATIONS publishes for the
-// clean phase-tagged handler probe (total + split by trigger).
-extern std::atomic<int64_t> g_pub_loc_count;
-extern std::atomic<int64_t> g_pub_add;
-extern std::atomic<int64_t> g_pub_rem;
-extern std::atomic<int64_t> g_pub_spill;
-extern std::atomic<int64_t> g_pub_ns;
-extern std::atomic<int64_t> g_pub_suppressed;
-
-// Gate for the "suppress local-spill location churn" fix (read env once).
-static bool SuppressLocalSpillChurn() {
-  static const bool on = std::getenv("RAY_suppress_local_spill_churn") != nullptr;
-  return on;
-}
-
-namespace {
-// Diagnostic (gated by env RAY_refcnt_lockwait_log): appends to
-// /tmp/raylet_refcnt_events.out so bench.agg picks it up. Proves whether the
-// owner's location-subscribe publish is delayed by contention on the global
-// ReferenceCounter mutex_ (the executor's task-submission / ref churn holds it).
-std::ofstream &RefcntEventLog() {
-  static std::ofstream stream = [] {
-    std::ofstream s;
-    if (std::getenv("RAY_refcnt_lockwait_log") != nullptr) {
-      s.open("/tmp/raylet_refcnt_events.out", std::ios::app);
-    }
-    return s;
-  }();
-  return stream;
-}
-}  // namespace
 
 size_t ReferenceCounter::Size() const {
   absl::MutexLock lock(&mutex_);
@@ -1527,7 +1491,6 @@ void ReferenceCounter::AddObjectLocationInternal(ReferenceTable::iterator it,
     // Only push to subscribers if we added a new location. We eagerly add the pinned
     // location without waiting for the object store notification to trigger a location
     // report, so there's a chance that we already knew about the node_id location.
-    g_pub_add.fetch_add(1, std::memory_order_relaxed);
     PushToLocationSubscribers(it);
   }
 }
@@ -1552,16 +1515,6 @@ bool ReferenceCounter::RemoveObjectLocation(const ObjectID &object_id,
 void ReferenceCounter::RemoveObjectLocationInternal(ReferenceTable::iterator it,
                                                     const NodeID &node_id) {
   it->second.locations.erase(node_id);
-  // FIX (gated by RAY_suppress_local_spill_churn): a locally-spilled object is
-  // still servable at its pinned node (served from disk via PushFromFilesystem),
-  // and FillObjectInformationInternal already advertises pinned_at_node_id in every
-  // snapshot. So publishing a plasma-copy removal changes nothing a subscriber can
-  // use -> skip the publish. Only skip when the pinned (servable) node is intact.
-  if (SuppressLocalSpillChurn() && it->second.pinned_at_node_id_.has_value()) {
-    g_pub_suppressed.fetch_add(1, std::memory_order_relaxed);
-    return;
-  }
-  g_pub_rem.fetch_add(1, std::memory_order_relaxed);
   PushToLocationSubscribers(it);
 }
 
@@ -1624,17 +1577,7 @@ bool ReferenceCounter::HandleObjectSpilled(const ObjectID &object_id,
     if (!spilled_node_id.IsNil()) {
       it->second.spilled_node_id = spilled_node_id;
     }
-    // FIX (gated): LOCAL spill (spilled_node_id != Nil) keeps the object servable
-    // at that same node, already advertised via pinned_at_node_id -> the spill
-    // publish is redundant. Skip it. Cloud spill (spilled_node_id == Nil) genuinely
-    // moves the object off-node, so it still publishes.
-    if (SuppressLocalSpillChurn() && !spilled_node_id.IsNil() &&
-        it->second.pinned_at_node_id_.has_value()) {
-      g_pub_suppressed.fetch_add(1, std::memory_order_relaxed);
-    } else {
-      g_pub_spill.fetch_add(1, std::memory_order_relaxed);
-      PushToLocationSubscribers(it);
-    }
+    PushToLocationSubscribers(it);
   } else {
     RAY_LOG(DEBUG).WithField(spilled_node_id).WithField(object_id)
         << "Object spilled to dead node ";
@@ -1762,7 +1705,6 @@ bool ReferenceCounter::IsObjectPendingCreation(const ObjectID &object_id) const 
 }
 
 void ReferenceCounter::PushToLocationSubscribers(ReferenceTable::iterator it) {
-  g_pub_loc_count.fetch_add(1, std::memory_order_relaxed);
   const auto &object_id = it->first;
   const auto &locations = it->second.locations;
   auto object_size = it->second.object_size_;
@@ -1781,9 +1723,7 @@ void ReferenceCounter::PushToLocationSubscribers(ReferenceTable::iterator it) {
   auto object_locations_msg = pub_message.mutable_worker_object_locations_message();
   FillObjectInformationInternal(it, object_locations_msg);
 
-  const int64_t _pub_t0 = absl::GetCurrentTimeNanos();
   object_info_publisher_->Publish(std::move(pub_message));
-  g_pub_ns.fetch_add(absl::GetCurrentTimeNanos() - _pub_t0, std::memory_order_relaxed);
 }
 
 void ReferenceCounter::FillObjectInformation(
@@ -1807,19 +1747,6 @@ void ReferenceCounter::FillObjectInformationInternal(
   for (const auto &node_id : it->second.locations) {
     object_info->add_node_ids(node_id.Binary());
   }
-  // Also advertise the primary-copy node when it is not already in `locations`.
-  // A spilled-but-in-scope object keeps `pinned_at_node_id_` (the node that holds
-  // its spill file) but its plasma `locations` set is empty once the primary is
-  // evicted, and the spilled-URL report to us is async. Without this, a subscriber
-  // (e.g. a reduce task) gets an empty location snapshot and stalls until the URL
-  // lands (measured p99 ~760ms). Publishing the pinned node here — exactly as
-  // GetLocalityData already does for the scheduling hint — lets the subscriber pull
-  // from that node immediately; the object manager serves it from the spill file.
-  if (it->second.pinned_at_node_id_.has_value() &&
-      it->second.locations.find(it->second.pinned_at_node_id_.value()) ==
-          it->second.locations.end()) {
-    object_info->add_node_ids(it->second.pinned_at_node_id_.value().Binary());
-  }
   int64_t object_size = it->second.object_size_;
   if (object_size > 0) {
     object_info->set_object_size(it->second.object_size_);
@@ -1831,16 +1758,7 @@ void ReferenceCounter::FillObjectInformationInternal(
 }
 
 void ReferenceCounter::PublishObjectLocationSnapshot(const ObjectID &object_id) {
-  // Measure how long this subscribe-triggered publish waited for the global
-  // ReferenceCounter mutex_. If the tail here matches the subscriber-side
-  // first_loc_cb tail, the owner's lock contention (executor ref churn) is the
-  // proven cause of the reduce-get location-resolution tail.
-  const int64_t _lk_t0 = absl::GetCurrentTimeNanos();
   absl::MutexLock lock(&mutex_);
-  const double _lk_wait_ms = (absl::GetCurrentTimeNanos() - _lk_t0) / 1e6;
-  if (_lk_wait_ms > 2.0 && RefcntEventLog().is_open()) {
-    RefcntEventLog() << "phase=refcnt_lockwait wait_ms=" << _lk_wait_ms << "\n";
-  }
   auto it = object_id_refs_.find(object_id);
   if (it == object_id_refs_.end()) {
     RAY_LOG(WARNING).WithField(object_id)
