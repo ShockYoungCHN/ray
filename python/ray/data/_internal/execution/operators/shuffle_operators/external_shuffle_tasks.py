@@ -115,7 +115,7 @@ if _REDUCEPROF:
                 return pk(0.5), pk(0.9), vs[-1], sum(vs) / n
 
             out = [f"REDUCEPROF n={n} total_mean={tot:.1f}s"]
-            for k in ("resolve", "fetchdecode", "decode", "flush"):
+            for k in ("resolve", "fetchdecode", "decode", "concat", "write", "flush"):
                 p50, p90, mx, mean = agg(k)
                 pct = 100 * mean / tot if tot else 0.0
                 out.append(
@@ -510,7 +510,7 @@ def _external_shuffle_reduce_task(
     """
     start_time_s = time.perf_counter()
     _prof = (
-        {"resolve": 0.0, "fetchdecode": 0.0, "decode": 0.0, "flush": 0.0}
+        {"resolve": 0.0, "fetchdecode": 0.0, "decode": 0.0, "flush": 0.0, "concat": 0.0, "write": 0.0}
         if _REDUCEPROF
         else None
     )
@@ -604,14 +604,26 @@ def _external_shuffle_reduce_task(
                 )
             # Wrap in a 1-element list — external is single-input, but
             # reduce_fn's signature is ``(partition_id, tables_by_input)``.
-            for block in reduce_fn(partition_id, [tables]):
+            # PROBE: materialize reduce_fn output first to time the concat
+            # (compute) separately from the _emit (write = parquet encode+disk).
+            _t = time.perf_counter()
+            blocks = list(reduce_fn(partition_id, [tables]))
+            if _prof is not None:
+                _prof["concat"] += time.perf_counter() - _t
+            for block in blocks:
                 if output_buffer is None:
                     # target_max_block_size=None: emit blocks as-is.
+                    _t = time.perf_counter()
                     yield from _emit(block)
+                    if _prof is not None:
+                        _prof["write"] += time.perf_counter() - _t
                 else:
                     output_buffer.add_block(block)
                     while output_buffer.has_next():
+                        _t = time.perf_counter()
                         yield from _emit(output_buffer.next())
+                        if _prof is not None:
+                            _prof["write"] += time.perf_counter() - _t
 
         # O_RDWR: same fd serves ``os.pwrite`` from fetch threads AND
         # ``os.pread`` from decode. Sticking with plain file I/O (no
