@@ -14,7 +14,6 @@
 
 #pragma once
 
-#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -22,10 +21,7 @@
 #include <utility>
 #include <vector>
 
-#include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
-#include "absl/synchronization/mutex.h"
-#include "absl/time/time.h"
 #include "ray/asio/instrumented_io_context.h"
 #include "ray/common/id.h"
 #include "ray/common/status.h"
@@ -133,11 +129,6 @@ class ObjectManagerInterface {
   virtual void RecordMetrics() = 0;
   virtual void HandleObjectAdded(const ObjectInfo &object_info) = 0;
   virtual void HandleObjectDeleted(const ObjectID &object_id) = 0;
-  /// Notification that an object finished spilling and is now servable from its
-  /// local spill file. Default no-op so mock/test implementers need not
-  /// override; ObjectManager overrides it to drain push requests that queued
-  /// while the object was mid-spill.
-  virtual void OnObjectSpilled(const ObjectID &object_id) {}
 
   virtual ~ObjectManagerInterface() = default;
 };
@@ -224,15 +215,7 @@ class ObjectManager : public ObjectManagerInterface,
   ///
   /// \param object_id The object's object id.
   /// \param node_id The remote node's id.
-  /// `pull_recv_ns`: wall-clock (from absl::GetCurrentTimeNanos()) at which
-  /// this node's HandlePull received the Pull RPC for this object. Threads
-  /// through Push -> PushLocal/PushFromFilesystem -> PushObjectInternal so
-  /// the eventual `phase=push_started` line can report elapsed time
-  /// between Pull-recv and StartPush. `0` means "not measured / synthetic
-  /// re-Push" (e.g. the second Push that fires after HandleObjectAdded
-  /// picks the value up out of `unfulfilled_push_requests_` instead).
-  void Push(const ObjectID &object_id, const NodeID &node_id,
-            int64_t pull_recv_ns = 0);
+  void Push(const ObjectID &object_id, const NodeID &node_id);
 
   /// Pull a bundle of objects. This will attempt to make all objects in the
   /// bundle local until the request is canceled with the returned ID.
@@ -306,21 +289,15 @@ class ObjectManager : public ObjectManagerInterface,
   ///
   /// \param object_id The object's object id.
   /// \param node_id The remote node's id.
-  /// \param pull_recv_ns See Push(); threaded through so PushObjectInternal
-  ///        can emit `phase=push_started pull_to_start_ms=...`.
-  void PushLocalObject(const ObjectID &object_id, const NodeID &node_id,
-                       int64_t pull_recv_ns = 0);
+  void PushLocalObject(const ObjectID &object_id, const NodeID &node_id);
 
   /// Pushing a known spilled object to a remote object manager.
   /// \param object_id The object's object id.
   /// \param node_id The remote node's id.
   /// \param spilled_url The url of the spilled object.
-  /// \param pull_recv_ns See Push(); threaded through so PushObjectInternal
-  ///        can emit `phase=push_started pull_to_start_ms=...`.
   void PushFromFilesystem(const ObjectID &object_id,
                           const NodeID &node_id,
-                          const std::string &spilled_url,
-                          int64_t pull_recv_ns = 0);
+                          const std::string &spilled_url);
 
   /// The internal implementation of pushing an object.
   ///
@@ -333,8 +310,7 @@ class ObjectManager : public ObjectManagerInterface,
   void PushObjectInternal(const ObjectID &object_id,
                           const NodeID &node_id,
                           std::shared_ptr<ChunkObjectReader> chunk_reader,
-                          bool from_disk,
-                          int64_t pull_recv_ns = 0);
+                          bool from_disk);
 
   /// Send one chunk of the object to remote object manager
   ///
@@ -349,11 +325,6 @@ class ObjectManager : public ObjectManagerInterface,
   /// \param chunk_reader Chunk reader used to read a chunk of the object
   /// \param from_disk Whether chunk is being read from disk or plasma. This is
   /// used only for metrics.
-  /// \param get_chunk_ns_total Shared accumulator for cumulative wall-clock
-  /// time spent inside ``chunk_reader->GetChunk`` across all chunks of one
-  /// push.  Used by PushObjectInternal to split out the spill-file read
-  /// portion of drain_ms in the ``phase=object_pushed`` line.  May be
-  /// nullptr (tests / future callers that don't need the breakdown).
   void SendObjectChunk(const UniqueID &push_id,
                        const ObjectID &object_id,
                        const NodeID &node_id,
@@ -361,8 +332,7 @@ class ObjectManager : public ObjectManagerInterface,
                        std::shared_ptr<rpc::ObjectManagerClientInterface> rpc_client,
                        std::function<void(const Status &)> on_complete,
                        std::shared_ptr<ChunkObjectReader> chunk_reader,
-                       bool from_disk,
-                       std::shared_ptr<std::atomic<int64_t>> get_chunk_ns_total);
+                       bool from_disk);
 
   /// Handle starting, running, and stopping asio rpc_service.
   void StartRpcService();
@@ -378,12 +348,6 @@ class ObjectManager : public ObjectManagerInterface,
   /// with directory. This also asks the pull manager to fetch this object again
   /// as soon as possible.
   void HandleObjectDeleted(const ObjectID &object_id) override;
-
-  /// Handle an object finishing spilling to local disk. Drains push requests
-  /// that queued while the object was mid-spill (servable neither from plasma
-  /// nor a spill URL), re-dispatching them now that PushFromFilesystem can
-  /// serve the object. Mirrors the HandleObjectAdded rescue path.
-  void OnObjectSpilled(const ObjectID &object_id) override;
 
   /// This is used to notify the main thread that the sending of a chunk has
   /// completed.
@@ -483,25 +447,11 @@ class ObjectManager : public ObjectManagerInterface,
   /// subscribe multiple times to the same object during Pull.
   UniqueID object_directory_pull_callback_id_ = UniqueID::FromRandom();
 
-  /// Value for `unfulfilled_push_requests_`. Carries both the cleanup
-  /// timer (unchanged behavior) and the wall-clock nanoseconds at which
-  /// HandlePull first observed this (object_id, requester) pair, so the
-  /// eventual `phase=push_started` line emitted when the object becomes
-  /// local can report `pull_to_start_ms` — the elapsed time between the
-  /// Pull RPC arriving on the sender and the first StartPush call for it.
-  /// This gap is invisible in every existing metric (push_wall_ms starts
-  /// at StartPush; bundle_locate is on the receiver side), and it's the
-  /// primary suspect for the ~3s tail observed in top-1% object latencies
-  /// where push_wall is small but first_byte is ≈3s.
-  struct UnfulfilledPushRequest {
-    std::unique_ptr<boost::asio::deadline_timer> timer;
-    int64_t pull_recv_ns = 0;
-  };
-
   /// Maintains a map of push requests that have not been fulfilled due to an object not
   /// being local. Objects are removed from this map after push_timeout_ms have elapsed.
-  absl::flat_hash_map<ObjectID,
-                      absl::flat_hash_map<NodeID, UnfulfilledPushRequest>>
+  absl::flat_hash_map<
+      ObjectID,
+      absl::flat_hash_map<NodeID, std::unique_ptr<boost::asio::deadline_timer>>>
       unfulfilled_push_requests_;
 
   /// The gPRC server.
@@ -544,38 +494,6 @@ class ObjectManager : public ObjectManagerInterface,
   size_t num_bytes_received_total_ = 0;
   size_t num_bytes_pushed_from_disk_ = 0;
   size_t num_bytes_pushed_from_plasma_ = 0;
-
-  /// Per-object timestamp of when the local raylet's PullManager fired the
-  /// Pull RPC for that object. Consumed (and erased) when the first chunk
-  /// of that object arrives in `HandlePush`, to emit `phase=object_first_byte`.
-  /// Overwritten on retry. Accessed from both `SendPullRequest` (main
-  /// service thread) and `HandlePush` (gRPC handler thread), so guarded
-  /// by `pull_sent_time_mu_`. The map is bounded by the number of in-flight
-  /// pulls without a first chunk yet, typically small.
-  absl::Mutex pull_sent_time_mu_;
-  absl::flat_hash_map<ObjectID, absl::Time> pull_sent_time_
-      ABSL_GUARDED_BY(pull_sent_time_mu_);
-  /// Cumulative count of Pull RPCs we have ever fired for each object_id
-  /// over this raylet's lifetime. Incremented in SendPullRequest, read by
-  /// HandlePush when emitting `object_first_byte` (carried as `attempt=N`).
-  /// `attempt > 1` ⇒ this object was Pull-ed at least twice — either an
-  /// in-session retry, or, more interestingly, an evicted-and-re-pulled
-  /// cycle (object once landed in our plasma, was later evicted, and is
-  /// now being fetched again). The aggregator distinguishes the two by
-  /// joining with the previous attempt's `object_first_byte` line. Grows
-  /// with the unique-object-id count over raylet lifetime; bounded in
-  /// practice by the number of distinct objects this node ever pulled.
-  absl::flat_hash_map<ObjectID, int64_t> pull_attempt_count_
-      ABSL_GUARDED_BY(pull_sent_time_mu_);
-
-  /// Wall-clock (ns) at which the receiver last saw ANY chunk of a given
-  /// object arrive. Used to emit `chunk_received.gap_from_prev_ms` so we
-  /// can distinguish "sender pushed all chunks together, network stalled
-  /// on one" from "sender is trickling chunks out slowly". Erased when
-  /// the last chunk arrives (buffer_pool marks the object sealed).
-  /// Accessed on the gRPC HandlePush thread — same lock as pull_sent_time_.
-  absl::flat_hash_map<ObjectID, int64_t> last_chunk_recv_ns_
-      ABSL_GUARDED_BY(pull_sent_time_mu_);
 
   /// Running total of received chunks.
   size_t num_chunks_received_total_ = 0;

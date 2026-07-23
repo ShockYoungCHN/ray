@@ -42,7 +42,6 @@
 #include "ray/core_worker_rpc_client/core_worker_client_pool.h"
 #include "ray/gcs_rpc_client/gcs_client.h"
 #include "ray/object_manager/ownership_object_directory.h"
-#include "ray/object_manager/pull_manager.h"
 #include "ray/object_manager_rpc_client/object_manager_client.h"
 #include "ray/raylet/local_object_manager.h"
 #include "ray/raylet/local_object_manager_interface.h"
@@ -889,11 +888,7 @@ int main(int argc, char *argv[]) {
         object_directory.get(),
         object_store_memory_gauge,
         spill_manager_metrics,
-        clock,
-        /*on_object_spilled*/
-        [&](const ray::ObjectID &object_id) {
-          object_manager->OnObjectSpilled(object_id);
-        });
+        clock);
 
     lease_dependency_manager = std::make_unique<ray::raylet::LeaseDependencyManager>(
         *object_manager, task_by_state_counter);
@@ -1104,20 +1099,6 @@ int main(int argc, char *argv[]) {
                         RayConfig::instance().event_level(),
                         RayConfig::instance().emit_event_to_log_file());
     };
-
-    // Dedicated event logs. High volume + structured + consumed by ad-hoc
-    // aggregation tooling rather than the dashboard event pipeline. Each is
-    // gated by its own env var so neither is paid for unless requested.
-    // - Spill events: raylet_spill_events.out  (RAY_spill_manager_event_log_enabled)
-    // - Pull events:  raylet_pull_events.out   (RAY_pull_manager_event_log_enabled)
-    if (!log_dir.empty()) {
-      if (RayConfig::instance().spill_manager_event_log_enabled()) {
-        ray::raylet::InitSpillEventLogger(log_dir);
-      }
-      if (RayConfig::instance().pull_manager_event_log_enabled()) {
-        ray::InitPullEventLogger(log_dir);
-      }
-    }
 
     ray::rpc::GcsNodeInfo self_node_info;
     self_node_info.set_node_id(raylet_node_id.Binary());
