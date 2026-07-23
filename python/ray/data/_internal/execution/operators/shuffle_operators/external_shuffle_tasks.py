@@ -86,6 +86,60 @@ _DEFAULT_MAX_BYTES_PER_FETCH = 256 * 1024 * 1024  # 256 MiB per FETCH frame
 # tied to #managers.
 _DEFAULT_FETCH_THREADS = 16
 
+# --- Reduce-phase profiler (RAY_SHUFFLE_REDUCEPROF=1) --------------------------
+# Each reduce sends its per-phase timings to ONE detached collector actor; the
+# driver prints a single aggregated summary (p50/p90/max/%%). No per-reduce log
+# lines -> immune to the ~10k-line `job logs` cap even at 8192 reducers.
+_REDUCEPROF = os.environ.get("RAY_SHUFFLE_REDUCEPROF") == "1"
+
+if _REDUCEPROF:
+
+    @ray.remote(num_cpus=0)
+    class _ReduceProfCollector:
+        def __init__(self):
+            self.rows = []
+
+        def record(self, r):
+            self.rows.append(r)
+
+        def summary(self):
+            rows = self.rows
+            if not rows:
+                return "REDUCEPROF no rows"
+            n = len(rows)
+            tot = sum(r.get("total", 0.0) for r in rows) / n
+
+            def agg(k):
+                vs = sorted(r.get(k, 0.0) for r in rows)
+                pk = lambda q: vs[min(len(vs) - 1, int(q * len(vs)))]  # noqa: E731
+                return pk(0.5), pk(0.9), vs[-1], sum(vs) / n
+
+            out = [f"REDUCEPROF n={n} total_mean={tot:.1f}s"]
+            for k in ("resolve", "fetchdecode", "decode", "flush"):
+                p50, p90, mx, mean = agg(k)
+                pct = 100 * mean / tot if tot else 0.0
+                out.append(
+                    f"  {k:11} p50={p50:6.2f} p90={p90:6.2f} max={mx:6.2f} "
+                    f"mean={mean:6.2f}s ({pct:4.1f}%)"
+                )
+            fw = sum(r.get("fetchdecode", 0.0) - r.get("decode", 0.0) for r in rows) / n
+            out.append(f"  fetch_wait  mean={fw:6.2f}s  (= fetchdecode - decode)")
+            return "\n".join(out)
+
+    def _rp_collector():
+        return _ReduceProfCollector.options(
+            name="reduceprof_collector",
+            namespace="reduceprof",
+            lifetime="detached",
+            get_if_exists=True,
+        ).remote()
+
+    def _rp_record(pid, prof):
+        try:
+            _rp_collector().record.remote(dict(prof, pid=pid))
+        except Exception:
+            pass
+
 
 def _index_to_csr(index, num_partitions):
     """Compact the per-partition range index into 3 flat CSR arrays.
@@ -422,11 +476,19 @@ def _external_shuffle_reduce_task(
         data_context: DataContext to install for the fused map, or None.
     """
     start_time_s = time.perf_counter()
+    _prof = (
+        {"resolve": 0.0, "fetchdecode": 0.0, "decode": 0.0, "flush": 0.0}
+        if _REDUCEPROF
+        else None
+    )
 
     # Pull per-partition source refs + an output schema for the empty-partition
     # fallback path (so the N-block contract still emits a typed 0-row block
     # when no mapper produced any data for this partition_id).
+    _t = time.perf_counter()
     sources, output_schema = _handles_to_sources(handles, partition_id)
+    if _prof is not None:
+        _prof["resolve"] = time.perf_counter() - _t
 
     def _yield_with_stats(block: Block):
         """Yield ``block`` then its pickled metadata. The two-yield protocol
@@ -580,23 +642,35 @@ def _external_shuffle_reduce_task(
                 os.fsync(fd)
                 _drop_pagecache(fd, base, size)
 
+            _t = time.perf_counter()
             with ThreadPoolExecutor(max_workers=n_threads) as ex:
                 futs = [ex.submit(_fetch_one, w) for w in work]
                 for fut in as_completed(futs):
                     base, size = fut.result()
                     if size > 0:
+                        _dt = time.perf_counter()
                         _decode_region(base, size)
+                        if _prof is not None:
+                            _prof["decode"] += time.perf_counter() - _dt
+            if _prof is not None:
+                _prof["fetchdecode"] = time.perf_counter() - _t
 
             # Drain the accumulator tail.
+            _t = time.perf_counter()
             if accum_tables:
                 yield from _flush(accum_tables)
             if output_buffer is not None:
                 output_buffer.finalize()
                 while output_buffer.has_next():
                     yield from _emit(output_buffer.next())
+            if _prof is not None:
+                _prof["flush"] = time.perf_counter() - _t
         finally:
             os.close(fd)
     finally:
+        if _prof is not None:
+            _prof["total"] = time.perf_counter() - start_time_s
+            _rp_record(partition_id, _prof)
         # Unlink only this reducer's own file. NOT rmdir(staging_dir): the dir
         # is shared per-node and rmdir races a concurrent reducer's open
         # (FileNotFoundError at 8TB). Teardown reclaims the empty dir.
