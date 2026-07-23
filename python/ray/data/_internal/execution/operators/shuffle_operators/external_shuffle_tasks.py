@@ -59,8 +59,6 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from ray.data._internal.execution.operators.shuffle_operators.shuffle_tasks import (  # noqa: E402,E501
     PartitionFn,
     ReduceFn,
-    _encode_partition_ipc,
-    _ipc_write_options,
 )
 from ray.data._internal.execution.operators.shuffle_operators.external_shuffle_runtime import (  # noqa: E402,E501
     _MAX_RANGE_BYTES,
@@ -73,6 +71,7 @@ from ray.data._internal.execution.operators.shuffle_operators.external_shuffle_r
     _manager_name,
     _prefetch_node_into,
     _PwriteSink,
+    _encode_shard,
     _read_ipc,
     ShuffleDiskError,
     ShuffleHandle,
@@ -134,6 +133,13 @@ if _REDUCEPROF:
                 f"  flush_split cpu={fcpu:6.2f}s ({cpu_pct:4.1f}% of flush = compute); "
                 f"rest = I/O-wait; wrote {fwmb:6.0f}MB ({mbps:5.0f}MB/s)"
             )
+            # Split flush CPU into concat (reduce_fn) vs write (parquet encode).
+            ccpu = sum(r.get("concat_cpu", 0.0) for r in rows) / n
+            wcpu = fcpu - ccpu
+            out.append(
+                f"  flush_cpu_split concat_cpu={ccpu:6.2f}s  "
+                f"write_cpu={wcpu:6.2f}s (= flush_cpu - concat_cpu = parquet encode)"
+            )
             return "\n".join(out)
 
     def _rp_collector():
@@ -172,6 +178,68 @@ if _REDUCEPROF:
         except Exception:
             pass
         return cpu, wchar
+
+
+# --- Map-phase profiler (RAY_SHUFFLE_MAPPROF=1) --------------------------------
+# Same collector-actor pattern as REDUCEPROF: each map sends per-phase timings
+# to one detached actor; the driver prints a single aggregated summary.
+_MAPPROF = os.environ.get("RAY_SHUFFLE_MAPPROF") == "1"
+
+if _MAPPROF:
+
+    @ray.remote(num_cpus=0)
+    class _MapProfCollector:
+        def __init__(self):
+            self.rows = []
+
+        def record(self, r):
+            self.rows.append(r)
+
+        def summary(self):
+            rows = self.rows
+            if not rows:
+                return "MAPPROF no rows"
+            n = len(rows)
+            tot = sum(r.get("total", 0.0) for r in rows) / n
+
+            def agg(k):
+                vs = sorted(r.get(k, 0.0) for r in rows)
+                pk = lambda q: vs[min(len(vs) - 1, int(q * len(vs)))]  # noqa: E731
+                return pk(0.5), pk(0.9), vs[-1], sum(vs) / n
+
+            out = [f"MAPPROF n={n} total_mean={tot:.1f}s"]
+            for k in ("partition", "encode", "write", "fsync"):
+                p50, p90, mx, mean = agg(k)
+                pct = 100 * mean / tot if tot else 0.0
+                out.append(
+                    f"  {k:10} p50={p50:6.2f} p90={p90:6.2f} max={mx:6.2f} "
+                    f"mean={mean:6.2f}s ({pct:4.1f}%)"
+                )
+            raw = sum(r.get("raw_mb", 0.0) for r in rows) / n
+            comp = sum(r.get("out_mb", 0.0) for r in rows) / n
+            enc = sum(r.get("encode", 0.0) for r in rows) / n
+            wr = sum(r.get("write", 0.0) for r in rows) / n
+            out.append(
+                f"  encode {raw:.0f}MB IPC -> {comp:.0f}MB zstd "
+                f"({(raw / comp) if comp else 0:.2f}x) "
+                f"@ {(raw / enc) if enc else 0:.0f}MB/s in; "
+                f"file write {(comp / wr) if wr else 0:.0f}MB/s"
+            )
+            return "\n".join(out)
+
+    def _mp_collector():
+        return _MapProfCollector.options(
+            name="mapprof_collector",
+            namespace="reduceprof",
+            lifetime="detached",
+            get_if_exists=True,
+        ).remote()
+
+    def _mp_record(map_id, prof):
+        try:
+            _mp_collector().record.remote(dict(prof, map_id=map_id))
+        except Exception:
+            pass
 
 
 def _index_to_csr(index, num_partitions):
@@ -225,12 +293,17 @@ class _PartitionSpillWriter:
         "_f",
         "_map_id",
         "_pool_budget_bytes",
-        "_ipc_write_options",
         "_staging",
         "_staging_bytes",
+        "_staging_total",
         "_index",
         "_decoded_bytes_per_partition",
         "_peak_inflight",
+        # MAPPROF counters (cheap; only reported when RAY_SHUFFLE_MAPPROF=1).
+        "encode_s",
+        "write_s",
+        "raw_bytes",
+        "out_bytes",
     )
 
     def __init__(
@@ -243,15 +316,19 @@ class _PartitionSpillWriter:
         self._f = f
         self._map_id = map_id
         self._pool_budget_bytes = pool_budget_bytes
-        self._ipc_write_options = _ipc_write_options(compression)
         self._staging: Dict[int, List[pa.Table]] = {}
         self._staging_bytes: Dict[int, int] = {}
+        self._staging_total = 0  # running sum -> _pool_size is O(1)
         self._index: Dict[int, List[Tuple[int, int]]] = {}
         self._decoded_bytes_per_partition: Dict[int, int] = {}
         self._peak_inflight = 0
+        self.encode_s = 0.0
+        self.write_s = 0.0
+        self.raw_bytes = 0
+        self.out_bytes = 0
 
     def _pool_size(self) -> int:
-        return sum(self._staging_bytes.values())
+        return self._staging_total
 
     def _flush(self, pid: int) -> None:
         shards = self._staging.get(pid)
@@ -262,7 +339,11 @@ class _PartitionSpillWriter:
         self._decoded_bytes_per_partition[pid] = (
             self._decoded_bytes_per_partition.get(pid, 0) + tbl.nbytes
         )
-        buf = _encode_partition_ipc(tbl, self._ipc_write_options)
+        _t = time.perf_counter()
+        buf = _encode_shard(tbl)
+        self.encode_s += time.perf_counter() - _t
+        self.raw_bytes += tbl.nbytes
+        self.out_bytes += buf.size
         # Refuse frames the u32 response-wire encoding can't represent.
         if buf.size > _MAX_RANGE_BYTES:
             raise RuntimeError(
@@ -272,9 +353,12 @@ class _PartitionSpillWriter:
                 f"``pool_budget_bytes`` or the upstream block size."
             )
         off = self._f.tell()
+        _t = time.perf_counter()
         self._f.write(memoryview(buf))
+        self.write_s += time.perf_counter() - _t
         self._index.setdefault(pid, []).append((off, buf.size))
         self._staging[pid] = []
+        self._staging_total -= self._staging_bytes[pid]
         self._staging_bytes[pid] = 0
 
     def add_shard(self, pid: int, shard: pa.Table) -> None:
@@ -282,6 +366,7 @@ class _PartitionSpillWriter:
             return
         self._staging.setdefault(pid, []).append(shard)
         self._staging_bytes[pid] = self._staging_bytes.get(pid, 0) + shard.nbytes
+        self._staging_total += shard.nbytes
         self._peak_inflight = max(self._peak_inflight, self._pool_size())
         # Spill LARGEST bucket(s) on overflow so total staging stays
         # bounded by ``pool_budget_bytes``.
@@ -389,6 +474,8 @@ def _external_shuffle_map_task(
 
     final_size_on_close = -1
     try:
+        _t_work = time.perf_counter()
+        _in_bytes = 0
         with open(tmp_path, "wb") as f:
             writer = _PartitionSpillWriter(
                 f, map_id, pool_budget_bytes, compression
@@ -400,6 +487,7 @@ def _external_shuffle_map_task(
                 # already Arrow.
                 if not isinstance(blk, pa.Table):
                     blk = BlockAccessor.for_block(blk).to_arrow()
+                _in_bytes += blk.nbytes
                 if output_schema is None:
                     # First-seen schema; reducer uses it to type empty
                     # partitions (ShuffleHandle["schema"]).
@@ -407,10 +495,15 @@ def _external_shuffle_map_task(
                 for pid, shard in _partition_units(blk):
                     writer.add_shard(pid, shard)
             writer.flush_all()
+            # partition = loop wall minus the encode/write the writer timed.
+            _partition_s = (
+                time.perf_counter() - _t_work - writer.encode_s - writer.write_s
+            )
 
             # userspace --flush-→ page cache --fsync-→ disk, then sanity-check the file
             # size matches the index. Mismatch = logic bug or silent short
             # write; refuse to publish (the except below unlinks tmp).
+            _t_fsync = time.perf_counter()
             f.flush()
             final_size_on_close = f.tell()
             if fsync_on_close:
@@ -418,6 +511,7 @@ def _external_shuffle_map_task(
                 # Drop the just-written pages so we don't hold GBs of
                 # warm cache per mapper.
                 _drop_pagecache(f.fileno(), 0, final_size_on_close)
+            _fsync_s = time.perf_counter() - _t_fsync
             if writer.index:
                 expected_size = max(
                     off + length
@@ -435,6 +529,20 @@ def _external_shuffle_map_task(
 
         # Atomic publish: .tmp → .shf.
         os.rename(tmp_path, final_path)
+        if _MAPPROF:
+            _mp_record(
+                map_id,
+                {
+                    "total": time.perf_counter() - _t_work,
+                    "partition": _partition_s,
+                    "encode": writer.encode_s,
+                    "write": writer.write_s,
+                    "fsync": _fsync_s,
+                    "raw_mb": writer.raw_bytes / 1e6,
+                    "out_mb": writer.out_bytes / 1e6,
+                    "in_mb": _in_bytes / 1e6,
+                },
+            )
     except Exception:
         # Don't leak a half-written .tmp in out_dir; Ray retries the task.
         try:
@@ -510,7 +618,7 @@ def _external_shuffle_reduce_task(
     """
     start_time_s = time.perf_counter()
     _prof = (
-        {"resolve": 0.0, "fetchdecode": 0.0, "decode": 0.0, "flush": 0.0, "concat": 0.0, "write": 0.0}
+        {"resolve": 0.0, "fetchdecode": 0.0, "decode": 0.0, "flush": 0.0, "concat": 0.0, "write": 0.0, "concat_cpu": 0.0}
         if _REDUCEPROF
         else None
     )
@@ -607,9 +715,14 @@ def _external_shuffle_reduce_task(
             # PROBE: materialize reduce_fn output first to time the concat
             # (compute) separately from the _emit (write = parquet encode+disk).
             _t = time.perf_counter()
+            _cc0, _cw0 = _proc_cpu_io() if _prof is not None else (0.0, 0)
             blocks = list(reduce_fn(partition_id, [tables]))
             if _prof is not None:
                 _prof["concat"] += time.perf_counter() - _t
+                _cc1, _cw1 = _proc_cpu_io()
+                # CPU cycles the reduce_fn (concat) burned; write_cpu is then
+                # flush_cpu - concat_cpu (parquet encode is the remainder).
+                _prof["concat_cpu"] += _cc1 - _cc0
             for block in blocks:
                 if output_buffer is None:
                     # target_max_block_size=None: emit blocks as-is.

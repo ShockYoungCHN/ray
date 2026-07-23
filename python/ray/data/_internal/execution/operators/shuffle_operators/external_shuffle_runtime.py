@@ -99,17 +99,39 @@ _MAX_RANGE_BYTES: int = (1 << 32) - 1
 
 
 # ----------------------------------------------------------------- Arrow IPC
-def _read_ipc(buf: Union[bytes, "pa.Buffer", memoryview]) -> pa.Table:
-    """Decode an IPC stream from bytes or a pa.Buffer view (e.g. mmap).
+# Shard wire format: ONE zstd frame over the whole uncompressed IPC stream,
+#     [u64 little-endian uncompressed_size][ zstd(uncompressed IPC stream) ]
+# instead of Arrow's per-buffer IPC compression (which makes one zstd blob per
+# column-buffer -> ~40 decompress calls + 40 allocs per lineitem shard). This
+# gives exactly ONE decompress + ONE alloc per shard at the reducer, and the
+# inner IPC is uncompressed so its buffers are read zero-copy. Codec is zstd at
+# its default level (matches the hash_shuffle_compression default).
+_WF_HEADER = struct.Struct("<Q")
+_SHARD_CODEC = pa.Codec("zstd")
 
-    pa.ipc.open_stream transparently handles compressed payloads, so this
-    works for both uncompressed and lz4/zstd IPC streams.
-    """
-    if isinstance(buf, (bytes, bytearray)):
-        source = pa.py_buffer(buf)
-    else:
-        source = buf
-    with pa.ipc.open_stream(source) as r:
+
+def _encode_shard(table: pa.Table) -> pa.Buffer:
+    """Encode one partition shard as a whole-frame zstd blob (see format above)."""
+    if table.num_columns > 0:
+        table = table.combine_chunks()
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, table.schema) as w:  # uncompressed inner IPC
+        for batch in table.to_batches():
+            w.write_batch(batch)
+    raw = sink.getvalue()
+    out = pa.BufferOutputStream()
+    out.write(_WF_HEADER.pack(raw.size))
+    out.write(_SHARD_CODEC.compress(raw))
+    return out.getvalue()
+
+
+def _read_ipc(buf: Union[bytes, "pa.Buffer", memoryview]) -> pa.Table:
+    """Decode a whole-frame shard: read the u64 size header, one zstd
+    decompress of the rest, then read the (uncompressed) IPC stream."""
+    src = pa.py_buffer(buf) if isinstance(buf, (bytes, bytearray)) else buf
+    n = _WF_HEADER.unpack_from(memoryview(src))[0]
+    raw = _SHARD_CODEC.decompress(src.slice(_WF_HEADER.size), decompressed_size=n)
+    with pa.ipc.open_stream(raw) as r:
         return r.read_all()
 
 
