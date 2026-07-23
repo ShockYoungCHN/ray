@@ -124,6 +124,16 @@ if _REDUCEPROF:
                 )
             fw = sum(r.get("fetchdecode", 0.0) - r.get("decode", 0.0) for r in rows) / n
             out.append(f"  fetch_wait  mean={fw:6.2f}s  (= fetchdecode - decode)")
+            # flush compute-vs-io: how much of flush wall was CPU, and MB written.
+            fcpu = sum(r.get("flush_cpu", 0.0) for r in rows) / n
+            fwall = sum(r.get("flush", 0.0) for r in rows) / n
+            fwmb = sum(r.get("flush_wmb", 0.0) for r in rows) / n
+            cpu_pct = 100 * fcpu / fwall if fwall else 0.0
+            mbps = fwmb / fwall if fwall else 0.0
+            out.append(
+                f"  flush_split cpu={fcpu:6.2f}s ({cpu_pct:4.1f}% of flush = compute); "
+                f"rest = I/O-wait; wrote {fwmb:6.0f}MB ({mbps:5.0f}MB/s)"
+            )
             return "\n".join(out)
 
     def _rp_collector():
@@ -139,6 +149,29 @@ if _REDUCEPROF:
             _rp_collector().record.remote(dict(prof, pid=pid))
         except Exception:
             pass
+
+    _CLK_TCK = os.sysconf("SC_CLK_TCK")
+
+    def _proc_cpu_io():
+        """(cpu_seconds, wchar_bytes) for THIS process — to split a phase into
+        compute (CPU busy) vs I/O-wait (wall >> cpu). cpu = utime+stime from
+        /proc/self/stat; wchar = bytes handed to write() from /proc/self/io."""
+        cpu = 0.0
+        try:
+            data = open("/proc/self/stat").read()
+            f = data[data.rfind(") ") + 2 :].split()  # skip pid + (comm)
+            cpu = (int(f[11]) + int(f[12])) / _CLK_TCK  # utime + stime
+        except Exception:
+            pass
+        wchar = 0
+        try:
+            for ln in open("/proc/self/io"):
+                if ln.startswith("wchar:"):
+                    wchar = int(ln.split()[1])
+                    break
+        except Exception:
+            pass
+        return cpu, wchar
 
 
 def _index_to_csr(index, num_partitions):
@@ -657,6 +690,7 @@ def _external_shuffle_reduce_task(
 
             # Drain the accumulator tail.
             _t = time.perf_counter()
+            _c0, _w0 = _proc_cpu_io() if _prof is not None else (0.0, 0)
             if accum_tables:
                 yield from _flush(accum_tables)
             if output_buffer is not None:
@@ -665,6 +699,9 @@ def _external_shuffle_reduce_task(
                     yield from _emit(output_buffer.next())
             if _prof is not None:
                 _prof["flush"] = time.perf_counter() - _t
+                _c1, _w1 = _proc_cpu_io()
+                _prof["flush_cpu"] = _c1 - _c0          # CPU seconds during flush
+                _prof["flush_wmb"] = (_w1 - _w0) / 1e6  # MB written during flush
         finally:
             os.close(fd)
     finally:
