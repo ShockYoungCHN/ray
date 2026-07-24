@@ -114,7 +114,8 @@ if _REDUCEPROF:
                 return pk(0.5), pk(0.9), vs[-1], sum(vs) / n
 
             out = [f"REDUCEPROF n={n} total_mean={tot:.1f}s"]
-            for k in ("resolve", "fetchdecode", "decode", "concat", "write", "flush"):
+            for k in ("resolve", "fetchdecode", "decode", "decompress", "combine",
+                      "fsync", "fadvise", "concat", "write", "flush"):
                 p50, p90, mx, mean = agg(k)
                 pct = 100 * mean / tot if tot else 0.0
                 out.append(
@@ -139,6 +140,12 @@ if _REDUCEPROF:
             out.append(
                 f"  flush_cpu_split concat_cpu={ccpu:6.2f}s  "
                 f"write_cpu={wcpu:6.2f}s (= flush_cpu - concat_cpu = parquet encode)"
+            )
+            # Isolated write CPU (apply_transform only, no yield/executor window).
+            wa = sum(r.get("write_apply_cpu", 0.0) for r in rows) / n
+            out.append(
+                f"  write_apply_cpu={wa:6.2f}s (apply_transform only; "
+                f"gap vs write_cpu = framework/yield CPU = {wcpu - wa:+.2f}s)"
             )
             return "\n".join(out)
 
@@ -208,7 +215,8 @@ if _MAPPROF:
                 return pk(0.5), pk(0.9), vs[-1], sum(vs) / n
 
             out = [f"MAPPROF n={n} total_mean={tot:.1f}s"]
-            for k in ("partition", "encode", "write", "fsync"):
+            for k in ("partition", "hashpart", "addshard", "flushresid",
+                      "encode", "write", "fsync"):
                 p50, p90, mx, mean = agg(k)
                 pct = 100 * mean / tot if tot else 0.0
                 out.append(
@@ -335,14 +343,17 @@ class _PartitionSpillWriter:
         if not shards:
             return
         tbl = pa.concat_tables(shards) if len(shards) > 1 else shards[0]
-        # ``tbl.nbytes`` is the decoded (pre-IPC, pre-compression) byte count.
+        # Reuse the byte count already summed in add_shard. Calling ``.nbytes``
+        # on a string-column slice recomputes referenced byte ranges (O(offsets),
+        # not O(1)); doing it per shard made the map O(partitions).
+        nb = self._staging_bytes[pid]
         self._decoded_bytes_per_partition[pid] = (
-            self._decoded_bytes_per_partition.get(pid, 0) + tbl.nbytes
+            self._decoded_bytes_per_partition.get(pid, 0) + nb
         )
         _t = time.perf_counter()
         buf = _encode_shard(tbl)
         self.encode_s += time.perf_counter() - _t
-        self.raw_bytes += tbl.nbytes
+        self.raw_bytes += nb
         self.out_bytes += buf.size
         # Refuse frames the u32 response-wire encoding can't represent.
         if buf.size > _MAX_RANGE_BYTES:
@@ -361,13 +372,17 @@ class _PartitionSpillWriter:
         self._staging_total -= self._staging_bytes[pid]
         self._staging_bytes[pid] = 0
 
-    def add_shard(self, pid: int, shard: pa.Table) -> None:
+    def add_shard(self, pid: int, shard: pa.Table, nb: int) -> None:
+        # ``nb`` = exact per-partition byte count, computed vectorized by the
+        # partitioner (or shard.nbytes fallback). Avoids calling .nbytes here:
+        # on a string-column slice it recomputes referenced byte ranges
+        # (O(offsets)), which per shard made the map O(partitions).
         if not shard.num_rows:
             return
         self._staging.setdefault(pid, []).append(shard)
-        self._staging_bytes[pid] = self._staging_bytes.get(pid, 0) + shard.nbytes
-        self._staging_total += shard.nbytes
-        self._peak_inflight = max(self._peak_inflight, self._pool_size())
+        self._staging_bytes[pid] = self._staging_bytes.get(pid, 0) + nb
+        self._staging_total += nb
+        self._peak_inflight = max(self._peak_inflight, self._staging_total)
         # Spill LARGEST bucket(s) on overflow so total staging stays
         # bounded by ``pool_budget_bytes``.
         while self._pool_size() >= self._pool_budget_bytes:
@@ -453,6 +468,8 @@ def _external_shuffle_map_task(
     tmp_path = final_path + ".tmp"
     output_schema: Optional[pa.Schema] = None
 
+    _prof_hp = [0.0]  # MAPPROF: time spent in partition_fn (hash_partition)
+
     def _partition_units(blk):
         """Yield (pid, shard).
         yield whole-block when the block already fits the pool (no overhead),
@@ -464,18 +481,27 @@ def _external_shuffle_map_task(
         batch_rows = max(1, pool_budget_bytes // avg_row)
         if blk.num_rows <= batch_rows:
             # block's partition spike is already ≤ pool → whole-block, no overhead
-            for pid, shard in partition_fn(blk).items():
-                yield pid, shard
+            _t = time.perf_counter()
+            res = partition_fn(blk)
+            _prof_hp[0] += time.perf_counter() - _t
+            parts, sizes = res if isinstance(res, tuple) else (res, None)
+            for pid, shard in parts.items():
+                yield pid, shard, int(sizes[pid]) if sizes is not None else shard.nbytes
         else:
             for batch in blk.to_batches(max_chunksize=batch_rows):
                 bt = pa.Table.from_batches([batch], schema=blk.schema)
-                for pid, shard in partition_fn(bt).items():
-                    yield pid, shard
+                _t = time.perf_counter()
+                res = partition_fn(bt)
+                _prof_hp[0] += time.perf_counter() - _t
+                parts, sizes = res if isinstance(res, tuple) else (res, None)
+                for pid, shard in parts.items():
+                    yield pid, shard, int(sizes[pid]) if sizes is not None else shard.nbytes
 
     final_size_on_close = -1
     try:
         _t_work = time.perf_counter()
         _in_bytes = 0
+        _addshard_s = 0.0
         with open(tmp_path, "wb") as f:
             writer = _PartitionSpillWriter(
                 f, map_id, pool_budget_bytes, compression
@@ -492,13 +518,21 @@ def _external_shuffle_map_task(
                     # First-seen schema; reducer uses it to type empty
                     # partitions (ShuffleHandle["schema"]).
                     output_schema = getattr(blk, "schema", None)
-                for pid, shard in _partition_units(blk):
-                    writer.add_shard(pid, shard)
+                for pid, shard, nb in _partition_units(blk):
+                    _t = time.perf_counter()
+                    writer.add_shard(pid, shard, nb)
+                    _addshard_s += time.perf_counter() - _t
+            _t = time.perf_counter()
             writer.flush_all()
+            _flushall_s = time.perf_counter() - _t
             # partition = loop wall minus the encode/write the writer timed.
             _partition_s = (
                 time.perf_counter() - _t_work - writer.encode_s - writer.write_s
             )
+            # Sub-split partition: hash_partition vs add_shard(staging) vs
+            # flush_all residual (concat/bookkeeping, minus encode+write).
+            _hashpart_s = _prof_hp[0]
+            _flushresid_s = _flushall_s - writer.encode_s - writer.write_s
 
             # userspace --flush-→ page cache --fsync-→ disk, then sanity-check the file
             # size matches the index. Mismatch = logic bug or silent short
@@ -535,6 +569,9 @@ def _external_shuffle_map_task(
                 {
                     "total": time.perf_counter() - _t_work,
                     "partition": _partition_s,
+                    "hashpart": _hashpart_s,
+                    "addshard": _addshard_s,
+                    "flushresid": _flushresid_s,
                     "encode": writer.encode_s,
                     "write": writer.write_s,
                     "fsync": _fsync_s,
@@ -618,7 +655,7 @@ def _external_shuffle_reduce_task(
     """
     start_time_s = time.perf_counter()
     _prof = (
-        {"resolve": 0.0, "fetchdecode": 0.0, "decode": 0.0, "flush": 0.0, "concat": 0.0, "write": 0.0, "concat_cpu": 0.0}
+        {"resolve": 0.0, "fetchdecode": 0.0, "decode": 0.0, "flush": 0.0, "concat": 0.0, "write": 0.0, "concat_cpu": 0.0, "write_apply_cpu": 0.0}
         if _REDUCEPROF
         else None
     )
@@ -662,9 +699,22 @@ def _external_shuffle_reduce_task(
             map_transformer.override_target_max_block_size(
                 map_task_context.target_max_block_size_override
             )
-            for out_block in map_transformer.apply_transform(
-                iter([block]), map_task_context
-            ):
+            # Time ONLY apply_transform (the real parquet write), excluding the
+            # yield-to-executor window — to tell real write CPU from framework
+            # CPU that flush_cpu (measured around the yields) may absorb.
+            _gen = map_transformer.apply_transform(iter([block]), map_task_context)
+            while True:
+                _a0, _ = _proc_cpu_io() if _prof is not None else (0.0, 0)
+                try:
+                    out_block = next(_gen)
+                    done = False
+                except StopIteration:
+                    done = True
+                if _prof is not None:
+                    _a1, _ = _proc_cpu_io()
+                    _prof["write_apply_cpu"] += _a1 - _a0
+                if done:
+                    break
                 yield from _yield_with_stats(out_block)
 
     # No shards for this partition. Without a fused map, reduce_fn on ``[]``
@@ -700,6 +750,16 @@ def _external_shuffle_reduce_task(
         accum_tables: List[pa.Table] = []
         accum_bytes: int = 0
         output_buffer: Optional[BlockOutputBuffer] = None
+        # Coalesce each prefetch region's shards into ONE chunk during decode so
+        # the fused write sees O(num_nodes) chunks instead of O(num_maps). The
+        # combine runs on this (main) thread while fetch worker threads keep
+        # pwriting, so its memcpy overlaps fetch I/O. Env-gated (0 = off).
+        _COMBINE = os.environ.get("RAY_SHUFFLE_REDUCE_COMBINE", "0") == "1"
+        # Move the (unavoidable, overlayfs-only-supports-fsync) page-cleaning
+        # fsync OFF the decode critical path and ONTO the fetch threads, where it
+        # overlaps other threads' network fetches. decode-side then just fadvise.
+        # (sync_file_range is a silent no-op on overlayfs, so plain fsync it is.)
+        _SFR = os.environ.get("RAY_SHUFFLE_REDUCE_SFR", "0") == "1"
 
         def _flush(tables: List[pa.Table]):
             """Call reduce_fn on ``tables`` and yield reshaped output."""
@@ -771,6 +831,13 @@ def _external_shuffle_reduce_task(
                     group.members,
                     max_bytes_per_fetch,
                 )
+                if _SFR and size > 0:
+                    # fsync ON THE FETCH THREAD: blocking, but overlaps other
+                    # threads' network fetches, so pages are clean by decode time
+                    # and decode-side fadvise evicts them with no fsync on the
+                    # critical path. (Plain fsync because sync_file_range no-ops
+                    # on overlayfs.)
+                    os.fsync(fd)
                 return base, size
 
             n_threads = min(len(groups), max(1, fetch_threads))
@@ -789,16 +856,45 @@ def _external_shuffle_reduce_task(
                 nonlocal accum_bytes
                 pos = base
                 end = base + size
+                region_tables: List[pa.Table] = []
+                _td = time.perf_counter() if _prof is not None else 0.0
                 while pos < end:
                     length = struct.unpack(">I", os.pread(fd, 4, pos))[0]
                     ipc_buf = os.pread(fd, length, pos + 4)
                     pos += 4 + length
                     table = _read_ipc(ipc_buf)
-                    accum_tables.append(table)
                     accum_bytes += table.nbytes
-                # fsync makes the dirty pwrite'd pages clean so DONTNEED evicts them.
-                os.fsync(fd)
+                    region_tables.append(table)
+                if _prof is not None:
+                    _prof["decompress"] = (
+                        _prof.get("decompress", 0.0) + time.perf_counter() - _td
+                    )
+                if _COMBINE and len(region_tables) > 1:
+                    _tc = time.perf_counter() if _prof is not None else 0.0
+                    accum_tables.append(
+                        pa.concat_tables(region_tables).combine_chunks()
+                    )
+                    if _prof is not None:
+                        _prof["combine"] = (
+                            _prof.get("combine", 0.0) + time.perf_counter() - _tc
+                        )
+                else:
+                    accum_tables.extend(region_tables)
+                # Make dirty pwrite'd pages clean so DONTNEED can evict them. With
+                # _SFR the async range-writeback was already kicked at fetch time
+                # (sync_file_range); otherwise fall back to a blocking fsync here
+                # (Mac/Win, or SFR off).
+                _tf = time.perf_counter() if _prof is not None else 0.0
+                if not _SFR:
+                    os.fsync(fd)
+                if _prof is not None:
+                    _prof["fsync"] = _prof.get("fsync", 0.0) + time.perf_counter() - _tf
+                    _tfa = time.perf_counter()
                 _drop_pagecache(fd, base, size)
+                if _prof is not None:
+                    _prof["fadvise"] = (
+                        _prof.get("fadvise", 0.0) + time.perf_counter() - _tfa
+                    )
 
             _t = time.perf_counter()
             with ThreadPoolExecutor(max_workers=n_threads) as ex:
