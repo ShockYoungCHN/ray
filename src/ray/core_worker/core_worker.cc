@@ -4883,6 +4883,19 @@ std::shared_ptr<RayletClientInterface> CoreWorker::GetRayletRpcClient(
 
 void CoreWorker::FreeObjectOnNodesAsync(const ObjectID &object_id,
                                         const absl::flat_hash_set<NodeID> &locations) {
+  if (!RayConfig::instance().batch_free_local_objects()) {
+    // A/B baseline: one FreeLocalObjects RPC per object per location, no coalescing.
+    rpc::FreeLocalObjectsRequest request;
+    request.add_object_ids(object_id.Binary());
+    for (const auto &node_id : locations) {
+      auto client = GetRayletRpcClient(node_id);
+      if (client == nullptr) {
+        continue;
+      }
+      client->FreeLocalObjects(request);
+    }
+    return;
+  }
   for (const auto &node_id : locations) {
     {
       absl::MutexLock lock(&free_batch_mu_);

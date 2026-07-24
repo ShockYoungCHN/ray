@@ -189,6 +189,10 @@ RAY_CONFIG(bool, lineage_pinning_enabled, true)
 /// The maximum batch size for coalesced FreeLocalObjects RPCs.
 RAY_CONFIG(int64_t, max_free_local_objects_batch_size, 256)
 
+/// A/B benchmark gate: false = one FreeLocalObjects RPC per object (legacy, no
+/// coalescing); true = per-node Nagle-style batching.
+RAY_CONFIG(bool, batch_free_local_objects, true)
+
 /// Maximum amount of lineage to keep in bytes. This includes the specs of all
 /// tasks that have previously already finished but that may be retried again.
 /// If we reach this limit, 50% of the current lineage will be evicted and
