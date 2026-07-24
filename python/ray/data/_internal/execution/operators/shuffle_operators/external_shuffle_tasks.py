@@ -67,6 +67,7 @@ from ray.data._internal.execution.operators.shuffle_operators.external_shuffle_r
     _SHUFFLE_MANAGER_NAMESPACE,
     _compute_prefetch_layout,
     _drop_pagecache,
+    _encode_shard,
     _group_by_manager,
     _handles_to_sources,
     _is_disk_exhausted,
@@ -177,7 +178,7 @@ class _PartitionSpillWriter:
         self._decoded_bytes_per_partition[pid] = (
             self._decoded_bytes_per_partition.get(pid, 0) + tbl.nbytes
         )
-        buf = _encode_partition_ipc(tbl, self._ipc_write_options)
+        buf = _encode_shard(tbl)  # whole-frame zstd (see _encode_shard)
         # Refuse frames the u32 response-wire encoding can't represent.
         if buf.size > _MAX_RANGE_BYTES:
             raise RuntimeError(
@@ -193,12 +194,14 @@ class _PartitionSpillWriter:
         self._staging_total -= self._staging_bytes[pid]
         self._staging_bytes[pid] = 0
 
-    def add_shard(self, pid: int, shard: pa.Table) -> None:
+    def add_shard(self, pid: int, shard: pa.Table, avg_row_bytes: int) -> None:
         if not shard.num_rows:
             return
-        # ``.nbytes`` on a string slice is O(slice) and not cached by Arrow;
-        # compute it once here and reuse (was called twice).
-        nb = shard.nbytes
+        # Estimate bytes as rows x avg_row_bytes (O(1)); avoids per-shard
+        # shard.nbytes (O(slice), paid N times => map's O(partitions) wall).
+        # Only drives the pool-budget heuristic; exact decoded size still comes
+        # from tbl.nbytes at flush.
+        nb = shard.num_rows * avg_row_bytes
         self._staging.setdefault(pid, []).append(shard)
         self._staging_bytes[pid] = self._staging_bytes.get(pid, 0) + nb
         self._staging_total += nb
@@ -300,12 +303,12 @@ def _external_shuffle_map_task(
         if blk.num_rows <= batch_rows:
             # block's partition spike is already ≤ pool → whole-block, no overhead
             for pid, shard in partition_fn(blk).items():
-                yield pid, shard
+                yield pid, shard, avg_row
         else:
             for batch in blk.to_batches(max_chunksize=batch_rows):
                 bt = pa.Table.from_batches([batch], schema=blk.schema)
                 for pid, shard in partition_fn(bt).items():
-                    yield pid, shard
+                    yield pid, shard, avg_row
 
     final_size_on_close = -1
     try:
@@ -324,8 +327,8 @@ def _external_shuffle_map_task(
                     # First-seen schema; reducer uses it to type empty
                     # partitions (ShuffleHandle["schema"]).
                     output_schema = getattr(blk, "schema", None)
-                for pid, shard in _partition_units(blk):
-                    writer.add_shard(pid, shard)
+                for pid, shard, avg_row in _partition_units(blk):
+                    writer.add_shard(pid, shard, avg_row)
             writer.flush_all()
 
             # userspace --flush-→ page cache --fsync-→ disk, then sanity-check the file
