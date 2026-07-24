@@ -196,9 +196,12 @@ class _PartitionSpillWriter:
     def add_shard(self, pid: int, shard: pa.Table) -> None:
         if not shard.num_rows:
             return
+        # ``.nbytes`` on a string slice is O(slice) and not cached by Arrow;
+        # compute it once here and reuse (was called twice).
+        nb = shard.nbytes
         self._staging.setdefault(pid, []).append(shard)
-        self._staging_bytes[pid] = self._staging_bytes.get(pid, 0) + shard.nbytes
-        self._staging_total += shard.nbytes
+        self._staging_bytes[pid] = self._staging_bytes.get(pid, 0) + nb
+        self._staging_total += nb
         self._peak_inflight = max(self._peak_inflight, self._pool_size())
         # Spill LARGEST bucket(s) on overflow so total staging stays
         # bounded by ``pool_budget_bytes``.
