@@ -501,6 +501,9 @@ def _external_shuffle_reduce_task(
         accum_tables: List[pa.Table] = []
         accum_bytes: int = 0
         output_buffer: Optional[BlockOutputBuffer] = None
+        # Coalesce each region's shards into one chunk so the write sees
+        # O(num_nodes) chunks, not O(num_maps) (env "0" disables).
+        _combine_regions = os.environ.get("RAY_SHUFFLE_REDUCE_COMBINE", "1") != "0"
 
         def _flush(tables: List[pa.Table]):
             """Call reduce_fn on ``tables`` and yield reshaped output."""
@@ -555,6 +558,9 @@ def _external_shuffle_reduce_task(
                     group.members,
                     max_bytes_per_fetch,
                 )
+                if size > 0:
+                    # fsync here (fetch thread) overlaps other fetches' network I/O.
+                    os.fsync(fd)
                 return base, size
 
             n_threads = min(len(groups), max(1, fetch_threads))
@@ -566,22 +572,25 @@ def _external_shuffle_reduce_task(
                 random.Random(partition_id).shuffle(work)
 
             def _decode_region(base: int, size: int):
-                """Walk frames in [base, base+size), decode into the
-                accumulator, then fsync + fadvise DONTNEED to release this
-                region's pages (best-effort; the kernel may ignore DONTNEED
-                under memory pressure)."""
+                """Decode + coalesce a region's shards into one chunk, then drop
+                its pages (already fsync'd on the fetch thread)."""
                 nonlocal accum_bytes
                 pos = base
                 end = base + size
+                region_tables: List[pa.Table] = []
                 while pos < end:
                     length = struct.unpack(">I", os.pread(fd, 4, pos))[0]
                     ipc_buf = os.pread(fd, length, pos + 4)
                     pos += 4 + length
                     table = _read_ipc(ipc_buf)
-                    accum_tables.append(table)
                     accum_bytes += table.nbytes
-                # fsync makes the dirty pwrite'd pages clean so DONTNEED evicts them.
-                os.fsync(fd)
+                    region_tables.append(table)
+                if _combine_regions and len(region_tables) > 1:
+                    accum_tables.append(
+                        pa.concat_tables(region_tables).combine_chunks()
+                    )
+                else:
+                    accum_tables.extend(region_tables)
                 _drop_pagecache(fd, base, size)
 
             with ThreadPoolExecutor(max_workers=n_threads) as ex:
