@@ -307,6 +307,7 @@ class _PartitionSpillWriter:
         "_index",
         "_decoded_bytes_per_partition",
         "_peak_inflight",
+        "_compression",
         # MAPPROF counters (cheap; only reported when RAY_SHUFFLE_MAPPROF=1).
         "encode_s",
         "write_s",
@@ -324,6 +325,9 @@ class _PartitionSpillWriter:
         self._f = f
         self._map_id = map_id
         self._pool_budget_bytes = pool_budget_bytes
+        # Single codec source: data_context.hash_shuffle_compression (threaded in
+        # by the map operator); the reduce reads the same field, so both agree.
+        self._compression = compression
         self._staging: Dict[int, List[pa.Table]] = {}
         self._staging_bytes: Dict[int, int] = {}
         self._staging_total = 0  # running sum -> _pool_size is O(1)
@@ -351,7 +355,7 @@ class _PartitionSpillWriter:
             self._decoded_bytes_per_partition.get(pid, 0) + nb
         )
         _t = time.perf_counter()
-        buf = _encode_shard(tbl)
+        buf = _encode_shard(tbl, self._compression)
         self.encode_s += time.perf_counter() - _t
         self.raw_bytes += nb
         self.out_bytes += buf.size
@@ -749,6 +753,11 @@ def _external_shuffle_reduce_task(
         # Accumulator for the final reduce.
         accum_tables: List[pa.Table] = []
         accum_bytes: int = 0
+        # Same codec source as the map: data_context.hash_shuffle_compression.
+        # Both ends read this one field, so decode always matches encode.
+        _compression = (
+            data_context if data_context is not None else DataContext.get_current()
+        ).hash_shuffle_compression
         output_buffer: Optional[BlockOutputBuffer] = None
         # Coalesce each prefetch region's shards into ONE chunk during decode so
         # the fused write sees O(num_nodes) chunks instead of O(num_maps). The
@@ -862,7 +871,7 @@ def _external_shuffle_reduce_task(
                     length = struct.unpack(">I", os.pread(fd, 4, pos))[0]
                     ipc_buf = os.pread(fd, length, pos + 4)
                     pos += 4 + length
-                    table = _read_ipc(ipc_buf)
+                    table = _read_ipc(ipc_buf, _compression)
                     accum_bytes += table.nbytes
                     region_tables.append(table)
                 if _prof is not None:
