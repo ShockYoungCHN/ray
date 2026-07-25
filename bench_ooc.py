@@ -26,6 +26,8 @@ Usage:
 """
 
 import argparse
+import os
+import shutil
 import time
 
 KEY_COLUMNS = ["column00"]  # l_orderkey
@@ -75,6 +77,7 @@ def run_ray(args) -> None:
         flush=True,
     )
     ds = ray.data.read_parquet(path).limit(target_rows)
+    shutil.rmtree(args.output_path, ignore_errors=True)
     start = time.perf_counter()
     ds.repartition(args.num_partitions, keys=KEY_COLUMNS).write_parquet(args.output_path)
     elapsed = time.perf_counter() - start
@@ -94,6 +97,7 @@ def run_daft(args) -> None:
         f"repartition({args.num_partitions}, {KEY_COLUMNS}) + write -> {args.output_path}",
         flush=True,
     )
+    shutil.rmtree(args.output_path, ignore_errors=True)
     start = time.perf_counter()
     (
         daft.read_parquet(path)
@@ -141,12 +145,16 @@ def run_spark(args) -> None:
         flush=True,
     )
     spark = SparkSession.builder.appName("bench_ooc_spark").getOrCreate()
+    # file:// forces the local disk; a bare path would go to Spark's default
+    # Hadoop FS (HDFS if configured). Matches Ray/Daft writing to local /tmp.
+    out = "file://" + os.path.abspath(args.output_path)
+    shutil.rmtree(args.output_path, ignore_errors=True)
     start = time.perf_counter()
     (
         spark.read.parquet(*selected)
         .repartition(args.num_partitions, KEY_COLUMNS[0])
         .write.mode("overwrite")
-        .parquet(args.output_path)
+        .parquet(out)
     )
     elapsed = time.perf_counter() - start
     _result("spark", args.data_size_gb, args.num_partitions, None, elapsed)
@@ -161,7 +169,7 @@ def main() -> None:
     ap.add_argument("--engine", choices=list(ENGINES), required=True)
     ap.add_argument("--data-size-gb", type=int, required=True)
     ap.add_argument("--num-partitions", type=int, required=True)
-    ap.add_argument("--output-path", default="/tmp/ooc_out")
+    ap.add_argument("--output-path", default="/tmp/shuffle_output")
     ap.add_argument(
         "--ray-shuffle",
         choices=["external", "in-memory"],
