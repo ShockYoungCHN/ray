@@ -1,7 +1,7 @@
 import itertools
 import logging
 from collections import defaultdict
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 from packaging.version import parse as parse_version
@@ -184,6 +184,82 @@ def hash_partition(
         for p in range(num_partitions)
         if counts[p] > 0
     }
+
+
+def _partition_byte_sizes(sorted_table, offsets):
+    """Per-partition (decoded) byte sizes from a partition-sorted table, in ONE
+    vectorized pass over each column's buffers — instead of ``Table.nbytes`` per
+    slice, which recomputes referenced byte ranges (O(offsets)) and makes the
+    map O(partitions). ``offsets`` are the per-partition row boundaries
+    (len num_partitions+1). Matches ``.nbytes`` within the validity-bitmap
+    rounding (< 0.02%); string value bytes are exact via the offset buffer."""
+    import numpy as np
+    import pyarrow
+
+    N = len(offsets) - 1
+    counts = np.diff(offsets)
+    total = np.zeros(N, dtype=np.int64)
+    for col in sorted_table.columns:
+        arr = col.chunk(0) if col.num_chunks == 1 else col.combine_chunks()
+        t = arr.type
+        bufs = arr.buffers()
+        base = arr.offset
+        if pyarrow.types.is_string(t) or pyarrow.types.is_binary(t):
+            voff = np.frombuffer(bufs[1], dtype=np.int32)
+            total += np.diff(voff[base + offsets]).astype(np.int64)
+            total += (counts + 1) * 4
+        elif pyarrow.types.is_large_string(t) or pyarrow.types.is_large_binary(t):
+            voff = np.frombuffer(bufs[1], dtype=np.int64)
+            total += np.diff(voff[base + offsets])
+            total += (counts + 1) * 8
+        elif t.bit_width is not None and t.bit_width % 8 == 0:
+            total += counts * (t.bit_width // 8)
+        else:
+            # Rare/nested types: fall back to exact per-partition nbytes.
+            for p in range(N):
+                if counts[p]:
+                    total[p] += col.slice(int(offsets[p]), int(counts[p])).nbytes
+            continue
+        if bufs[0] is not None:  # validity bitmap
+            total += (counts + 7) // 8
+    return total
+
+
+def hash_partition_with_sizes(
+    table: "pyarrow.Table",
+    *,
+    hash_cols: List[str],
+    num_partitions: int,
+) -> Tuple[Dict[int, "pyarrow.Table"], "np.ndarray"]:
+    """Like ``hash_partition`` but also returns a dense per-partition byte-size
+    array (int64, len num_partitions), computed vectorized. Lets callers skip
+    per-shard ``.nbytes``. Separate from ``hash_partition`` so its many other
+    callers are unaffected."""
+    import numpy as np
+    import pyarrow.compute as pac
+
+    assert num_partitions > 0
+    if table.num_rows == 0:
+        return {}, np.zeros(num_partitions, dtype=np.int64)
+    if num_partitions == 1:
+        return {0: table}, np.array([table.nbytes], dtype=np.int64)
+
+    projected_table = table.select(hash_cols)
+    partitions_array = np.asarray(
+        _hash_partition(projected_table, num_partitions=num_partitions), dtype=np.int64
+    )
+    sort_indices = pac.sort_indices(pyarrow.array(partitions_array))
+    counts = np.bincount(partitions_array, minlength=num_partitions)
+    offsets = np.zeros(num_partitions + 1, dtype=np.int64)
+    offsets[1:] = np.cumsum(counts)
+    sorted_table = take_table(table, sort_indices)
+    sizes = _partition_byte_sizes(sorted_table, offsets)
+    parts = {
+        p: sorted_table.slice(int(offsets[p]), int(counts[p]))
+        for p in range(num_partitions)
+        if counts[p] > 0
+    }
+    return parts, sizes
 
 
 def take_table(

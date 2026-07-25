@@ -26,6 +26,20 @@ def _make_hash_partition_fn(key_columns: List[str], num_partitions: int) -> Part
     return _partition
 
 
+def _make_hash_partition_fn_with_sizes(key_columns: List[str], num_partitions: int):
+    """Like _make_hash_partition_fn but the returned fn yields
+    ``(Dict[pid, Table], per_partition_byte_sizes)`` — the sizes are computed
+    vectorized so the external map avoids per-shard ``.nbytes``."""
+    from ray.data._internal.arrow_ops.transform_pyarrow import hash_partition_with_sizes
+
+    def _partition(block: pa.Table):
+        return hash_partition_with_sizes(
+            block, hash_cols=key_columns, num_partitions=num_partitions
+        )
+
+    return _partition
+
+
 def _concat_reduce(
     partition_id: int, tables_by_input: List[List[pa.Table]]
 ) -> Iterable[pa.Table]:

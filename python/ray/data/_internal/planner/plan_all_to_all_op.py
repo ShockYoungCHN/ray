@@ -9,6 +9,7 @@ from ray.data._internal.execution.operators.hash_shuffle_v2 import (
     _SHUFFLE_MAP_RUNTIME_ENV,
     _concat_reduce,
     _make_hash_partition_fn,
+    _make_hash_partition_fn_with_sizes,
     _sort_reduce,
 )
 from ray.data._internal.execution.operators.shuffle_operators.shuffle_map_operator import (  # noqa: E501
@@ -89,16 +90,20 @@ def _plan_hash_shuffle_repartition_v2(
         or data_context.default_hash_shuffle_parallelism
     )
 
-    partition_fn = _make_hash_partition_fn(key_list, target_num_partitions)
     reduce_fn = _sort_reduce(key_list) if logical_op.sort else _concat_reduce
 
     if data_context.use_external_hash_shuffle:
+        # External map avoids per-shard .nbytes by taking vectorized sizes.
+        partition_fn = _make_hash_partition_fn_with_sizes(
+            key_list, target_num_partitions
+        )
         map_cls, reduce_cls, prefix = (
             ExternalHashShuffleMapOp,
             ExternalHashShuffleReduceOp,
             "ExternalHashShuffle",
         )
     else:
+        partition_fn = _make_hash_partition_fn(key_list, target_num_partitions)
         map_cls, reduce_cls, prefix = (
             ShuffleMapOp,
             ShuffleReduceOp,
