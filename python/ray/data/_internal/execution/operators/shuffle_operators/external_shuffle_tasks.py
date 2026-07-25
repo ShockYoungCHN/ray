@@ -325,8 +325,7 @@ class _PartitionSpillWriter:
         self._f = f
         self._map_id = map_id
         self._pool_budget_bytes = pool_budget_bytes
-        # Single codec source: data_context.hash_shuffle_compression (threaded in
-        # by the map operator); the reduce reads the same field, so both agree.
+        # Codec from data_context.hash_shuffle_compression (same field the reduce reads).
         self._compression = compression
         self._staging: Dict[int, List[pa.Table]] = {}
         self._staging_bytes: Dict[int, int] = {}
