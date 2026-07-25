@@ -60,7 +60,6 @@ from ray.data._internal.execution.operators.shuffle_operators.shuffle_tasks impo
     PartitionFn,
     ReduceFn,
     _encode_partition_ipc,
-    _ipc_write_options,
 )
 from ray.data._internal.execution.operators.shuffle_operators.external_shuffle_runtime import (  # noqa: E402,E501
     _MAX_RANGE_BYTES,
@@ -139,7 +138,7 @@ class _PartitionSpillWriter:
         "_f",
         "_map_id",
         "_pool_budget_bytes",
-        "_ipc_write_options",
+        "_compression",
         "_staging",
         "_staging_bytes",
         "_staging_total",
@@ -158,7 +157,10 @@ class _PartitionSpillWriter:
         self._f = f
         self._map_id = map_id
         self._pool_budget_bytes = pool_budget_bytes
-        self._ipc_write_options = _ipc_write_options(compression)
+        # Single codec source: data_context.hash_shuffle_compression, threaded in
+        # by the map operator. _flush stamps every shard with it; the reduce reads
+        # the same value from its DataContext, so both ends always agree.
+        self._compression = compression
         self._staging: Dict[int, List[pa.Table]] = {}
         self._staging_bytes: Dict[int, int] = {}
         self._staging_total = 0  # running sum -> _pool_size is O(1)
@@ -178,7 +180,7 @@ class _PartitionSpillWriter:
         self._decoded_bytes_per_partition[pid] = (
             self._decoded_bytes_per_partition.get(pid, 0) + tbl.nbytes
         )
-        buf = _encode_shard(tbl)  # whole-frame zstd (see _encode_shard)
+        buf = _encode_shard(tbl, self._compression)  # whole-frame codec (see _encode_shard)
         # Refuse frames the u32 response-wire encoding can't represent.
         if buf.size > _MAX_RANGE_BYTES:
             raise RuntimeError(
@@ -510,6 +512,12 @@ def _external_shuffle_reduce_task(
         # Coalesce each region's shards into one chunk so the write sees
         # O(num_nodes) chunks, not O(num_maps) (env "0" disables).
         _combine_regions = os.environ.get("RAY_SHUFFLE_REDUCE_COMBINE", "1") != "0"
+        # Same codec source as the map: data_context.hash_shuffle_compression.
+        # Both ends read this one field, so decode always matches encode (no
+        # hardcoded default -> honors RAY_DATA_HASH_SHUFFLE_COMPRESSION overrides).
+        _compression = (
+            data_context if data_context is not None else DataContext.get_current()
+        ).hash_shuffle_compression
 
         def _flush(tables: List[pa.Table]):
             """Call reduce_fn on ``tables`` and yield reshaped output."""
@@ -588,7 +596,7 @@ def _external_shuffle_reduce_task(
                     length = struct.unpack(">I", os.pread(fd, 4, pos))[0]
                     ipc_buf = os.pread(fd, length, pos + 4)
                     pos += 4 + length
-                    table = _read_ipc(ipc_buf)
+                    table = _read_ipc(ipc_buf, _compression)
                     accum_bytes += table.nbytes
                     region_tables.append(table)
                 if _combine_regions and len(region_tables) > 1:
