@@ -157,9 +157,7 @@ class _PartitionSpillWriter:
         self._f = f
         self._map_id = map_id
         self._pool_budget_bytes = pool_budget_bytes
-        # Single codec source: data_context.hash_shuffle_compression, threaded in
-        # by the map operator. _flush stamps every shard with it; the reduce reads
-        # the same value from its DataContext, so both ends always agree.
+        # Codec from data_context.hash_shuffle_compression (same field the reduce reads).
         self._compression = compression
         self._staging: Dict[int, List[pa.Table]] = {}
         self._staging_bytes: Dict[int, int] = {}
@@ -512,9 +510,7 @@ def _external_shuffle_reduce_task(
         # Coalesce each region's shards into one chunk so the write sees
         # O(num_nodes) chunks, not O(num_maps) (env "0" disables).
         _combine_regions = os.environ.get("RAY_SHUFFLE_REDUCE_COMBINE", "1") != "0"
-        # Same codec source as the map: data_context.hash_shuffle_compression.
-        # Both ends read this one field, so decode always matches encode (no
-        # hardcoded default -> honors RAY_DATA_HASH_SHUFFLE_COMPRESSION overrides).
+        # Codec from data_context.hash_shuffle_compression (same field the map used).
         _compression = (
             data_context if data_context is not None else DataContext.get_current()
         ).hash_shuffle_compression
