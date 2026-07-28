@@ -480,9 +480,7 @@ class ShuffleManager:
 
 
 @ray.remote(num_cpus=0)
-def _cleanup_shuffle_dir(
-    map_dir: str, reduce_dir: str, expected_node_id: str
-) -> None:
+def _cleanup_shuffle_dir(map_dir: str, reduce_dir: str, expected_node_id: str) -> None:
     """Best-effort ``rmtree`` of this shuffle's map + reduce staging dirs.
     NodeAffinity(soft=True) may land us off-target; no-op then."""
     if ray.get_runtime_context().get_node_id() != expected_node_id:
