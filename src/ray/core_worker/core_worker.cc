@@ -36,6 +36,7 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "ray/asio/periodical_runner.h"
+#include <atomic>
 #include "ray/common/bundle_spec.h"
 #include "ray/common/protobuf_utils.h"
 #include "ray/common/ray_config.h"
@@ -56,6 +57,17 @@ namespace ray::core {
 
 namespace {
 // Default capacity for serialization caches.
+// [CUNIT] owner-side control-plane load counters (c_unit measurement). Tests whether
+// the owner's location-serving + ref-removed work scales with M*R shuffle object count.
+// Counts only (puller-side latency is captured by the object_manager pull-events); no
+// timing here to stay within the repo's ClockInterface rule and minimize build risk.
+std::atomic<int64_t> g_cunit_loc_reqs{0};    // GetObjectLocationsOwner RPCs (sync, cold path)
+std::atomic<int64_t> g_cunit_loc_objs{0};    // object locations filled via that sync RPC
+std::atomic<int64_t> g_cunit_loc_subs{0};    // ProcessSubscribeObjectLocations (REAL pub/sub
+                                             // location path -> owner publishes snapshot)
+std::atomic<int64_t> g_cunit_locupd{0};      // per-object location/pin/refcount-maintenance
+                                             // updates the owner processes (UpdateObjectLocationBatch)
+std::atomic<int64_t> g_cunit_refremoved{0};  // SubscribeForRefRemoved processed
 constexpr size_t kDefaultSerializationCacheCap = 500;
 
 // Implements setting the transient RUNNING_IN_RAY_GET and RUNNING_IN_RAY_WAIT states.
@@ -478,6 +490,27 @@ CoreWorker::CoreWorker(
         RayConfig::instance().raylet_death_check_interval_milliseconds(),
         "CoreWorker.ExitIfParentRayletDies");
   }
+
+  // [CUNIT] periodically dump owner-side control-plane load counters (only when this
+  // worker actually served any, to avoid spamming idle workers). Grep raylet/worker
+  // logs for "[CUNIT]" and diff across the run to get per-second location-serving load.
+  periodical_runner_->RunFnPeriodically(
+      [] {
+        const int64_t reqs = g_cunit_loc_reqs.load(std::memory_order_relaxed);
+        const int64_t subs = g_cunit_loc_subs.load(std::memory_order_relaxed);
+        const int64_t lupd = g_cunit_locupd.load(std::memory_order_relaxed);
+        const int64_t refr = g_cunit_refremoved.load(std::memory_order_relaxed);
+        if (reqs == 0 && subs == 0 && lupd == 0 && refr == 0) {
+          return;
+        }
+        RAY_LOG(INFO) << "[CUNIT] loc_reqs=" << reqs
+                      << " loc_objs=" << g_cunit_loc_objs.load(std::memory_order_relaxed)
+                      << " loc_subs=" << subs
+                      << " locupd=" << lupd
+                      << " refremoved=" << refr;
+      },
+      1000,
+      "CoreWorker.CunitDump");
 
   /// If periodic asio stats print is enabled, it will print it.
   const auto event_stats_print_interval_ms =
@@ -3976,6 +4009,8 @@ void CoreWorker::HandleUpdateObjectLocationBatch(
   const auto &node_id = NodeID::FromBinary(request.node_id());
   const auto &object_location_updates = request.object_location_updates();
 
+  g_cunit_locupd.fetch_add(object_location_updates.size(),          // [CUNIT] owner-side
+                           std::memory_order_relaxed);              // per-object refcount/location work
   for (const auto &object_location_update : object_location_updates) {
     const auto &object_id = ObjectID::FromBinary(object_location_update.object_id());
 
@@ -4096,6 +4131,7 @@ void CoreWorker::ProcessSubscribeObjectLocations(
     return;
   }
 
+  g_cunit_loc_subs.fetch_add(1, std::memory_order_relaxed);  // [CUNIT] real location path
   // Publish the first object location snapshot when subscribed for the first time.
   reference_counter_->PublishObjectLocationSnapshot(object_id);
 }
@@ -4127,6 +4163,9 @@ void CoreWorker::HandleGetObjectLocationsOwner(
                            send_reply_callback)) {
     return;
   }
+  g_cunit_loc_reqs.fetch_add(1, std::memory_order_relaxed);            // [CUNIT]
+  g_cunit_loc_objs.fetch_add(request.object_ids_size(),                // [CUNIT]
+                             std::memory_order_relaxed);
   for (int i = 0; i < request.object_ids_size(); ++i) {
     auto object_id = ObjectID::FromBinary(request.object_ids(i));
     auto *object_info = reply->add_object_location_infos();
@@ -4150,6 +4189,7 @@ void CoreWorker::ProcessSubscribeForRefRemoved(
 
   const auto owner_address = message.reference().owner_address();
   ObjectID contained_in_id = ObjectID::FromBinary(message.contained_in_id());
+  g_cunit_refremoved.fetch_add(1, std::memory_order_relaxed);  // [CUNIT]
   // So it will call PublishRefRemovedInternal to publish a message when the requested
   // object ID's ref count goes to 0.
   reference_counter_->SubscribeRefRemoved(object_id, contained_in_id, owner_address);
