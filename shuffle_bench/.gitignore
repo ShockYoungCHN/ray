@@ -1,0 +1,4 @@
+# generated job specs (produced by gen_jobs.sh) and run artifacts
+job_*.yaml
+__pycache__/
+*.log
