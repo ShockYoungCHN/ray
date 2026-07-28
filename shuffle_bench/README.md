@@ -1,6 +1,6 @@
 # shuffle_bench — file vs in-memory hash-shuffle sweep
 
-Self-contained Anyscale sweep of `repartition` across data size (and partition density), comparing the two
+Self-contained Anyscale sweep of `repartition` across data size (and partition size), comparing the two
 hash-shuffle arms. The only per-arm difference is `DataContext.use_external_hash_shuffle`:
 
 | arm | `use_external_hash_shuffle` | what it does |
@@ -13,12 +13,12 @@ Both do `read_parquet(TPC-H lineitem).limit(rows).repartition(N, keys=[l_orderke
 arm labels so RESULT lines stay comparable across runs.)
 
 ## Files (only these three are tracked — yamls are generated)
-- **`bench_shuffle.py`** — the harness. `--data-size-gb`, `--gb-per-partition` (density → partitions),
+- **`bench_shuffle.py`** — the harness. `--data-size-gb`, `--gb-per-partition` (→ num_partitions),
   `--shuffle {v2,disk,both}`, `--target-cpu`, `--result-json`, `--stats`. Emits one
   `RESULT arm=… size=…GB gbpp=… parts=… wall=…s throughput=…GB/s ok=…` per arm (+ a `SPEEDUP` line for `both`).
   `v2` OOM/OwnerDied at large cells is caught and reported as `ok=False` — a data point, not a crash.
 - **`gen_jobs.sh [ARM]`** — generates the job yamls for `ARM ∈ {disk, v2, both}` (default `both`).
-  Edit `IMAGE` / `COMPUTE` / `TARGET_CPU` / `SIZES` / `ORDER` / `DENSITY` at the top.
+  Edit `IMAGE` / `COMPUTE` / `TARGET_CPU` / `SIZES` / `ORDER` / `PARTITION_SIZE_GB` at the top.
 - `job_<arm>_<size>.yaml` — **generated artifacts, git-ignored.** Regenerate; don't commit.
 
 ## Run

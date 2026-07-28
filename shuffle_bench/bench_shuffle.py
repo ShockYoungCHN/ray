@@ -1,5 +1,5 @@
 """Sweep harness: disk (file-transport, v3) vs v2 (in-memory/object-store) hash
-shuffle, parameterized by DATA SIZE and PARTITION DENSITY (GB per partition).
+shuffle, parameterized by DATA SIZE and PARTITION SIZE (GB per partition).
 
 num_partitions = round(data_size_gb / gb_per_partition), so:
   1GB/partition -> 1TB=1024, 2TB=2048, 4TB=4096, 8TB=8192 partitions
@@ -156,7 +156,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data-size-gb", type=int, required=True)
     p.add_argument("--gb-per-partition", type=float, required=True,
-                   help="Partition density; num_partitions = data_size_gb / this.")
+                   help="GB per partition; num_partitions = data_size_gb / this.")
     p.add_argument("--shuffle", choices=["v2", "disk", "both"], default="both")
     p.add_argument("--target-cpu", type=int, default=256)
     p.add_argument("--output-path", default="/tmp/shuffle_output")
