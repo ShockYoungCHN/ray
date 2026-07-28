@@ -53,13 +53,11 @@ from ray.data.block import (
 )
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
-# ReduceFn/PartitionFn and the IPC encode helpers _encode_partition_ipc/_ipc_write_options)
-# are shared with the in-memory variant.
+# PartitionFn/ReduceFn contracts are shared with the in-memory variant.
 # External shuffle is single-input (for now), so ReduceFn's outer list always has length 1.
 from ray.data._internal.execution.operators.shuffle_operators.shuffle_tasks import (  # noqa: E402,E501
     PartitionFn,
     ReduceFn,
-    _encode_partition_ipc,
 )
 from ray.data._internal.execution.operators.shuffle_operators.external_shuffle_runtime import (  # noqa: E402,E501
     _MAX_RANGE_BYTES,
@@ -178,7 +176,9 @@ class _PartitionSpillWriter:
         self._decoded_bytes_per_partition[pid] = (
             self._decoded_bytes_per_partition.get(pid, 0) + tbl.nbytes
         )
-        buf = _encode_shard(tbl, self._compression)  # whole-frame codec (see _encode_shard)
+        buf = _encode_shard(
+            tbl, self._compression
+        )  # whole-frame codec (see _encode_shard)
         # Refuse frames the u32 response-wire encoding can't represent.
         if buf.size > _MAX_RANGE_BYTES:
             raise RuntimeError(
@@ -313,9 +313,7 @@ def _external_shuffle_map_task(
     final_size_on_close = -1
     try:
         with open(tmp_path, "wb") as f:
-            writer = _PartitionSpillWriter(
-                f, map_id, pool_budget_bytes, compression
-            )
+            writer = _PartitionSpillWriter(f, map_id, pool_budget_bytes, compression)
             for blk in blocks:
                 # Accept any Ray Data Block (Arrow / pandas / ...) at the
                 # boundary and normalize to ``pa.Table`` here. Downstream
@@ -463,9 +461,7 @@ def _external_shuffle_reduce_task(
             yield from _yield_with_stats(block)
             return
         assert map_task_context is not None and data_context is not None
-        with DataContext.current(data_context), TaskContext.current(
-            map_task_context
-        ):
+        with DataContext.current(data_context), TaskContext.current(map_task_context):
             map_transformer.override_target_max_block_size(
                 map_task_context.target_max_block_size_override
             )
