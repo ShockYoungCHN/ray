@@ -79,9 +79,7 @@ from ray.data._internal.execution.operators.shuffle_operators.external_shuffle_r
 
 
 _DEFAULT_MAX_BYTES_PER_FETCH = 256 * 1024 * 1024  # 256 MiB per FETCH frame
-# CAP on fetch connections per reducer: n_threads = min(#managers, this). A
-# resource budget (bounds ShuffleManager contention + recv-buffer memory), not
-# tied to #managers.
+# CAP on fetch connections per reducer: n_threads = min(#managers, this).
 _DEFAULT_FETCH_THREADS = 16
 
 
